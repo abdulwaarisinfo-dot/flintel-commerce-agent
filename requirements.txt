@@ -1,0 +1,17 @@
+# Core
+anthropic>=0.25.0
+pymongo>=4.6.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Social Platforms
+feedparser>=6.0.11
+tweepy>=4.14.0
+telethon>=1.34.0
+
+# API Server
+fastapi>=0.110.0
+uvicorn>=0.29.0
+
+# Scheduling & Async
+asyncio-throttle>=1.0.2
