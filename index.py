@@ -218,6 +218,15 @@ REDDIT_SEARCH_KEYWORDS = [
     "need incident response",
     "Salesforce alternative",
     "switching from HubSpot",
+    # ── BUSINESS CONTEXT ───────────────────────────────────────────────────────
+    "my bookkeeper", "our bookkeeper", "my accountant", "our accountant",
+    "small business accounting", "startup accounting", "solo founder accounting",
+    "freelancer accounting", "self employed accounting", "DIY bookkeeping",
+    "doing my own books", "founder doing the books", "wearing the finance hat",
+    "no dedicated finance person", "growing business need better accounting",
+    "scaling finance operations", "outsourced bookkeeping", "outsourced accounting",
+    "virtual CFO", "fractional CFO", "need a fractional CFO",
+    "part time bookkeeper", "part time accountant",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
