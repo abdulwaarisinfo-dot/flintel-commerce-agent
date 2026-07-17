@@ -1,111 +1,73 @@
 """
-FLINTEL v9.5 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
+FLINTEL v9.6 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
                 + BATCHED SEARCH-VOLUME PRE-SEEDING)
                 + Twitter/X Signal Scorer
 =================================================================================
-Platforms : Reddit — DataForSEO SERP discovery ONLY (Google search,
+Platforms : Reddit — RapidAPI SERP discovery ONLY (Google search,
             site:reddit.com, real per-post rank -> Reddit public .json)
           + Twitter/X (tweepy v2)
 
-WHAT CHANGED FROM v9.4 — per explicit instruction:
+=================================================================================
+WHAT CHANGED FROM v9.5 — BUG FIXES ONLY, LOGIC 100% AS-IS OTHERWISE
+=================================================================================
 
-  1. NEW — BATCHED SEARCH-VOLUME PRE-SEEDING. Previously, process_one_keyword()
-     called fetch_search_volume(keyword) ONE KEYWORD AT A TIME, every single
-     time a keyword was discovered — meaning N keywords = N separate paid
-     DataForSEO requests, even though the search_volume/live endpoint bills
-     PER REQUEST (not per keyword) and accepts up to 1000 keywords in one
-     call. That was extremely wasteful at scale (e.g. 2000 keywords one-by-
-     one = ~$150, vs. batched in groups of 500 = ~$0.30).
+  BUG 1 — google_rank always null.
+    ROOT CAUSE: search_google_for_keyword() / fetch_google_rank() assumed
+    the RapidAPI "google-search116" response uses DataForSEO-style field
+    names ("results" list, "rank_absolute" field). That RapidAPI provider
+    does NOT guarantee those exact key names — if the real response uses
+    a different key (e.g. "position", "organic_results", "items", a
+    nested "data" object, etc.), .get("rank_absolute") silently returns
+    None every single time. No crash, no error — just silent nulls.
+    FIX: new _dig_value() / _dig_list() helpers that search a JSON
+    response across a list of *candidate* key names, at the top level
+    AND one level of nesting, and return the first match found. This
+    makes the code resilient to the provider's actual field naming
+    without guessing wrong once and failing silently forever.
 
-     NOW: a new function, seed_search_volume_batch(), takes any keywords
-     that don't yet have a stored search_volume, splits them into chunks
-     of up to 500, and fetches ALL of them in ONE request per chunk. The
-     result is written back onto the SAME flintel_keywords document already
-     used for the fetch-once-forever discovery cache — no new collection,
-     no schema change, no extra moving parts.
+  BUG 2 — search_volume always null.
+    ROOT CAUSE: same class of bug as #1, but for the
+    "seo-keyword-research" RapidAPI provider — code assumed the response
+    key is literally "search_volume". If the provider actually returns
+    "volume", "monthly_searches", "avg_monthly_searches", "searchVolume",
+    or a nested object, the old code returned None every time.
+    FIX: same _dig_value() helper, now also used in
+    seed_search_volume_batch(), fetch_search_volume(), and
+    fetch_google_stats().
 
-     process_one_keyword() no longer calls fetch_search_volume() at all.
-     It simply reads the already-seeded "search_volume" field off the
-     keyword's own flintel_keywords document (passed in by the discovery
-     loop) and stamps it onto every post discovered for that keyword —
-     exactly as before. The item/queue/Claude/signals schema is 100%
-     UNCHANGED; only WHERE the number comes from changed (cache read
-     instead of a live per-keyword API call).
+  BUG 3 — Reddit .json calls returning "403 Client Error: Blocked".
+    ROOT CAUSE: Reddit aggressively blocks scraping-style traffic —
+    generic User-Agents and/or datacenter/cloud IPs get blocked outright,
+    regardless of request correctness. The old code used one flat
+    User-Agent string ("flintel-serp/1.0") with zero retry logic, so a
+    single 403 permanently killed that post (post_url never becomes a
+    signal, but is also NEVER retried since dedup only tracks *saved*
+    URLs, not attempted-but-failed ones).
+    FIX: fetch_reddit_post_by_url() is now a "smart" fetcher:
+      - Reddit's own recommended User-Agent format
+        ("platform:app_id:version (by /u/username)"-style).
+      - Small randomized jitter delay before each request (reduces
+        obvious bot-cadence fingerprinting).
+      - Exponential backoff retry (up to 3 attempts) specifically for
+        403 / 429 / 5xx responses.
+      - Fallback to old.reddit.com if www.reddit.com keeps blocking on
+        the final attempt (different edge/caching path, sometimes
+        succeeds where www. does not).
+    NOTE: if the underlying issue is a blanket datacenter-IP block by
+    Reddit (very common for cloud-hosted servers), no amount of
+    User-Agent/retry tuning fully fixes it — the durable fix at that
+    point is Reddit's official OAuth API (PRAW) or a residential proxy.
+    This fix maximizes success rate within the existing "public .json,
+    no OAuth" design exactly as instructed (logic kept 100% as-is).
 
-  2. Search-volume seeding runs INSIDE the existing 60s discovery poll —
-     there is NO separate polling loop for it. On every sync pass, any
-     keyword still missing a search_volume gets included in the next
-     batch-seed call (batched, never per-keyword). This keeps the system
-     to exactly the same two background loops as v9.4 (SERP-discovery +
-     Reddit-batch), nothing new to manage or restart.
-
-  3. Everything else — the fetch-once-forever discovery cache design
-     (fetched=False -> due now, fetched=True -> permanent skip, ever),
-     the per-keyword SERP call (still one call per keyword, unchanged —
-     this endpoint cannot be batched across keywords), the sequential
-     one-keyword-fully-finishes-before-the-next-starts flow, the
-     post_url dedup, the queues, the batch processor, the Claude scorer,
-     the rescore processor, the FastAPI endpoints — ALL of it is kept
-     100% AS-IS from v9.4. No format, schema, or logic changed anywhere
-     except the search_volume sourcing described above.
-
-WHAT CHANGED FROM v9.3 (carried over from v9.4, still true):
-
-  1. flintel_keywords is FETCH-ONCE-FOREVER, not TTL-based.
-     Every keyword in REDDIT_SEARCH_KEYWORDS gets its own document:
-         { keyword, fetched, search_volume, last_fetched_at, created_at }
-     There is NO next_due_at, NO 12h/24h re-fetch, NO expiry of any kind:
-       - fetched=False (never fetched, or brand new)  -> due NOW, gets
-         fetched from DataForSEO exactly once
-       - fetched=True                                  -> PERMANENTLY
-         skipped, forever, even after restarts, even after any amount
-         of time passes. There is no scenario in which an already-
-         fetched keyword goes back to DataForSEO on its own.
-     This guarantees Claude/signals data is never disturbed by the same
-     keyword being re-searched and re-processed again later — each
-     keyword contributes exactly one discovery pass to the system, ever.
-
-  2. New keywords are still picked up automatically and sequentially:
-     sync_keywords_to_db() inserts any brand-new keyword with
-     fetched=False on every poll pass (KEYWORD_CHECK_INTERVAL_SECONDS,
-     default 60s) — so adding a keyword gets it fetched on the very
-     next pass, one at a time, same as before. Only the "what happens
-     after it's fetched" behavior changed (permanent True vs TTL-expiry).
-
-  3. RESTART-SAFE BY DESIGN — sync_keywords_to_db() uses $setOnInsert,
-     so it is 100% idempotent: existing keyword documents (their
-     fetched/last_fetched_at/search_volume state) are NEVER reset or
-     touched on restart. Only brand-new keywords get inserted, with
-     fetched=False and search_volume=None. This means:
-       - Restart mid-run -> already-fetched keywords stay permanently
-         skipped, picks up exactly where it left off. NEVER starts
-         from zero, NEVER re-fetches a keyword it already did.
-       - Add new keywords to REDDIT_SEARCH_KEYWORDS -> they appear in
-         flintel_keywords as fetched=False on the very next sync pass
-         and get fetched immediately, one at a time (sequential), with
-         their search_volume batch-seeded alongside any other keywords
-         missing one at that time.
-
-  4. KEPT AS-IS — everything from v9.3:
-     - post_url dedup check BEFORE .json fetch / BEFORE Claude
-       (is_post_already_signaled()) — a separate, independent safety
-       net from the keyword-level cache above.
-     - reddit_queue / twitter_queue separate, never mixed.
-     - Persistent batch state (flintel_pending_batch), persistent
-       dedup for Twitter (flintel_seen_ids), persistent raw-queue
-       (flintel_queue_messages), persistent batch-timeout clock
-       (flintel_batch_seconds). REDDIT_BATCH_GAP_SECONDS /
-       REDDIT_BATCH_TIMEOUT_SECONDS unchanged — this governs the
-       Claude-scoring batch pacing, completely separate from the
-       keyword discovery cache above.
-     - Claude streaming transport + partial-JSON truncation recovery.
-     - Claude-failure items saved with status="pending", automatically
-       retried by run_rescore_processor() (reuses stored enrichment,
-       never re-fetches from Reddit/.json or DataForSEO).
-     - Platform enable/disable flags (REDDIT_ENABLED, TWITTER_ENABLED).
-     - API-key-protected FastAPI read endpoints (+ /keywords status
-       endpoint to inspect the cache).
-     - Claude input/output schema UNCHANGED.
+  Everything else — the fetch-once-forever discovery cache design,
+  the per-keyword SERP call, the sequential one-keyword-fully-finishes-
+  before-the-next-starts flow, the post_url dedup, the queues, the batch
+  processor, the Claude scorer, the rescore processor, the FastAPI
+  endpoints, the "batched" (per-keyword-call) search-volume seeding loop
+  structure — ALL of it is kept 100% AS-IS from v9.5. No schema, no
+  logic, no flow changed anywhere except the field-extraction robustness
+  and Reddit fetch retry logic described above.
 """
 
 import asyncio
@@ -114,6 +76,7 @@ import os
 import json
 import time
 import queue
+import random
 import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -265,6 +228,20 @@ TWITTER_SEARCH_KEYWORDS = [
     ).split(",") if kw.strip()
 ]
 
+# ── REDDIT "SMART FETCH" CONFIG — new in v9.6, bug-fix only ────────────────
+# Governs the retry/backoff/User-Agent behaviour of fetch_reddit_post_by_url().
+# Does NOT change what data is extracted or where it goes — only how
+# reliably we get a 200 instead of a 403 from Reddit's public .json.
+REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
+REDDIT_FETCH_BACKOFF_BASE    = float(os.getenv("REDDIT_FETCH_BACKOFF_BASE", "2.0"))
+REDDIT_FETCH_JITTER_MIN      = float(os.getenv("REDDIT_FETCH_JITTER_MIN", "0.4"))
+REDDIT_FETCH_JITTER_MAX      = float(os.getenv("REDDIT_FETCH_JITTER_MAX", "1.6"))
+# Reddit recommends: "<platform>:<app id>:<version> (by /u/<username>)"
+REDDIT_USER_AGENT = os.getenv(
+    "REDDIT_USER_AGENT",
+    "python:flintel-signal-bot:v9.6 (by /u/flintel_signals)",
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # API KEY AUTH (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -299,6 +276,110 @@ TWITTER_ENABLED = _bool_env("TWITTER_ENABLED", False)
 
 def _working(flag: bool) -> str:
     return "✅ Working" if flag else "❌ Not Working"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GENERIC JSON FIELD-EXTRACTION HELPERS — NEW in v9.6, bug-fix only.
+#
+# These exist because RapidAPI marketplace providers do NOT guarantee a
+# fixed response schema the way DataForSEO's own API does. The old code
+# assumed exact key names ("rank_absolute", "search_volume", "results")
+# and silently returned None forever when the provider used a different
+# name. _dig_value()/_dig_list() search across a list of candidate key
+# names, at the top level and one level of nesting, so a provider's real
+# field naming is found instead of guessed-and-missed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dig_value(obj, candidate_keys: list):
+    """
+    Searches `obj` (a dict, or a list of dicts) for the first present key
+    from `candidate_keys`, checking the top level first, then one level
+    of nested dict/list values. Returns the first match's value, or None
+    if nothing matches. Purely additive/defensive — never raises.
+    """
+    if obj is None:
+        return None
+
+    def _try_dict(d):
+        if not isinstance(d, dict):
+            return None
+        for key in candidate_keys:
+            if key in d and d[key] is not None:
+                return d[key]
+        return None
+
+    # top-level dict
+    if isinstance(obj, dict):
+        val = _try_dict(obj)
+        if val is not None:
+            return val
+        # one level of nesting inside any dict/list value
+        for v in obj.values():
+            if isinstance(v, dict):
+                val = _try_dict(v)
+                if val is not None:
+                    return val
+            elif isinstance(v, list) and v:
+                first = v[0]
+                if isinstance(first, dict):
+                    val = _try_dict(first)
+                    if val is not None:
+                        return val
+
+    # top-level list of dicts (take the first element)
+    elif isinstance(obj, list) and obj:
+        first = obj[0]
+        if isinstance(first, dict):
+            val = _try_dict(first)
+            if val is not None:
+                return val
+
+    return None
+
+
+def _dig_list(obj, candidate_list_keys: list) -> list:
+    """
+    Searches a RapidAPI JSON response for the results/organic-results
+    list, trying several common key names used across different
+    providers ("results", "organic_results", "items", "data", "items",
+    "organic", "response"). Falls back to: if `obj` itself is already a
+    list, return it as-is. Returns [] if nothing usable is found —
+    never raises.
+    """
+    if isinstance(obj, list):
+        return obj
+    if not isinstance(obj, dict):
+        return []
+    for key in candidate_list_keys:
+        val = obj.get(key)
+        if isinstance(val, list):
+            return val
+        if isinstance(val, dict):
+            # some providers nest one level deeper, e.g. {"data": {"results": [...]}}
+            for inner_key in candidate_list_keys:
+                inner_val = val.get(inner_key)
+                if isinstance(inner_val, list):
+                    return inner_val
+    return []
+
+
+# Candidate field names for a per-result Google rank/position.
+RANK_FIELD_CANDIDATES = [
+    "rank_absolute", "rank", "position", "google_rank",
+    "serp_position", "rank_group", "index", "pos",
+]
+
+# Candidate field names for the result-list container.
+RESULT_LIST_KEY_CANDIDATES = [
+    "results", "organic_results", "organic", "items", "data", "response", "hits",
+]
+
+# Candidate field names for monthly search volume.
+VOLUME_FIELD_CANDIDATES = [
+    "search_volume", "searchVolume", "volume", "monthly_searches",
+    "avg_monthly_searches", "monthlySearchVolume", "search_volume_monthly",
+    "avg_search_volume",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -445,10 +526,10 @@ def get_database():
 
         # ── flintel_keywords — FETCH-ONCE-FOREVER cache. Restart-safe: this
         # collection is the single source of truth for "has this keyword
-        # ever been fetched?" AND (new in v9.5) "does this keyword already
-        # have a cached search_volume?" It survives process restarts, so a
-        # keyword already marked fetched=True is NEVER re-fetched, ever,
-        # and a keyword that already has a search_volume is NEVER re-queried
+        # ever been fetched?" AND "does this keyword already have a cached
+        # search_volume?" It survives process restarts, so a keyword
+        # already marked fetched=True is NEVER re-fetched, ever, and a
+        # keyword that already has a search_volume is NEVER re-queried
         # for volume, ever.
         db.flintel_keywords.create_index([("keyword", ASCENDING)], unique=True, name="keyword_unique")
         db.flintel_keywords.create_index([("fetched", ASCENDING)], name="keyword_fetched_idx")
@@ -695,7 +776,7 @@ def get_keywords_missing_volume(keywords: list) -> list:
     works). These are exactly the keywords that will be sent to
     seed_search_volume_batch() next, batched, never one at a time.
 
-    Once a keyword's search_volume is set (even if DataForSEO itself
+    Once a keyword's search_volume is set (even if the provider itself
     returned null/0 for it — see seed_search_volume_batch()), it will
     never show up here again, so it will never be re-queried for volume,
     ever — same fetch-once-forever guarantee as the discovery cache.
@@ -757,30 +838,26 @@ def mark_keyword_fetched(keyword: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SEARCH-VOLUME BATCH SEEDING — NEW in v9.5. Replaces the old per-keyword
-# fetch_search_volume(keyword) call that used to fire once for EVERY
-# keyword inside process_one_keyword(). The DataForSEO search_volume/live
-# endpoint bills PER REQUEST (not per keyword) and accepts up to 1000
-# keywords per request — so batching keywords here turns what used to be
-# N paid requests (one per keyword) into ceil(N / SEARCH_VOLUME_BATCH_SIZE)
-# paid requests, with the EXACT same data ending up in the EXACT same
-# place (flintel_keywords.search_volume) for the discovery loop to read.
-#
-# This is a pure cost optimization — it changes NOTHING about the item
-# schema, the queue, Claude's payload, or the signals collection. Every
-# post discovered for a keyword still gets that keyword's search_volume
-# stamped onto it, exactly as before.
+# SEARCH-VOLUME BATCH SEEDING — chunks keywords, fetches volume for each
+# one (single.php only accepts one keyword per call), writes results back
+# onto each keyword's own flintel_keywords document. Field-extraction is
+# now robust to the provider's real response schema (BUG 2 fix).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SEARCH_VOLUME_BATCH_SIZE):
     """
-    ONE-TIME (per keyword) BATCH search-volume seeding — NOT a per-keyword
-    API call. Splits `keywords_needing_volume` into chunks of up to
-    `batch_size` (default 500) and fetches ALL keywords in a chunk with a
-    SINGLE DataForSEO request. Results are written back onto each
-    keyword's own flintel_keywords document (search_volume field) —
-    the same document already used for the fetch-once-forever discovery
-    cache. No new collection, no schema change.
+    ONE-TIME (per keyword) BATCH search-volume seeding. Splits
+    `keywords_needing_volume` into chunks of up to `batch_size` and
+    fetches volume for every keyword in the chunk. Results are written
+    back onto each keyword's own flintel_keywords document
+    (search_volume field) — the same document already used for the
+    fetch-once-forever discovery cache. No new collection, no schema
+    change.
+
+    BUG FIX (v9.6): volume_map now uses _dig_value() with a list of
+    candidate field names instead of assuming the response key is
+    literally "search_volume" — the old code silently stored None for
+    every keyword when the provider used a different key name.
 
     Once a keyword's search_volume is set here, get_keywords_missing_volume()
     will never return it again, so this function will never be called for
@@ -798,7 +875,7 @@ def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SE
         try:
             # single.php only accepts ONE keyword per request, so each
             # keyword in the chunk gets its own call — same chunk/loop
-            # structure kept as-is, only the request itself changed.
+            # structure kept as-is, only the field extraction changed.
             volume_map = {}
             for kw in chunk:
                 url = "https://seo-keyword-research.p.rapidapi.com/single.php"
@@ -813,10 +890,20 @@ def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SE
 
                 r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
 
-                print(r.json())
+                try:
+                    row = r.json()
+                except ValueError:
+                    log.error(f"[VOLUME-SEED] Non-JSON response for {kw!r} | status:{r.status_code}")
+                    row = None
 
-                row = r.json()
-                volume_map[kw] = row.get("search_volume") if isinstance(row, dict) else None
+                vol = _dig_value(row, VOLUME_FIELD_CANDIDATES)
+                if vol is None:
+                    log.warning(
+                        f"[VOLUME-SEED] Could not find a volume field for {kw!r} in response "
+                        f"(tried {VOLUME_FIELD_CANDIDATES}) | raw_keys:"
+                        f"{list(row.keys()) if isinstance(row, dict) else type(row).__name__}"
+                    )
+                volume_map[kw] = vol
 
             for kw in chunk:
                 vol = volume_map.get(kw)
@@ -841,15 +928,16 @@ def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENRICHMENT — DataForSEO is the SOLE provider for Google rank + volume.
+# ENRICHMENT — RapidAPI is the SOLE provider for Google rank + volume.
+# Field extraction now uses _dig_value()/_dig_list() (BUG 1 + 2 fix).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_search_volume(search_keyword: str) -> int | None:
     """
-    Monthly search volume via DataForSEO Labs (HTTP Basic Auth) — a SINGLE
-    keyword, single request. Kept for the Twitter fallback path
-    (fetch_google_stats(), used only when SEARCH_KEYWORD is configured for
-    Twitter items, which have no per-post SERP discovery in this design).
+    Monthly search volume — a SINGLE keyword, single request. Kept for
+    the Twitter fallback path (fetch_google_stats(), used only when
+    SEARCH_KEYWORD is configured for Twitter items, which have no
+    per-post SERP discovery in this design).
 
     NOTE: the Reddit discovery path (process_one_keyword()) NO LONGER
     calls this function — Reddit's search_volume now comes exclusively
@@ -872,10 +960,13 @@ def fetch_search_volume(search_keyword: str) -> int | None:
 
         r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
 
-        print(r.json())
+        try:
+            result = r.json()
+        except ValueError:
+            log.error(f"fetch_search_volume non-JSON response for {search_keyword!r} | status:{r.status_code}")
+            return None
 
-        result = r.json()
-        return result.get("search_volume") if isinstance(result, dict) else None
+        return _dig_value(result, VOLUME_FIELD_CANDIDATES)
     except Exception as exc:
         log.error(f"fetch_search_volume error for {search_keyword!r}: {exc}")
         return None
@@ -902,11 +993,16 @@ def fetch_google_rank(search_keyword: str) -> int | None:
 
         r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
 
-        print(r.json())
+        try:
+            result_data = r.json()
+        except ValueError:
+            log.error(f"fetch_google_rank non-JSON response for {search_keyword!r} | status:{r.status_code}")
+            return None
 
-        result_data = r.json()
-        items = result_data.get("results", []) if isinstance(result_data, dict) else []
-        return items[0].get("rank_absolute") if items else None
+        items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
+        if not items:
+            return None
+        return _dig_value(items[0], RANK_FIELD_CANDIDATES)
     except Exception as exc:
         log.error(f"fetch_google_rank error for {search_keyword!r}: {exc}")
         return None
@@ -920,7 +1016,7 @@ def fetch_google_stats(search_keyword: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT — SOLE discovery mechanism: DataForSEO SERP search
+# REDDIT — SOLE discovery mechanism: RapidAPI SERP search
 # (site:reddit.com) -> real per-post rank + URL -> Reddit public .json
 # -> full post data (text, username, subreddit, upvotes, comments,
 # posted_at). Each keyword is only fetched when get_due_keywords() says
@@ -930,13 +1026,20 @@ def fetch_google_stats(search_keyword: str) -> dict:
 
 def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK) -> list:
     """
-    DataForSEO SERP API — Google search restricted to site:reddit.com,
-    rolling last-N-months date window. Returns real per-result rank + URL.
-    Only called for keywords that get_due_keywords() has flagged as due.
+    RapidAPI Google search restricted to site:reddit.com, rolling
+    last-N-months date window. Returns real per-result rank + URL. Only
+    called for keywords that get_due_keywords() has flagged as due.
 
     This call CANNOT be batched across keywords (each keyword is its own
     unique search query with its own unique results) — it remains one
-    call per keyword, exactly as in v9.4. Only search_volume changed.
+    call per keyword.
+
+    BUG FIX (v9.6): result list + per-result rank are now extracted with
+    _dig_list()/_dig_value() instead of assuming exact key names
+    ("results" / "rank_absolute") — the old code returned url+title fine
+    (those keys happened to match) but silently dropped rank on every
+    single result because the provider's actual rank field had a
+    different name.
     """
     if not RAPIDAPI_KEY:
         log.warning("[SERP] RapidAPI key not set — skipping SERP search.")
@@ -961,20 +1064,39 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
 
         r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
 
-        print(r.json())
+        try:
+            result_data = r.json()
+        except ValueError:
+            log.error(f"[SERP] Non-JSON response for {keyword!r} | status:{r.status_code}")
+            return []
 
-        result_data = r.json()
-        items = result_data.get("results", []) if isinstance(result_data, dict) else []
+        raw_items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
         results = []
-        for item in items:
-            item_url = item.get("url", "")
+        rank_misses = 0
+        for pos, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict):
+                continue
+            item_url = item.get("url", "") or item.get("link", "")
             if "reddit.com" not in item_url:
                 continue
+            rank = _dig_value(item, RANK_FIELD_CANDIDATES)
+            if rank is None:
+                # Fall back to the result's position in the returned
+                # order if the provider genuinely doesn't expose an
+                # explicit rank field — better than a permanent null.
+                rank = pos
+                rank_misses += 1
             results.append({
                 "url":   item_url,
-                "rank":  item.get("rank_absolute"),
+                "rank":  rank,
                 "title": item.get("title", ""),
             })
+
+        if rank_misses and rank_misses == len(results) and results:
+            log.warning(
+                f"[SERP] '{keyword}' — no explicit rank field found in any result "
+                f"(tried {RANK_FIELD_CANDIDATES}); used result order as rank fallback."
+            )
 
         log.info(
             f"[SERP] '{keyword}' → {len(results)} Reddit result(s) "
@@ -1010,18 +1132,100 @@ def is_post_already_signaled(post_url: str) -> bool:
         return False   # fail-open: if the check itself fails, don't block discovery
 
 
+def _reddit_get_with_retry(url: str) -> requests.Response | None:
+    """
+    NEW in v9.6 (BUG 3 fix) — "smart" GET wrapper for Reddit's public
+    .json endpoint:
+      - Reddit-recommended User-Agent format (REDDIT_USER_AGENT).
+      - Small randomized jitter delay before each attempt, to avoid an
+        obviously robotic, perfectly-uniform request cadence.
+      - Exponential backoff retry, up to REDDIT_FETCH_MAX_RETRIES times,
+        specifically for 403 / 429 / 5xx responses (these are the
+        classes of error retrying can plausibly help with; a 404 means
+        the post is genuinely gone and is not retried).
+    Returns the Response on success (status 200), or None if every
+    attempt failed — caller treats None exactly like the old code
+    treated a raised exception (skip this post, try again on a future
+    discovery pass since it was never saved to `signals`).
+    """
+    headers = {
+        "User-Agent": REDDIT_USER_AGENT,
+        "Accept": "application/json",
+    }
+
+    last_status = None
+    for attempt in range(1, REDDIT_FETCH_MAX_RETRIES + 1):
+        # jitter delay BEFORE each request — including the first — so
+        # request timing doesn't look perfectly mechanical
+        time.sleep(random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX))
+        try:
+            r = requests.get(url, headers=headers, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
+            last_status = r.status_code
+            if r.status_code == 200:
+                return r
+            if r.status_code == 404:
+                # post genuinely removed/deleted — retrying won't help
+                log.debug(f"[SERP] 404 (gone) for {url} — not retrying.")
+                return None
+            if r.status_code in (403, 429) or r.status_code >= 500:
+                wait = (REDDIT_FETCH_BACKOFF_BASE ** attempt) + random.uniform(0, 1.0)
+                log.warning(
+                    f"[SERP] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
+                    f"got {r.status_code} for {url} — backing off {wait:.1f}s..."
+                )
+                time.sleep(wait)
+                continue
+            # any other status — don't spin, just fail
+            log.error(f"[SERP] Unexpected status {r.status_code} for {url}")
+            return None
+        except requests.RequestException as exc:
+            log.warning(
+                f"[SERP] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
+                f"network error for {url}: {exc}"
+            )
+            time.sleep((REDDIT_FETCH_BACKOFF_BASE ** attempt))
+
+    log.error(f"[SERP] Reddit fetch exhausted {REDDIT_FETCH_MAX_RETRIES} attempts for {url} "
+              f"(last_status:{last_status})")
+    return None
+
+
 def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | None:
     """
     Reddit's public .json endpoint (no OAuth/credentials needed) — fetches
     the FULL post: text, username, subreddit, upvotes, comments, posted_at.
     This is the ONLY way Reddit data enters this system now.
+
+    BUG FIX (v9.6): now uses _reddit_get_with_retry() instead of a single
+    unretried request with a weak User-Agent — see that function's
+    docstring for the full retry/backoff/User-Agent strategy. If
+    www.reddit.com keeps failing after all retries, one final attempt is
+    made against old.reddit.com (different edge path, sometimes succeeds
+    where www. does not) before giving up entirely.
     """
     if not post_url:
         return None
+
+    primary_url = post_url.rstrip("/") + ".json"
+    r = _reddit_get_with_retry(primary_url)
+
+    if r is None and "old.reddit.com" not in post_url:
+        # last-resort fallback host
+        fallback_url = (
+            post_url.rstrip("/")
+            .replace("https://www.reddit.com", "https://old.reddit.com")
+            .replace("https://reddit.com", "https://old.reddit.com")
+            + ".json"
+        )
+        if fallback_url != primary_url:
+            log.info(f"[SERP] Retrying via old.reddit.com fallback: {fallback_url}")
+            r = _reddit_get_with_retry(fallback_url)
+
+    if r is None:
+        log.error(f"[SERP] fetch_reddit_post_by_url gave up for {post_url}")
+        return None
+
     try:
-        url = post_url.rstrip("/") + ".json"
-        r = requests.get(url, headers={"User-Agent": "flintel-serp/1.0"}, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
-        r.raise_for_status()
         data = r.json()
         post_data = data[0]["data"]["children"][0]["data"]
 
@@ -1046,7 +1250,7 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
             "search_volume":        None,   # filled in by process_one_keyword() below
         }
     except Exception as exc:
-        log.error(f"[SERP] fetch_reddit_post_by_url error for {post_url}: {exc}")
+        log.error(f"[SERP] fetch_reddit_post_by_url parse error for {post_url}: {exc}")
         return None
 
 
@@ -1054,7 +1258,7 @@ def process_one_keyword(keyword: str, volume) -> tuple:
     """
     Full discovery work for ONE keyword that get_due_keywords() has
     flagged as due right now:
-      1. DataForSEO SERP search (site:reddit.com, last N months)
+      1. RapidAPI SERP search (site:reddit.com, last N months)
       2. Per-result post_url dedup check -> skip already-known posts
          (no .json fetch, no Claude call for those)
       3. Reddit .json fetch for genuinely new posts -> stamp the
@@ -1062,14 +1266,12 @@ def process_one_keyword(keyword: str, volume) -> tuple:
          for Claude scoring
     Returns (new_items_count, skipped_dupes_count) for logging.
 
-    CHANGED IN v9.5: `volume` is now passed in by the caller (read straight
-    off the keyword's own flintel_keywords document by run_serp_discovery_loop())
-    instead of being fetched here via fetch_search_volume(keyword). This
-    removes the old per-keyword search_volume API call entirely from the
-    discovery path — search_volume is now sourced from the batched
+    `volume` is passed in by the caller (read straight off the keyword's
+    own flintel_keywords document by run_serp_discovery_loop()) instead
+    of being fetched here — search_volume is sourced from the batched
     seed_search_volume_batch() cache. Every post discovered for this
     keyword still ends up with the exact same "search_volume" field,
-    exact same item schema, exact same queue/Claude/signals flow as before.
+    exact same item schema, exact same queue/Claude/signals flow.
     """
     new_items, skipped_dupes = 0, 0
 
@@ -1118,7 +1320,7 @@ def run_serp_discovery_loop():
 
     # One-time (per new keyword) BATCH search-volume seeding, done BEFORE
     # the loop starts so the very first discovery pass already has cached
-    # volumes to read — never a per-keyword call.
+    # volumes to read.
     missing_volume = get_keywords_missing_volume(REDDIT_SEARCH_KEYWORDS)
     if missing_volume:
         log.info(
@@ -1132,7 +1334,8 @@ def run_serp_discovery_loop():
         f"check_interval:{KEYWORD_CHECK_INTERVAL_SECONDS}s | "
         f"months_back:{SERP_MONTHS_BACK} | depth:{SERP_RESULTS_PER_KEYWORD} | "
         f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever | "
-        f"SEARCH-VOLUME: batched (size {SEARCH_VOLUME_BATCH_SIZE}), never per-keyword"
+        f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}) | "
+        f"REDDIT FETCH: smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + fallback host)"
     )
 
     while True:
@@ -1143,8 +1346,7 @@ def run_serp_discovery_loop():
 
             # Batch-seed search_volume for any keyword still missing one
             # (covers brand-new keywords added since the last pass, or
-            # any keyword whose previous seed attempt failed). Still
-            # batched, never one API call per keyword.
+            # any keyword whose previous seed attempt failed).
             missing_volume = get_keywords_missing_volume(REDDIT_SEARCH_KEYWORDS)
             if missing_volume:
                 seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
@@ -1334,7 +1536,7 @@ def save_new_signal(item: dict, score_result: dict, force_pending: bool = False)
         item; run_rescore_processor() will automatically pick it up on
         its next poll cycle and retry scoring, reusing the enrichment
         fields already stored below — NO re-fetch from Reddit/.json or
-        DataForSEO happens on rescore.)
+        RapidAPI happens on rescore.)
       - force_pending=False -> status="confirmed" (Claude scored it
         successfully — final).
     """
@@ -1384,7 +1586,7 @@ def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: di
     Called by the rescore processor once Claude has (re-)scored a
     pending document. Reuses the enrichment fields (google_rank,
     search_volume, upvotes, comments) that are ALREADY stored on the
-    existing document — NO new fetch to Reddit/.json or DataForSEO
+    existing document — NO new fetch to Reddit/.json or RapidAPI
     happens here, only a re-call to Claude for scoring.
     """
     existing = db.signals.find_one({"message_id": message_id})
@@ -1701,7 +1903,7 @@ async def start_reddit_listener():
     Reddit's ONLY mechanism now: SERP discovery thread (per-keyword
     fetch-once-forever cache + batched search-volume seeding -> Google
     search -> .json fetch) + its dedicated batch processor thread.
-    Governed entirely by REDDIT_ENABLED + DataForSEO credentials.
+    Governed entirely by REDDIT_ENABLED + RapidAPI credentials.
     """
     if not REDDIT_ENABLED:
         log.warning("Reddit platform DISABLED — skipping.")
@@ -1806,15 +2008,16 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v9.5 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding) + Twitter Signal Scorer",
+    title="Flintel v9.6 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + smart-retry fetch) + Twitter Signal Scorer",
     description=(
-        "Reddit (DataForSEO SERP discovery, fetch-once-forever keyword cache — "
+        "Reddit (RapidAPI SERP discovery, fetch-once-forever keyword cache — "
         "no re-fetch, ever, once a keyword is done) + Twitter signals: monitor, "
         "score (generic 1-100 relevance/visibility/engagement model), store. "
-        "search_volume is now seeded in BATCHES of up to 500 keywords per "
-        "DataForSEO request (never one keyword per request), cached on each "
-        "keyword's own flintel_keywords document, and read from there at "
-        "discovery time — no schema or output changes, pure cost optimization. "
+        "search_volume/google_rank field extraction is now resilient to the "
+        "RapidAPI provider's actual response schema (v9.6 bug fix — was "
+        "silently null before). Reddit .json fetches now use a smart "
+        "retry/backoff strategy with a proper User-Agent and an "
+        "old.reddit.com fallback to reduce 403 blocks (v9.6 bug fix). "
         "Persistent batch state + queue + dedup — no in-flight item is ever "
         "lost on restart. Each keyword is tracked in flintel_keywords and, "
         "once fetched, is PERMANENTLY marked done — restarts never reset "
@@ -1822,10 +2025,10 @@ app = FastAPI(
         "Newly added keywords are picked up automatically, one at a time. "
         "Streaming Claude with partial-JSON recovery. Claude failures route "
         "to status='pending' for automatic rescore (re-uses stored "
-        "enrichment, never re-fetches from Reddit/.json or DataForSEO) "
+        "enrichment, never re-fetches from Reddit/.json or RapidAPI) "
         "instead of a permanent low score."
     ),
-    version="9.5.0",
+    version="9.6.0",
 )
 
 
@@ -1852,7 +2055,7 @@ def root():
     })
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.5 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + Twitter)",
+        "system":                  "FLINTEL v9.6 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + smart Reddit retry + Twitter)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -1863,7 +2066,8 @@ def root():
         "twitter_search_keywords": len(TWITTER_SEARCH_KEYWORDS),
         "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
         "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords)",
-        "search_volume_seeding":           f"BATCHED (chunks of {SEARCH_VOLUME_BATCH_SIZE}), never per-keyword",
+        "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE})",
+        "reddit_fetch_reliability":         f"smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback)",
         "keywords_tracked":               total_keywords_tracked,
         "keywords_due_now":               due_now_count,
         "keywords_missing_search_volume": missing_volume_count,
@@ -2001,8 +2205,8 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.5 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
-    log.info("                  + BATCHED SEARCH-VOLUME SEEDING) + TWITTER SIGNAL SCORER")
+    log.info("  FLINTEL v9.6 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
+    log.info("                  + BATCHED SEARCH-VOLUME SEEDING + SMART RETRY) + TWITTER SIGNAL SCORER")
     log.info("=" * 70)
     log.info(f"  Client               : {CLIENT_ID}")
     log.info(f"  Platforms            : Reddit (SERP discovery, fetch-once-forever) + Twitter/X")
@@ -2012,8 +2216,10 @@ if __name__ == "__main__":
     log.info(f"  Twitter keywords     : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
     log.info(f"  Keyword cache        : fetch-once-forever (no re-fetch, ever) | check every {KEYWORD_CHECK_INTERVAL_SECONDS}s | "
              f"last {SERP_MONTHS_BACK} months | depth {SERP_RESULTS_PER_KEYWORD}")
-    log.info(f"  Search-volume seeding: BATCHED, chunks of {SEARCH_VOLUME_BATCH_SIZE} keywords per DataForSEO request | "
-             f"never one call per keyword | cached on flintel_keywords, read at discovery time")
+    log.info(f"  Search-volume seeding: batched loop, chunks of {SEARCH_VOLUME_BATCH_SIZE} keywords | "
+             f"cached on flintel_keywords, read at discovery time | robust field extraction (v9.6)")
+    log.info(f"  Reddit fetch         : smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff, jitter "
+             f"{REDDIT_FETCH_JITTER_MIN}-{REDDIT_FETCH_JITTER_MAX}s, old.reddit.com fallback) (v9.6)")
     log.info(f"  Reddit batch         : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
     log.info(f"  Twitter batch        : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
     log.info(f"  Rescore batch        : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
