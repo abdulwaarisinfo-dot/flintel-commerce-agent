@@ -1927,11 +1927,17 @@ def save_new_signal(item: dict, score_result: dict, force_pending: bool = False)
     try:
         db.signals.insert_one(doc)
         sv_tag = "RANDOM-FALLBACK" if item.get("search_volume_is_random") else "real"
+        # Minimal, focused log line — ONLY what's needed to eyeball a
+        # signal at a glance: platform + keyword, search_volume (/mo,
+        # tagged real vs random-fallback), google_rank as a plain number,
+        # and the post_url. Full doc (score, engagement, etc.) is still
+        # in Mongo/the /signals endpoint as before — this is just the
+        # log line format, nothing else changed.
         log.info(
-            f"SAVED [{doc['platform'].upper()}] status:{doc['status']} score:{doc['intent_score']} "
-            f"relevant:{doc['is_relevant']} | u/{doc['username']} | "
-            f"upvotes:{doc['upvotes']} comments:{doc['comments']} "
-            f"rank:{doc['google_rank']} volume:{doc['search_volume']} ({sv_tag})"
+            f"SAVED [{doc['platform'].upper()}] {doc['search_keyword']!r} | "
+            f"search_volume:{doc['search_volume']}/mo ({sv_tag}) | "
+            f"google_rank:{doc['google_rank']} | "
+            f"post_url:{doc['post_url']}"
         )
         return True
     except DuplicateKeyError:
