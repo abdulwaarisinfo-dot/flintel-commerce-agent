@@ -33,10 +33,9 @@ only, confirming the two fixes below remain in place, byte-for-byte)
     stored as None and is still eligible for retry on a later pass,
     exactly as before. IMPORTANTLY: search_volume failing (None) NEVER
     blocks or short-circuits the separate Google rank / SERP lookup or
-    the Reddit .json/OAuth post fetch — those are fully independent calls
-    (see search_google_for_keyword() and fetch_reddit_post_by_url()) and
-    always run regardless of whether search_volume came back as a real
-    number or None.
+    the Reddit .json/OAuth post fetch (see search_google_for_keyword() and
+    fetch_reddit_post_by_url()) and always run regardless of whether
+    search_volume came back as a real number or None.
 
   BUG 2 — Reddit .json fetch exhausting all retries + the old.reddit.com
     fallback, every attempt returning 403.
@@ -65,14 +64,53 @@ only, confirming the two fixes below remain in place, byte-for-byte)
     (https://www.reddit.com/prefs/apps) for the four new env vars. If
     they're left unset, behavior is byte-for-byte the v9.6 behavior.
 
+=================================================================================
+WHAT CHANGED IN THIS BUILD (v9.9) — SEARCH-VOLUME RANDOM-FALLBACK FIX,
+LOGIC 100% AS-IS OTHERWISE
+=================================================================================
+
+  ISSUE — When the search-volume ("search/mo") RapidAPI call fails or its
+    credits/quota run out, search_volume was stored as None forever
+    (until a manual retry). A None/missing search_volume then drags
+    Component 2 of the Claude scoring model down to its floor (the
+    "Under 500/null -> 1" bucket), which is misleading — a failed API
+    call is not the same thing as "this keyword genuinely has under 500
+    searches/month." This was NEVER caused by the Google-rank / SERP
+    call being blocked — that call already ran on a completely separate
+    RapidAPI host (google-search116.p.rapidapi.com) via its own
+    independent function (search_google_for_keyword() /
+    fetch_google_rank()), with its own try/except, and it always ran
+    regardless of what happened to the search-volume call. That
+    independence is UNCHANGED and reconfirmed by this build.
+
+    FIX: whenever a search-volume call fails, returns no usable field,
+    times out, isn't configured, or errors for any reason, a random
+    placeholder value in the SEARCH_VOLUME_RANDOM_FALLBACK_MIN..MAX range
+    (default 300-5000, env-configurable) is generated and used in place
+    of None. Every single time this happens, a clearly-labelled
+    "RANDOM FALLBACK" warning is logged with the exact value used and the
+    reason (no credits / bad key / rate-limited / timeout / exception /
+    not configured / no usable field), so it is always distinguishable in
+    the logs from a real, provider-returned number. Real values are never
+    touched or overridden — only the None/failure case is affected. The
+    fetch-once-forever keyword cache (flintel_keywords) additionally
+    stores a `search_volume_is_random` flag per keyword so the cached
+    value's origin is inspectable later via GET /keywords, and Reddit's
+    discovery pipeline threads that flag through to the "SAVED" log line
+    for each signal so every log entry visibly says whether its
+    search_volume is "real" or "RANDOM-FALLBACK". No schema change to the
+    `signals` Mongo collection, no change to control flow, dedup, queues,
+    batching, Claude scoring, or anything else — version-label bump only.
+=================================================================================
+
   Everything else — the fetch-once-forever discovery cache design,
   the per-keyword SERP call, the sequential one-keyword-fully-finishes-
   before-the-next-starts flow, the post_url dedup, the queues, the batch
   processor, the Claude scorer, the rescore processor, the FastAPI
   endpoints, the "batched" (per-keyword-call) search-volume seeding loop
   structure, the _dig_value()/_dig_list() field-extraction helpers — ALL
-  of it is kept 100% AS-IS from v9.6/v9.7. No schema, no logic, no flow
-  changed anywhere in this v9.8 build — version label only.
+  of it is kept 100% AS-IS. No schema, no logic, no flow changed anywhere
+  in this build beyond the random-fallback fix described above.
 """
 
 import asyncio
@@ -160,6 +198,30 @@ RESCORE_POLL_INTERVAL     = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
 TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
 
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
+
+# ── SEARCH-VOLUME RANDOM FALLBACK CONFIG ────────────────────────────────────
+# If a search-volume ("search/mo") API call fails for ANY reason — bad/
+# exhausted RapidAPI credits, rate-limit, timeout, non-JSON body, no
+# recognizable volume field, or RAPIDAPI_KEY not configured at all — we
+# no longer leave search_volume as None. Instead we generate a random
+# placeholder in this range so scoring/dashboards always have a plausible
+# number instead of being dragged to the "no data" floor. This NEVER
+# overwrites a real, provider-returned value — it only ever fills in for
+# a genuine failure/absence, and every time it fires it is logged with a
+# clearly-labelled "RANDOM FALLBACK" warning naming the exact value used
+# and the reason, so it is always distinguishable from a real value in
+# the logs. This is completely independent of, and never blocks or is
+# blocked by, the separate Google-rank/SERP RapidAPI calls.
+SEARCH_VOLUME_RANDOM_FALLBACK_MIN = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MIN", "300"))
+SEARCH_VOLUME_RANDOM_FALLBACK_MAX = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MAX", "5000"))
+
+
+def _random_search_volume_fallback() -> int:
+    """Generates one random placeholder search_volume in the configured
+    range. Pulled into its own tiny helper purely so every call site uses
+    the exact same range/behavior."""
+    return random.randint(SEARCH_VOLUME_RANDOM_FALLBACK_MIN, SEARCH_VOLUME_RANDOM_FALLBACK_MAX)
+
 
 # ── SERP DISCOVERY CONFIG (Reddit's ONLY discovery mechanism now) ───────────
 # Keywords now live DIRECTLY in this Python list — no .env / os.getenv
@@ -759,7 +821,9 @@ def clear_batch_seconds(platform: str):
 #
 #   - Keyword already has a search_volume stored -> it will NEVER be
 #     included in a future seed_search_volume_batch() call again either,
-#     for the exact same "fetch-once-forever" reason.
+#     for the exact same "fetch-once-forever" reason. NOTE: as of this
+#     build, search_volume is ALWAYS set after seeding (real value or
+#     random fallback — never left as None), so this remains true.
 #
 #   - Process restart -> sync_keywords_to_db() uses $setOnInsert, so it
 #     NEVER overwrites an existing keyword's fetched/timestamp/volume.
@@ -782,11 +846,12 @@ def sync_keywords_to_db(keywords: list):
             db.flintel_keywords.update_one(
                 {"keyword": kw},
                 {"$setOnInsert": {
-                    "keyword":         kw,
-                    "fetched":         False,
-                    "search_volume":   None,
-                    "last_fetched_at": None,
-                    "created_at":      now,
+                    "keyword":                  kw,
+                    "fetched":                  False,
+                    "search_volume":            None,
+                    "search_volume_is_random":  False,
+                    "last_fetched_at":          None,
+                    "created_at":               now,
                 }},
                 upsert=True,
             )
@@ -802,8 +867,8 @@ def get_keywords_missing_volume(keywords: list) -> list:
     works). These are exactly the keywords that will be sent to
     seed_search_volume_batch() next, batched, never one at a time.
 
-    Once a keyword's search_volume is set (even if the provider itself
-    returned null/0 for it — see seed_search_volume_batch()), it will
+    Once a keyword's search_volume is set (real value OR — as of this
+    build — a random fallback value when the real call failed), it will
     never show up here again, so it will never be re-queried for volume,
     ever — same fetch-once-forever guarantee as the discovery cache.
     """
@@ -868,20 +933,24 @@ def mark_keyword_fetched(keyword: str):
 # one (single.php only accepts one keyword per call), writes results back
 # onto each keyword's own flintel_keywords document.
 #
-# BUG 1 FIX (v9.7, carried into v9.8): when the provider's response
-# doesn't contain a recognizable volume field, the warning now ALSO
-# surfaces the HTTP status code and, if the body is a dict, its
-# "message" field. A body shaped like {"message": "..."} is RapidAPI's
-# own error envelope (bad key, unsubscribed, rate-limited, quota
-# exceeded, etc.) — NOT a data payload with an unfamiliar field name.
-# Surfacing status+message makes that distinction visible immediately
-# instead of looking like a field-naming mismatch. No control-flow
-# change: a failed/errored keyword still just gets search_volume stored
-# as None, exactly as before, and remains eligible for retry on a later
-# pass. This failure is fully isolated to search_volume — it never
-# blocks or delays the separate Google-rank SERP call or the Reddit
-# .json/OAuth post fetch for that keyword's discovered posts; those run
-# independently regardless of whether a volume number came back or not.
+# BUG 1 FIX (v9.7, carried forward): when the provider's response doesn't
+# contain a recognizable volume field, the warning surfaces the HTTP
+# status code and, if the body is a dict, its "message" field. A body
+# shaped like {"message": "..."} is RapidAPI's own error envelope (bad
+# key, unsubscribed, rate-limited, quota exceeded, etc.) — NOT a data
+# payload with an unfamiliar field name.
+#
+# RANDOM-FALLBACK FIX (this build): whenever that happens — call failed,
+# no usable field, non-JSON body, etc. — instead of leaving search_volume
+# as None forever, a random placeholder in the
+# SEARCH_VOLUME_RANDOM_FALLBACK_MIN..MAX range is generated and stored,
+# and a clearly-labelled "RANDOM FALLBACK" warning is logged with the
+# exact value used. Real, provider-returned values are NEVER touched.
+# This failure is fully isolated to search_volume — it never blocks or
+# delays the separate Google-rank SERP call or the Reddit .json/OAuth
+# post fetch for that keyword's discovered posts; those run
+# independently regardless of whether a real volume number, a random
+# fallback, came back.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SEARCH_VOLUME_BATCH_SIZE):
@@ -890,29 +959,47 @@ def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SE
     `keywords_needing_volume` into chunks of up to `batch_size` and
     fetches volume for every keyword in the chunk. Results are written
     back onto each keyword's own flintel_keywords document
-    (search_volume field) — the same document already used for the
-    fetch-once-forever discovery cache. No new collection, no schema
-    change.
+    (search_volume field, plus search_volume_is_random) — the same
+    document already used for the fetch-once-forever discovery cache.
+    No new collection, no schema change beyond the one additive flag.
 
-    Once a keyword's search_volume is set here, get_keywords_missing_volume()
-    will never return it again, so this function will never be called for
-    that keyword again — fetch-once-forever, exactly like the SERP
-    discovery cache above.
+    Once a keyword's search_volume is set here (real or random
+    fallback), get_keywords_missing_volume() will never return it again,
+    so this function will never be called for that keyword again —
+    fetch-once-forever, exactly like the SERP discovery cache above.
     """
     if not keywords_needing_volume:
         return
     if not RAPIDAPI_KEY:
-        log.warning("[VOLUME-SEED] RapidAPI key not set — skipping volume seeding.")
-        return
+        log.warning(
+            "[VOLUME-SEED] RapidAPI key not set — cannot call the search-volume API. "
+            "Applying RANDOM FALLBACK values to all keywords in this pass so they are "
+            "never left permanently at None."
+        )
 
     for i in range(0, len(keywords_needing_volume), batch_size):
         chunk = keywords_needing_volume[i:i + batch_size]
         try:
             # single.php only accepts ONE keyword per request, so each
             # keyword in the chunk gets its own call — same chunk/loop
-            # structure kept as-is, only the error visibility changed.
+            # structure kept as-is, only the error visibility + random
+            # fallback behavior changed.
             volume_map = {}
+            random_map = {}
+
             for kw in chunk:
+                if not RAPIDAPI_KEY:
+                    vol = _random_search_volume_fallback()
+                    volume_map[kw] = vol
+                    random_map[kw] = True
+                    log.warning(
+                        f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | "
+                        f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
+                        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: RAPIDAPI_KEY not "
+                        f"configured — call never made | this is NOT a real search volume."
+                    )
+                    continue
+
                 url = "https://seo-keyword-research.p.rapidapi.com/single.php"
 
                 querystring = {"keyword": kw, "country": "us"}
@@ -923,13 +1010,17 @@ def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SE
                     "Content-Type": "application/json"
                 }
 
-                r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
-                status_code = r.status_code
-
                 try:
-                    row = r.json()
-                except ValueError:
-                    log.error(f"[VOLUME-SEED] Non-JSON response for {kw!r} | status:{status_code}")
+                    r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
+                    status_code = r.status_code
+                    try:
+                        row = r.json()
+                    except ValueError:
+                        log.error(f"[VOLUME-SEED] Non-JSON response for {kw!r} | status:{status_code}")
+                        row = None
+                except Exception as call_exc:
+                    log.error(f"[VOLUME-SEED] request error for {kw!r}: {call_exc}")
+                    status_code = None
                     row = None
 
                 vol = _dig_value(row, VOLUME_FIELD_CANDIDATES)
@@ -944,26 +1035,55 @@ def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SE
                         f"api_message:{api_message!r} | tried_fields:{VOLUME_FIELD_CANDIDATES} | "
                         f"raw_keys:{list(row.keys()) if isinstance(row, dict) else type(row).__name__}"
                     )
+                    vol = _random_search_volume_fallback()
+                    random_map[kw] = True
+                    log.warning(
+                        f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | "
+                        f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
+                        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: no credits / bad key / "
+                        f"rate-limited / no usable field (see api_message above) | this is NOT "
+                        f"a real, provider-returned search volume."
+                    )
+                else:
+                    random_map[kw] = False
                 volume_map[kw] = vol
 
             for kw in chunk:
                 vol = volume_map.get(kw)
+                is_random = random_map.get(kw, False)
                 db.flintel_keywords.update_one(
                     {"keyword": kw},
-                    {"$set": {"search_volume": vol}},
+                    {"$set": {"search_volume": vol, "search_volume_is_random": is_random}},
                     upsert=True,
                 )
 
+            random_count = sum(1 for v in random_map.values() if v)
             log.info(
                 f"[VOLUME-SEED] Batch {i // batch_size + 1} | {len(chunk)} keyword(s) "
-                f"seeded with search_volume | via RapidAPI (single.php, one call per keyword)"
+                f"seeded with search_volume | via RapidAPI (single.php, one call per keyword) | "
+                f"real:{len(chunk) - random_count} random_fallback:{random_count}"
             )
 
         except Exception as exc:
             log.error(f"[VOLUME-SEED] batch error (keywords {i}-{i + len(chunk)}): {exc}")
-            # NOTE: on failure, these keywords are left with search_volume
-            # still None, so they will simply be retried (batched) on the
-            # NEXT sync pass — no data loss, no permanent skip.
+            # Even on an unexpected batch-level error, don't leave these
+            # keywords permanently at None — apply the random fallback so
+            # they're never stuck, and log it clearly.
+            for kw in chunk:
+                vol = _random_search_volume_fallback()
+                log.warning(
+                    f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | search_volume={vol} "
+                    f"| reason: unexpected batch-level error — {exc} | this is NOT a real "
+                    f"search volume."
+                )
+                try:
+                    db.flintel_keywords.update_one(
+                        {"keyword": kw},
+                        {"$set": {"search_volume": vol, "search_volume_is_random": True}},
+                        upsert=True,
+                    )
+                except Exception as inner_exc:
+                    log.error(f"[VOLUME-SEED] could not persist random fallback for {kw!r}: {inner_exc}")
 
         time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
@@ -979,10 +1099,13 @@ def fetch_search_volume(search_keyword: str) -> int | None:
     SEARCH_KEYWORD is configured for Twitter items, which have no
     per-post SERP discovery in this design).
 
-    BUG 1 FIX (v9.7, carried into v9.8): same error-visibility fix as
-    seed_search_volume_batch() — logs status code + the provider's
-    "message" field (if present) when no volume field is found, instead
-    of only logging "field not found."
+    RANDOM-FALLBACK FIX (this build): if RAPIDAPI_KEY isn't configured,
+    the call fails/times out, the response isn't JSON, or no usable
+    volume field is found, a random placeholder in the
+    SEARCH_VOLUME_RANDOM_FALLBACK_MIN..MAX range is returned instead of
+    None, and a clearly-labelled "RANDOM FALLBACK" warning is logged
+    with the exact value and reason. A real, provider-returned value is
+    NEVER overridden.
 
     NOTE: the Reddit discovery path (process_one_keyword()) NO LONGER
     calls this function — Reddit's search_volume now comes exclusively
@@ -990,8 +1113,18 @@ def fetch_search_volume(search_keyword: str) -> int | None:
     keyword's flintel_keywords document. This function remains only for
     the low-volume, single-keyword Twitter fallback use case.
     """
-    if not RAPIDAPI_KEY or not search_keyword:
+    if not search_keyword:
         return None
+
+    if not RAPIDAPI_KEY:
+        vol = _random_search_volume_fallback()
+        log.warning(
+            f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
+            f"search_volume={vol} | reason: RAPIDAPI_KEY not configured — call never made | "
+            f"this is NOT a real search volume."
+        )
+        return vol
+
     try:
         url = "https://seo-keyword-research.p.rapidapi.com/single.php"
 
@@ -1010,7 +1143,13 @@ def fetch_search_volume(search_keyword: str) -> int | None:
             result = r.json()
         except ValueError:
             log.error(f"fetch_search_volume non-JSON response for {search_keyword!r} | status:{status_code}")
-            return None
+            vol = _random_search_volume_fallback()
+            log.warning(
+                f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
+                f"search_volume={vol} | reason: non-JSON response (status:{status_code}) | "
+                f"this is NOT a real search volume."
+            )
+            return vol
 
         vol = _dig_value(result, VOLUME_FIELD_CANDIDATES)
         if vol is None:
@@ -1019,10 +1158,24 @@ def fetch_search_volume(search_keyword: str) -> int | None:
                 f"fetch_search_volume no volume field for {search_keyword!r} | "
                 f"status:{status_code} | api_message:{api_message!r}"
             )
+            vol = _random_search_volume_fallback()
+            log.warning(
+                f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
+                f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
+                f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: no credits / bad key / "
+                f"rate-limited / no usable field (see api_message above) | this is NOT a "
+                f"real, provider-returned search volume."
+            )
         return vol
     except Exception as exc:
         log.error(f"fetch_search_volume error for {search_keyword!r}: {exc}")
-        return None
+        vol = _random_search_volume_fallback()
+        log.warning(
+            f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
+            f"search_volume={vol} | reason: exception during call — {exc} | this is NOT a "
+            f"real search volume."
+        )
+        return vol
 
 
 def fetch_google_rank(search_keyword: str) -> int | None:
@@ -1033,7 +1186,9 @@ def fetch_google_rank(search_keyword: str) -> int | None:
 
     This call is fully independent of fetch_search_volume() — it always
     runs on its own merits and is never skipped or blocked just because
-    a prior search_volume lookup returned None/failed.
+    a prior search_volume lookup returned a random fallback or failed.
+    Google-rank has NO random-fallback behavior (only requested for
+    search_volume) — it stays None on failure, exactly as before.
     """
     if not RAPIDAPI_KEY or not search_keyword:
         return None
@@ -1091,9 +1246,10 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
     This call CANNOT be batched across keywords (each keyword is its own
     unique search query with its own unique results) — it remains one
     call per keyword. It runs unconditionally whenever a keyword is due,
-    regardless of whether that keyword's cached search_volume ended up
-    as a real number or None — rank discovery and volume seeding are
-    fully decoupled steps.
+    on its own dedicated RapidAPI host, completely independent of the
+    search-volume host/call above — it is NEVER blocked, delayed, or
+    skipped because of a search-volume failure or random fallback, and
+    it never blocks search-volume in the other direction either.
     """
     if not RAPIDAPI_KEY:
         log.warning("[SERP] RapidAPI key not set — skipping SERP search.")
@@ -1186,7 +1342,7 @@ def is_post_already_signaled(post_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT OAUTH (PRAW) — added in v9.7, BUG 2 FIX, carried into v9.8.
+# REDDIT OAUTH (PRAW) — added in v9.7, BUG 2 FIX, carried forward.
 #
 # The v9.6 public .json smart-retry fetcher was already correctly
 # implemented (proper User-Agent, jittered backoff, old.reddit.com
@@ -1372,7 +1528,7 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
     Fetches the FULL post: text, username, subreddit, upvotes, comments,
     posted_at. This is the ONLY way Reddit data enters this system now.
 
-    BUG 2 FIX (v9.7, carried into v9.8): now tries Reddit's OAuth API
+    BUG 2 FIX (v9.7, carried forward): now tries Reddit's OAuth API
     (PRAW) FIRST — this is the durable fix for the persistent-403/
     blanket-IP-block failure mode that no amount of retry/backoff/
     User-Agent tuning on the public endpoint can solve. If PRAW isn't
@@ -1435,28 +1591,29 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
         return None
 
 
-def process_one_keyword(keyword: str, volume) -> tuple:
+def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) -> tuple:
     """
     Full discovery work for ONE keyword that get_due_keywords() has
     flagged as due right now:
       1. RapidAPI SERP search (site:reddit.com, last N months) — runs
          regardless of whether this keyword's search_volume is a real
-         number or None.
+         number or a random fallback.
       2. Per-result post_url dedup check -> skip already-known posts
          (no fetch, no Claude call for those)
       3. Reddit fetch (OAuth/PRAW first, public .json fallback) for
          genuinely new posts -> stamp the keyword's already-seeded
-         search_volume onto each item -> queue for Claude scoring
+         search_volume (and its random/real flag) onto each item ->
+         queue for Claude scoring
     Returns (new_items_count, skipped_dupes_count) for logging.
 
-    `volume` is passed in by the caller (read straight off the keyword's
-    own flintel_keywords document by run_serp_discovery_loop()) instead
-    of being fetched here — search_volume is sourced from the batched
-    seed_search_volume_batch() cache. Every post discovered for this
-    keyword still ends up with the exact same "search_volume" field,
-    exact same item schema, exact same queue/Claude/signals flow —
-    whether `volume` is a real number or None, the SERP rank lookup and
-    the Reddit post fetch above always still run.
+    `volume` and `volume_is_random` are passed in by the caller (read
+    straight off the keyword's own flintel_keywords document by
+    run_serp_discovery_loop()) instead of being fetched here —
+    search_volume is sourced from the batched seed_search_volume_batch()
+    cache. Every post discovered for this keyword still ends up with the
+    exact same item schema and the exact same queue/Claude/signals flow
+    — whether `volume` is real or a random fallback, the SERP rank
+    lookup and the Reddit post fetch above always still run.
     """
     new_items, skipped_dupes = 0, 0
 
@@ -1472,6 +1629,7 @@ def process_one_keyword(keyword: str, volume) -> tuple:
         if not item:
             continue
         item["search_volume"] = volume   # same cached value for every post from this keyword
+        item["search_volume_is_random"] = volume_is_random
         reddit_queue.put(item)
         save_queue_message("reddit", item)
         new_items += 1
@@ -1484,7 +1642,8 @@ def run_serp_discovery_loop():
     """
     Continuously polls flintel_keywords every KEYWORD_CHECK_INTERVAL_SECONDS
     for keywords that have NEVER been fetched (fetched=False), and for any
-    keyword still missing a cached search_volume (batch-seeds it).
+    keyword still missing a cached search_volume (batch-seeds it — real
+    value, or a logged random fallback if the call fails/has no credits).
 
     There is NO TTL, NO re-due date, NO fixed "sleep N hours then redo
     everything" step. Each keyword's SERP discovery is processed exactly
@@ -1498,13 +1657,15 @@ def run_serp_discovery_loop():
       - an already-fetched keyword is skipped forever, even immediately
         after a full server restart — its state lives in MongoDB, not
         in memory, so nothing resets to zero and nothing gets re-fetched.
-      - a keyword that already has a search_volume is never re-queried
-        for volume again, ever, for the same reason.
+      - a keyword that already has a search_volume (real or random
+        fallback) is never re-queried for volume again, ever, for the
+        same reason.
       - whether a keyword's seeded search_volume came back as a real
-        number OR ended up None (RapidAPI error/quota/rate-limit — see
-        seed_search_volume_batch()), that keyword is STILL processed for
-        SERP rank + Reddit post fetch below exactly the same way — a
-        missing/failed volume never blocks or skips discovery.
+        number OR a random fallback (RapidAPI error/quota/rate-limit —
+        see seed_search_volume_batch()), that keyword is STILL processed
+        for SERP rank + Reddit post fetch below exactly the same way — a
+        missing/failed volume never blocks or skips discovery, it is
+        simply replaced with a clearly-logged random placeholder.
     """
     sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
 
@@ -1525,6 +1686,8 @@ def run_serp_discovery_loop():
         f"months_back:{SERP_MONTHS_BACK} | depth:{SERP_RESULTS_PER_KEYWORD} | "
         f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever | "
         f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}) | "
+        f"random fallback range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} "
+        f"on failure/no-credits (always logged) | "
         f"REDDIT FETCH: OAuth(PRAW) {'configured' if REDDIT_OAUTH_CONFIGURED else 'NOT configured'} "
         f"primary + public .json smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + fallback host) as backup"
     )
@@ -1537,7 +1700,8 @@ def run_serp_discovery_loop():
 
             # Batch-seed search_volume for any keyword still missing one
             # (covers brand-new keywords added since the last pass, or
-            # any keyword whose previous seed attempt failed).
+            # any keyword whose previous seed attempt somehow left it
+            # unset).
             missing_volume = get_keywords_missing_volume(REDDIT_SEARCH_KEYWORDS)
             if missing_volume:
                 seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
@@ -1550,14 +1714,16 @@ def run_serp_discovery_loop():
             total_new, total_dupes = 0, 0
             for doc in due:
                 keyword = doc["keyword"]
-                volume = doc.get("search_volume")   # cached, already seeded — no API call
-                new_items, dupes = process_one_keyword(keyword, volume)
+                volume = doc.get("search_volume")                     # cached, already seeded — no API call
+                volume_is_random = doc.get("search_volume_is_random", False)
+                new_items, dupes = process_one_keyword(keyword, volume, volume_is_random)
                 mark_keyword_fetched(keyword)
                 total_new += new_items
                 total_dupes += dupes
+                sv_tag = "RANDOM-FALLBACK" if volume_is_random else "real"
                 log.info(
                     f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
-                    f"search_volume:{volume} (from cache) | "
+                    f"search_volume:{volume} ({sv_tag}, from cache) | "
                     f"marked fetched=True PERMANENTLY — will never be re-fetched"
                 )
                 time.sleep(SERP_FETCH_SLEEP_SECONDS)
@@ -1730,6 +1896,12 @@ def save_new_signal(item: dict, score_result: dict, force_pending: bool = False)
         RapidAPI happens on rescore.)
       - force_pending=False -> status="confirmed" (Claude scored it
         successfully — final).
+
+    The `signals` document schema itself is UNCHANGED. The random/real
+    origin of search_volume is surfaced purely in the log line below
+    (via item.get("search_volume_is_random")) so it's always visible in
+    the application/render logs which value type was used, without
+    altering the persisted schema.
     """
     doc = {
         "message_id":            item["message_id"],
@@ -1754,11 +1926,12 @@ def save_new_signal(item: dict, score_result: dict, force_pending: bool = False)
     }
     try:
         db.signals.insert_one(doc)
+        sv_tag = "RANDOM-FALLBACK" if item.get("search_volume_is_random") else "real"
         log.info(
             f"SAVED [{doc['platform'].upper()}] status:{doc['status']} score:{doc['intent_score']} "
             f"relevant:{doc['is_relevant']} | u/{doc['username']} | "
             f"upvotes:{doc['upvotes']} comments:{doc['comments']} "
-            f"rank:{doc['google_rank']} volume:{doc['search_volume']}"
+            f"rank:{doc['google_rank']} volume:{doc['search_volume']} ({sv_tag})"
         )
         return True
     except DuplicateKeyError:
@@ -1911,6 +2084,13 @@ def run_batch_processor(
                         it["google_rank"] = google_stats.get("google_rank")
                         it["search_volume"] = google_stats.get("search_volume")
                         it["search_keyword"] = SEARCH_KEYWORD
+                        # search_volume for this path is produced by
+                        # fetch_search_volume(), which now always logs
+                        # its own "RANDOM FALLBACK" warning inline
+                        # whenever it had to synthesize a value instead
+                        # of returning a real one — no separate flag is
+                        # threaded through here to keep this enrichment
+                        # step's logic 100% as-is otherwise.
 
                 log.info(
                     f"[{platform_label}] ━━━ BATCH {total_batches} ━━━ | reason:{fire_reason} | "
@@ -2201,31 +2381,31 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v9.8 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + OAuth/PRAW fetch) + Twitter Signal Scorer",
+    title="Flintel v9.9 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + OAuth/PRAW fetch + random-fallback volume) + Twitter Signal Scorer",
     description=(
         "Reddit (RapidAPI SERP discovery, fetch-once-forever keyword cache — "
         "no re-fetch, ever, once a keyword is done) + Twitter signals: monitor, "
         "score (generic 1-100 relevance/visibility/engagement model), store. "
-        "v9.7 bug fixes (carried into v9.8, version-label bump only): "
-        "(1) search_volume/google_rank error logging now surfaces the "
-        "RapidAPI status code + 'message' field when a volume isn't found, "
-        "instead of a misleading 'field not found' warning that hid the real "
-        "API-level error — this failure never blocks the independent Google "
-        "rank SERP call or the Reddit .json/OAuth post fetch; (2) Reddit "
-        "per-post fetch now tries authenticated OAuth (PRAW) FIRST, resolving "
-        "the persistent-403 blanket-IP-block failure mode — falls back "
-        "unchanged to the v9.6 public .json smart-retry + old.reddit.com path "
-        "if OAuth isn't configured or fails. Persistent batch state + queue + "
-        "dedup — no in-flight item is ever lost on restart. Each keyword is "
-        "tracked in flintel_keywords and, once fetched, is PERMANENTLY marked "
-        "done — restarts never reset progress and never trigger a re-fetch of "
-        "an already-done keyword. Newly added keywords are picked up "
+        "Search-volume ('search/mo') failures — bad key, exhausted credits, "
+        "rate-limits, timeouts, or no usable field — are NEVER left as a "
+        "permanent None: a random placeholder in a configurable range "
+        "(default 300-5000) is generated instead, and every single "
+        "occurrence is logged with a clearly-labelled 'RANDOM FALLBACK' "
+        "warning naming the exact value + reason, so it's always "
+        "distinguishable in the logs from a real value. This is fully "
+        "independent of — and never blocks or is blocked by — the separate "
+        "Google-rank/SERP RapidAPI calls, which run on their own host and "
+        "their own try/except. Persistent batch state + queue + dedup — no "
+        "in-flight item is ever lost on restart. Each keyword is tracked in "
+        "flintel_keywords and, once fetched, is PERMANENTLY marked done — "
+        "restarts never reset progress and never trigger a re-fetch of an "
+        "already-done keyword. Newly added keywords are picked up "
         "automatically, one at a time. Streaming Claude with partial-JSON "
         "recovery. Claude failures route to status='pending' for automatic "
         "rescore (re-uses stored enrichment, never re-fetches from Reddit or "
         "RapidAPI) instead of a permanent low score."
     ),
-    version="9.8.0",
+    version="9.9.0",
 )
 
 
@@ -2250,9 +2430,13 @@ def root():
         "keyword": {"$in": REDDIT_SEARCH_KEYWORDS},
         "search_volume": None,
     })
+    random_volume_count = db.flintel_keywords.count_documents({
+        "keyword": {"$in": REDDIT_SEARCH_KEYWORDS},
+        "search_volume_is_random": True,
+    })
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.8 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + OAuth/PRAW fetch + Twitter)",
+        "system":                  "FLINTEL v9.9 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + OAuth/PRAW fetch + random-fallback volume + Twitter)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -2266,10 +2450,12 @@ def root():
         "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
         "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords)",
         "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE})",
+        "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}, always logged, never overrides a real value",
         "reddit_fetch_reliability":         f"OAuth(PRAW) {'configured' if REDDIT_OAUTH_CONFIGURED else 'not configured'} primary + smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback) backup",
         "keywords_tracked":               total_keywords_tracked,
         "keywords_due_now":               due_now_count,
         "keywords_missing_search_volume": missing_volume_count,
+        "keywords_with_random_search_volume": random_volume_count,
         "serp_months_back":        SERP_MONTHS_BACK,
         "serp_results_per_kw":     SERP_RESULTS_PER_KEYWORD,
         "reddit_batch_size":       REDDIT_BATCH_SIZE,
@@ -2324,12 +2510,13 @@ def get_keywords_status():
     Inspect the fetch-once-forever keyword cache directly — for every
     keyword shows whether it's been fetched (true = permanently done,
     never re-fetched; false = still pending, due on the next pass), its
-    cached search_volume (None = not yet batch-seeded), and when it was
-    last fetched.
+    cached search_volume (real value or a random-fallback placeholder —
+    see search_volume_is_random), and when it was last fetched.
     """
     raw_docs = list(db.flintel_keywords.find({}, {"_id": 0}).sort("keyword", 1))
     due_count = 0
     missing_volume_count = 0
+    random_volume_count = 0
     docs = []
     for d in raw_docs:
         is_due = not d.get("fetched")
@@ -2337,6 +2524,8 @@ def get_keywords_status():
             due_count += 1
         if d.get("search_volume") is None:
             missing_volume_count += 1
+        if d.get("search_volume_is_random"):
+            random_volume_count += 1
         for f in ["last_fetched_at", "created_at"]:
             if d.get(f):
                 d[f] = d[f].isoformat()
@@ -2346,6 +2535,7 @@ def get_keywords_status():
         "total": len(docs),
         "due_now": due_count,
         "missing_search_volume": missing_volume_count,
+        "random_fallback_search_volume": random_volume_count,
         "keywords": docs,
     }
 
@@ -2405,8 +2595,9 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.8 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
-    log.info("                  + BATCHED SEARCH-VOLUME SEEDING + OAUTH/PRAW FETCH) + TWITTER SIGNAL SCORER")
+    log.info("  FLINTEL v9.9 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
+    log.info("                  + BATCHED SEARCH-VOLUME SEEDING + OAUTH/PRAW FETCH")
+    log.info("                  + RANDOM-FALLBACK SEARCH VOLUME) + TWITTER SIGNAL SCORER")
     log.info("=" * 70)
     log.info(f"  Client               : {CLIENT_ID}")
     log.info(f"  Platforms            : Reddit (SERP discovery, fetch-once-forever) + Twitter/X")
@@ -2420,7 +2611,10 @@ if __name__ == "__main__":
              f"last {SERP_MONTHS_BACK} months | depth {SERP_RESULTS_PER_KEYWORD}")
     log.info(f"  Search-volume seeding: batched loop, chunks of {SEARCH_VOLUME_BATCH_SIZE} keywords | "
              f"cached on flintel_keywords, read at discovery time | error status+message logged; "
-             f"never blocks rank/reddit fetch (v9.7/v9.8)")
+             f"never blocks rank/reddit fetch")
+    log.info(f"  Search-volume fallback: RANDOM placeholder {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
+             f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} on any failure/no-credits — always clearly logged, "
+             f"never overrides a real value")
     log.info(f"  Reddit fetch         : OAuth(PRAW) primary (v9.7+) + public .json smart-retry fallback "
              f"({REDDIT_FETCH_MAX_RETRIES}x backoff, jitter {REDDIT_FETCH_JITTER_MIN}-{REDDIT_FETCH_JITTER_MAX}s, "
              f"old.reddit.com fallback)")
