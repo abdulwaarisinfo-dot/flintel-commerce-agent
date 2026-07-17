@@ -154,7 +154,6 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
-CLIENT_ID   = os.getenv("CLIENT_ID", "settla")
 
 # Optional generic label/context — used ONLY as a fallback google_rank
 # lookup for Twitter items (Twitter has no per-post SERP discovery in
@@ -243,7 +242,7 @@ SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
 # ── SEARCH-VOLUME BATCH SEEDING CONFIG ──────────────────────────────────────
 # search_volume/live bills PER REQUEST, not per keyword, and accepts up to
 # 1000 keywords in a single call. We use 500 as a safe default chunk size.
-SEARCH_VOLUME_BATCH_SIZE = int(os.getenv("SEARCH_VOLUME_BATCH_SIZE", "500"))
+SEARCH_VOLUME_BATCH_SIZE = int(os.getenv("SEARCH_VOLUME_BATCH_SIZE", "12"))
 
 # ── TWITTER SEARCH KEYWORDS — independent from Reddit's list, can differ ──
 TWITTER_SEARCH_KEYWORDS = [
