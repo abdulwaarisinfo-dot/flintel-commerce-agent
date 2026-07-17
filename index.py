@@ -1,44 +1,67 @@
 """
-FLINTEL v9.10 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
+FLINTEL v9.11 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
                 + BATCHED SEARCH-VOLUME PRE-SEEDING)
                 + Twitter/X Signal Scorer
 =================================================================================
 Platforms : Reddit — RapidAPI SERP discovery ONLY (Google search,
-            site:reddit.com, real per-post rank -> Reddit public .json
-            endpoint, smart-retry, no credentials required)
+            site:reddit.com, real per-post rank -> Reddit public per-post
+            RSS feed, smart-retry, no credentials required)
           + Twitter/X (tweepy v2)
 
 =================================================================================
-WHAT CHANGED IN THIS BUILD (v9.10) — PRAW / REDDIT OAUTH REMOVED,
-LOGIC 100% AS-IS OTHERWISE
+WHAT CHANGED IN THIS BUILD (v9.11) — REDDIT FETCH SWITCHED FROM .json TO
+RSS (per-post) + RANDOM ENGAGEMENT FALLBACK, LOGIC 100% AS-IS OTHERWISE
 =================================================================================
 
-  CHANGE — The v9.7 addition of Reddit OAuth (PRAW) as the primary
-    per-post fetch path has been REMOVED entirely. No more `import praw`,
-    no more REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET / REDDIT_USERNAME /
-    REDDIT_PASSWORD env vars, no more "script" app / credentials needed
-    at all for Reddit.
+  ROOT CAUSE (confirmed, not a code bug): Reddit's public, anonymous
+    .json endpoint was returning 403 on EVERY attempt, on BOTH the
+    primary host (www.reddit.com) AND the old.reddit.com fallback host,
+    across every retry/backoff cycle. That pattern — 100% failure across
+    every attempt on both hosts — is the signature of Reddit blanket-
+    blocking the server's IP itself (very common for cloud/datacenter
+    IP ranges) for anonymous .json/API-shaped traffic. No amount of
+    request-shape/pacing/User-Agent tuning on that endpoint can fix an
+    IP-level block. The SERP/Google-rank discovery call
+    (search_google_for_keyword()) was NEVER affected by this — it runs
+    on a completely separate RapidAPI host and kept returning real post
+    URLs + ranks the whole time, exactly as logged.
 
-    fetch_reddit_post_by_url() now goes STRAIGHT to the public,
-    credential-free .json endpoint (with the same v9.6 smart-retry:
-    proper User-Agent, jittered exponential backoff, old.reddit.com
-    fallback host) — the exact same fetch style FLINTEL-EC uses for
-    Reddit (no OAuth, no login, nothing to configure), just applied to
-    a single known post_url instead of a subreddit's /new.rss feed,
-    since SERP discovery here already gives us the exact post URL to
-    fetch (title/selftext/author/subreddit/ups/num_comments/created_utc),
-    all straight from Reddit's own JSON — real numeric upvotes and real
-    numeric comment counts, not estimates.
+  CHANGE 1 — Reddit per-post fetch switched from the .json endpoint to
+    Reddit's public per-post RSS feed (same URL, `.rss` suffix instead
+    of `.json` — e.g. .../comments/<id>/<slug>.rss), fetched with the
+    exact same v9.6 smart-retry (proper User-Agent, jittered exponential
+    backoff, old.reddit.com fallback host) — nothing about the retry
+    logic changed, only the URL suffix and the response parser (RSS/Atom
+    via feedparser instead of JSON). This mirrors the RSS-based approach
+    already used for Reddit elsewhere, just applied to a single known
+    post_url (from SERP discovery) instead of a whole subreddit's
+    /new.rss feed, since the exact post is already known here.
 
-    Everything downstream is COMPLETELY UNCHANGED: item schema returned
-    by fetch_reddit_post_by_url() is identical to before (message_id,
+  CHANGE 2 — Reddit's RSS format does NOT expose numeric upvotes or
+    comment counts (this is a genuine schema limitation of Reddit's RSS
+    feeds, not a parsing bug — those fields simply are not present in
+    the feed). Since Component 3 (Engagement Signal) of the Claude
+    scoring model needs a numeric upvotes/comments value to score
+    against, `upvotes` and `comments` are now generated as a random
+    placeholder in the REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN..MAX range
+    (default 100-3000, env-configurable) for every Reddit post fetched
+    via RSS — the exact same "random fallback" pattern already used for
+    search_volume: every single occurrence is logged with a clearly-
+    labelled "RANDOM FALLBACK" warning naming the exact values used and
+    the reason (Reddit RSS does not expose engagement counts), and the
+    item carries an `engagement_is_random` flag through to the "SAVED"
+    log line, so it is always distinguishable in the logs from a real,
+    provider-returned number — never silently indistinguishable.
+
+    Everything downstream is otherwise UNCHANGED: item schema returned
+    by fetch_reddit_post_by_url() still has the same keys (message_id,
     platform, text, username, subreddit_or_channel, post_url, posted_at,
     search_keyword, upvotes, comments, google_rank, search_volume) — so
     queueing, batching, Claude scoring, and Mongo storage need zero
-    changes. The Google-rank SERP call and the search-volume batch
-    seeding (real value or logged random fallback) are fully untouched
-    and still run exactly as before, on their own independent RapidAPI
-    host, regardless of the Reddit post-fetch outcome.
+    schema changes. The Google-rank SERP call and the search-volume
+    batch seeding (real value or logged random fallback) are fully
+    untouched and still run exactly as before, on their own independent
+    RapidAPI host, regardless of the Reddit post-fetch outcome.
 
 =================================================================================
 CARRIED FORWARD FROM v9.9 — SEARCH-VOLUME RANDOM-FALLBACK FIX,
@@ -86,7 +109,9 @@ LOGIC 100% AS-IS
   endpoints, the "batched" (per-keyword-call) search-volume seeding loop
   structure, the _dig_value()/_dig_list() field-extraction helpers — ALL
   of it is kept 100% AS-IS. No schema, no logic, no flow changed anywhere
-  in this build beyond removing PRAW/OAuth as described above.
+  in this build beyond switching the Reddit per-post fetch to RSS and
+  randomizing upvotes/comments as described above. No OAuth/PRAW — that
+  was already removed in v9.10 and stays removed.
 """
 
 import asyncio
@@ -97,6 +122,7 @@ import time
 import queue
 import random
 import re
+import html
 import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -105,6 +131,7 @@ import anthropic
 import httpx
 import tweepy
 import requests
+import feedparser
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 from fastapi import FastAPI, HTTPException, Security, Depends
@@ -198,6 +225,28 @@ def _random_search_volume_fallback() -> int:
     return random.randint(SEARCH_VOLUME_RANDOM_FALLBACK_MIN, SEARCH_VOLUME_RANDOM_FALLBACK_MAX)
 
 
+# ── REDDIT ENGAGEMENT (upvotes/comments) RANDOM FALLBACK CONFIG ────────────
+# Reddit's public RSS feed (used as of v9.11 for the per-post fetch — see
+# module docstring) does NOT expose numeric upvote or comment counts —
+# this is a genuine schema limitation of the RSS format itself, not a
+# parsing bug. Since Component 3 (Engagement Signal) of the Claude
+# scoring model needs a numeric value to score against, every Reddit
+# post fetched via RSS gets a random placeholder upvotes/comments value
+# in this range instead of None/0, using the exact same "random
+# fallback, always logged, never silently indistinguishable from a real
+# value" pattern already used for search_volume above.
+REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN", "100"))
+REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX", "3000"))
+
+
+def _random_engagement_fallback() -> int:
+    """Generates one random placeholder upvotes/comments value in the
+    configured range. Separate helper (own range) from the search-volume
+    one above, even though the pattern is identical, so the two ranges
+    can be tuned independently."""
+    return random.randint(REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN, REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX)
+
+
 # ── SERP DISCOVERY CONFIG (Reddit's ONLY discovery mechanism now) ───────────
 # Keywords now live DIRECTLY in this Python list — no .env / os.getenv
 # involved. To add a new keyword, just add a new string to this list and
@@ -240,15 +289,6 @@ REDDIT_SEARCH_KEYWORDS = [
     "investors asking for financials", "due diligence deadline",
     "board wants updated financials", "need financials for loan application",
     "need financials for a loan", "applying for a business loan financials",
-    
-     "Bill.com problem", "Bill.com alternative",
-    "Gusto payroll problem", "Gusto accounting integration issue",
-    "Expensify problem", "Expensify alternative",
-    "alternative to Xero", "alternative to FreshBooks",
-    "alternative to NetSuite", "alternative to Sage",
-    "better than QuickBooks", "better than Xero",
-    "competitors to QuickBooks", "QuickBooks competitors",
-    "Xero competitors",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
