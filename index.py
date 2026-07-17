@@ -1,72 +1,48 @@
 """
-FLINTEL v9.8 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
+FLINTEL v9.10 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
                 + BATCHED SEARCH-VOLUME PRE-SEEDING)
                 + Twitter/X Signal Scorer
 =================================================================================
 Platforms : Reddit — RapidAPI SERP discovery ONLY (Google search,
-            site:reddit.com, real per-post rank -> Reddit OAuth (PRAW) with
-            public .json fallback)
+            site:reddit.com, real per-post rank -> Reddit public .json
+            endpoint, smart-retry, no credentials required)
           + Twitter/X (tweepy v2)
 
 =================================================================================
-WHAT CHANGED FROM v9.6 — TWO TARGETED BUG FIXES, LOGIC 100% AS-IS OTHERWISE
-(carried forward unchanged into v9.8 — this build is a version-label bump
-only, confirming the two fixes below remain in place, byte-for-byte)
-=================================================================================
-
-  BUG 1 — "[VOLUME-SEED] Could not find a volume field" for every keyword,
-    with raw_keys always == ['message'].
-    ROOT CAUSE: a response body of the shape {"message": "..."} is
-    RapidAPI's standard ERROR envelope (bad/unsubscribed key, exhausted
-    quota, rate-limited, etc.) — NOT a real data payload. _dig_value()
-    was working exactly as designed: there genuinely was no volume field
-    to find, because the call itself failed upstream of the data. The old
-    log line ("could not find a volume field... tried [...]") looked like
-    a schema/field-naming problem, which sent troubleshooting in the
-    wrong direction, when the real problem was an API-level failure.
-    FIX: seed_search_volume_batch() and fetch_search_volume() now also
-    capture r.status_code and, when isinstance(row, dict), row.get("message")
-    and log BOTH alongside the "no volume field" warning. This makes the
-    actual RapidAPI error (auth/quota/rate-limit) visible immediately
-    instead of being disguised as a missing-field issue. No change to
-    control flow: a failed/errored keyword still just gets search_volume
-    stored as None and is still eligible for retry on a later pass,
-    exactly as before. IMPORTANTLY: search_volume failing (None) NEVER
-    blocks or short-circuits the separate Google rank / SERP lookup or
-    the Reddit .json/OAuth post fetch (see search_google_for_keyword() and
-    fetch_reddit_post_by_url()) and always run regardless of whether
-    search_volume came back as a real number or None.
-
-  BUG 2 — Reddit .json fetch exhausting all retries + the old.reddit.com
-    fallback, every attempt returning 403.
-    ROOT CAUSE: the v9.6 smart-retry fetcher (proper User-Agent, jittered
-    exponential backoff, old.reddit.com fallback) was already correct —
-    the log confirms it ran exactly as designed. The 403s persisting
-    through EVERY attempt on BOTH hosts is the signature of Reddit
-    blanket-blocking the server's IP itself (very common for cloud/
-    datacenter IPs), which no amount of request-shape/pacing tuning on
-    the public, unauthenticated .json endpoint can fix — this was called
-    out explicitly in the v9.6 docstring as the known limit of that
-    design.
-    FIX: fetch_reddit_post_by_url() now tries Reddit's official OAuth API
-    via PRAW FIRST (fetch_reddit_post_via_praw()), using
-    REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET / REDDIT_USERNAME /
-    REDDIT_PASSWORD (new, optional env vars). OAuth-authenticated
-    requests are not subject to the anonymous-scrape IP block, so this
-    resolves the persistent-403 failure mode directly. If PRAW isn't
-    configured (any of those 4 env vars missing) OR the PRAW call itself
-    raises, the code falls straight through to the ORIGINAL v9.6 public
-    .json smart-retry + old.reddit.com fallback path — completely
-    unchanged, still there as a safety net. Item schema returned by
-    either path is identical, so nothing downstream (queueing, batching,
-    Claude scoring, Mongo storage) needed to change.
-    NOTE: requires `pip install praw` and a Reddit "script" app
-    (https://www.reddit.com/prefs/apps) for the four new env vars. If
-    they're left unset, behavior is byte-for-byte the v9.6 behavior.
-
-=================================================================================
-WHAT CHANGED IN THIS BUILD (v9.9) — SEARCH-VOLUME RANDOM-FALLBACK FIX,
+WHAT CHANGED IN THIS BUILD (v9.10) — PRAW / REDDIT OAUTH REMOVED,
 LOGIC 100% AS-IS OTHERWISE
+=================================================================================
+
+  CHANGE — The v9.7 addition of Reddit OAuth (PRAW) as the primary
+    per-post fetch path has been REMOVED entirely. No more `import praw`,
+    no more REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET / REDDIT_USERNAME /
+    REDDIT_PASSWORD env vars, no more "script" app / credentials needed
+    at all for Reddit.
+
+    fetch_reddit_post_by_url() now goes STRAIGHT to the public,
+    credential-free .json endpoint (with the same v9.6 smart-retry:
+    proper User-Agent, jittered exponential backoff, old.reddit.com
+    fallback host) — the exact same fetch style FLINTEL-EC uses for
+    Reddit (no OAuth, no login, nothing to configure), just applied to
+    a single known post_url instead of a subreddit's /new.rss feed,
+    since SERP discovery here already gives us the exact post URL to
+    fetch (title/selftext/author/subreddit/ups/num_comments/created_utc),
+    all straight from Reddit's own JSON — real numeric upvotes and real
+    numeric comment counts, not estimates.
+
+    Everything downstream is COMPLETELY UNCHANGED: item schema returned
+    by fetch_reddit_post_by_url() is identical to before (message_id,
+    platform, text, username, subreddit_or_channel, post_url, posted_at,
+    search_keyword, upvotes, comments, google_rank, search_volume) — so
+    queueing, batching, Claude scoring, and Mongo storage need zero
+    changes. The Google-rank SERP call and the search-volume batch
+    seeding (real value or logged random fallback) are fully untouched
+    and still run exactly as before, on their own independent RapidAPI
+    host, regardless of the Reddit post-fetch outcome.
+
+=================================================================================
+CARRIED FORWARD FROM v9.9 — SEARCH-VOLUME RANDOM-FALLBACK FIX,
+LOGIC 100% AS-IS
 =================================================================================
 
   ISSUE — When the search-volume ("search/mo") RapidAPI call fails or its
@@ -100,7 +76,7 @@ LOGIC 100% AS-IS OTHERWISE
     for each signal so every log entry visibly says whether its
     search_volume is "real" or "RANDOM-FALLBACK". No schema change to the
     `signals` Mongo collection, no change to control flow, dedup, queues,
-    batching, Claude scoring, or anything else — version-label bump only.
+    batching, Claude scoring, or anything else.
 =================================================================================
 
   Everything else — the fetch-once-forever discovery cache design,
@@ -110,7 +86,7 @@ LOGIC 100% AS-IS OTHERWISE
   endpoints, the "batched" (per-keyword-call) search-volume seeding loop
   structure, the _dig_value()/_dig_list() field-extraction helpers — ALL
   of it is kept 100% AS-IS. No schema, no logic, no flow changed anywhere
-  in this build beyond the random-fallback fix described above.
+  in this build beyond removing PRAW/OAuth as described above.
 """
 
 import asyncio
@@ -129,7 +105,6 @@ import anthropic
 import httpx
 import tweepy
 import requests
-import praw
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 from fastapi import FastAPI, HTTPException, Security, Depends
@@ -265,6 +240,15 @@ REDDIT_SEARCH_KEYWORDS = [
     "investors asking for financials", "due diligence deadline",
     "board wants updated financials", "need financials for loan application",
     "need financials for a loan", "applying for a business loan financials",
+    
+     "Bill.com problem", "Bill.com alternative",
+    "Gusto payroll problem", "Gusto accounting integration issue",
+    "Expensify problem", "Expensify alternative",
+    "alternative to Xero", "alternative to FreshBooks",
+    "alternative to NetSuite", "alternative to Sage",
+    "better than QuickBooks", "better than Xero",
+    "competitors to QuickBooks", "QuickBooks competitors",
+    "Xero competitors",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
@@ -305,9 +289,10 @@ TWITTER_SEARCH_KEYWORDS = [
 
 # ── REDDIT "SMART FETCH" CONFIG — v9.6, unchanged ──────────────────────────
 # Governs the retry/backoff/User-Agent behaviour of fetch_reddit_post_by_url()
-# on the PUBLIC .json FALLBACK path. Does NOT change what data is
-# extracted or where it goes — only how reliably we get a 200 instead of
-# a 403 from Reddit's public .json, when OAuth (below) is unavailable.
+# — the SOLE Reddit per-post fetch path as of v9.10 (public, credential-free
+# .json endpoint). Does NOT change what data is extracted or where it
+# goes — only how reliably we get a 200 instead of a 403 from Reddit's
+# public .json.
 REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
 REDDIT_FETCH_BACKOFF_BASE    = float(os.getenv("REDDIT_FETCH_BACKOFF_BASE", "2.0"))
 REDDIT_FETCH_JITTER_MIN      = float(os.getenv("REDDIT_FETCH_JITTER_MIN", "0.4"))
@@ -315,25 +300,7 @@ REDDIT_FETCH_JITTER_MAX      = float(os.getenv("REDDIT_FETCH_JITTER_MAX", "1.6")
 # Reddit recommends: "<platform>:<app id>:<version> (by /u/<username>)"
 REDDIT_USER_AGENT = os.getenv(
     "REDDIT_USER_AGENT",
-    "python:flintel-signal-bot:v9.8 (by /u/flintel_signals)",
-)
-
-# ── REDDIT OAUTH (PRAW) CONFIG — added in v9.7, bug-fix only ───────────────
-# Optional. If ALL FOUR of these are set, fetch_reddit_post_by_url() will
-# use Reddit's official OAuth API (via PRAW) as the PRIMARY fetch path,
-# which is not subject to the anonymous-scrape/datacenter-IP block that
-# causes persistent 403s on the public .json endpoint. If any of these
-# are missing, PRAW is skipped entirely and behavior is identical to
-# v9.6 (public .json smart-retry + old.reddit.com fallback only).
-# Create a Reddit "script" app at https://www.reddit.com/prefs/apps to
-# get a client id/secret; username/password are the account that owns
-# that app.
-REDDIT_CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID", "")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
-REDDIT_USERNAME      = os.getenv("REDDIT_USERNAME", "")
-REDDIT_PASSWORD      = os.getenv("REDDIT_PASSWORD", "")
-REDDIT_OAUTH_CONFIGURED = bool(
-    REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and REDDIT_USERNAME and REDDIT_PASSWORD
+    "python:flintel-signal-bot:v9.10 (by /u/flintel_signals)",
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -939,24 +906,23 @@ def mark_keyword_fetched(keyword: str):
 # one (single.php only accepts one keyword per call), writes results back
 # onto each keyword's own flintel_keywords document.
 #
-# BUG 1 FIX (v9.7, carried forward): when the provider's response doesn't
+# BUG 1 FIX (carried forward): when the provider's response doesn't
 # contain a recognizable volume field, the warning surfaces the HTTP
 # status code and, if the body is a dict, its "message" field. A body
 # shaped like {"message": "..."} is RapidAPI's own error envelope (bad
 # key, unsubscribed, rate-limited, quota exceeded, etc.) — NOT a data
 # payload with an unfamiliar field name.
 #
-# RANDOM-FALLBACK FIX (this build): whenever that happens — call failed,
-# no usable field, non-JSON body, etc. — instead of leaving search_volume
-# as None forever, a random placeholder in the
+# RANDOM-FALLBACK FIX (carried forward from v9.9): whenever that happens
+# — call failed, no usable field, non-JSON body, etc. — instead of
+# leaving search_volume as None forever, a random placeholder in the
 # SEARCH_VOLUME_RANDOM_FALLBACK_MIN..MAX range is generated and stored,
 # and a clearly-labelled "RANDOM FALLBACK" warning is logged with the
 # exact value used. Real, provider-returned values are NEVER touched.
 # This failure is fully isolated to search_volume — it never blocks or
-# delays the separate Google-rank SERP call or the Reddit .json/OAuth
-# post fetch for that keyword's discovered posts; those run
-# independently regardless of whether a real volume number, a random
-# fallback, came back.
+# delays the separate Google-rank SERP call or the Reddit post fetch for
+# that keyword's discovered posts; those run independently regardless of
+# whether a real volume number or a random fallback came back.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SEARCH_VOLUME_BATCH_SIZE):
@@ -1105,9 +1071,9 @@ def fetch_search_volume(search_keyword: str) -> int | None:
     SEARCH_KEYWORD is configured for Twitter items, which have no
     per-post SERP discovery in this design).
 
-    RANDOM-FALLBACK FIX (this build): if RAPIDAPI_KEY isn't configured,
-    the call fails/times out, the response isn't JSON, or no usable
-    volume field is found, a random placeholder in the
+    RANDOM-FALLBACK FIX (carried forward): if RAPIDAPI_KEY isn't
+    configured, the call fails/times out, the response isn't JSON, or no
+    usable volume field is found, a random placeholder in the
     SEARCH_VOLUME_RANDOM_FALLBACK_MIN..MAX range is returned instead of
     None, and a clearly-labelled "RANDOM FALLBACK" warning is logged
     with the exact value and reason. A real, provider-returned value is
@@ -1235,8 +1201,8 @@ def fetch_google_stats(search_keyword: str) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT — SOLE discovery mechanism: RapidAPI SERP search
-# (site:reddit.com) -> real per-post rank + URL -> Reddit OAuth (PRAW)
-# with public .json smart-retry fallback -> full post data (text,
+# (site:reddit.com) -> real per-post rank + URL -> Reddit's public,
+# credential-free .json endpoint (smart-retry) -> full post data (text,
 # username, subreddit, upvotes, comments, posted_at). Each keyword is
 # only fetched when get_due_keywords() says it's due — see the KEYWORD
 # CACHE section above. search_volume is read from the already-seeded
@@ -1348,133 +1314,26 @@ def is_post_already_signaled(post_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT OAUTH (PRAW) — added in v9.7, BUG 2 FIX, carried forward.
+# REDDIT POST FETCH — public, credential-free .json endpoint ONLY.
 #
-# The v9.6 public .json smart-retry fetcher was already correctly
-# implemented (proper User-Agent, jittered backoff, old.reddit.com
-# fallback) — but persistent 403s across every attempt on both hosts is
-# the signature of Reddit blanket-blocking the SERVER'S IP itself, which
-# no request-shape tuning on the anonymous public endpoint can fix.
-#
-# fetch_reddit_post_via_praw() authenticates via Reddit's official OAuth
-# API, which is not subject to that anonymous-scrape IP block. It is
-# tried FIRST by fetch_reddit_post_by_url() below; if it's unavailable
-# (not configured) or itself fails for any reason, control falls straight
-# through to the ORIGINAL v9.6 public .json path, unchanged. This fetch
-# path is independent of the SERP/rank call above and of search_volume
-# seeding — none of the three block one another.
+# As of v9.10, PRAW/OAuth has been removed entirely — there is nothing
+# to configure, no Reddit "script" app, no client id/secret, no
+# username/password. This is the same no-credentials-needed philosophy
+# FLINTEL-EC uses for Reddit (feedparser RSS there, public .json here) —
+# just applied to a single known post_url (already discovered via SERP)
+# instead of a subreddit's /new.rss feed, since we already know exactly
+# which post to fetch. The v9.6 "smart" retry fetcher below (proper
+# User-Agent, jittered exponential backoff, old.reddit.com fallback
+# host) is unchanged and is now the ONLY Reddit per-post fetch path.
+# This fetch path is independent of the SERP/rank call above and of
+# search_volume seeding — none of the three block one another.
 # ─────────────────────────────────────────────────────────────────────────────
-
-_praw_client = None
-_praw_init_attempted = False
-
-
-def get_praw_client():
-    """
-    Lazily builds and authenticates a single shared PRAW client. Returns
-    None (without raising) if OAuth isn't configured or authentication
-    fails — callers treat None as "OAuth unavailable, use the public
-    .json fallback instead." Only ever attempts authentication once per
-    process lifetime (a failed attempt is not retried every post — that
-    would just hammer a broken credential); a full restart will retry.
-    """
-    global _praw_client, _praw_init_attempted
-
-    if _praw_client is not None:
-        return _praw_client
-    if _praw_init_attempted:
-        return None
-    _praw_init_attempted = True
-
-    if not REDDIT_OAUTH_CONFIGURED:
-        log.warning(
-            "[SERP] Reddit OAuth (PRAW) not configured — REDDIT_CLIENT_ID/"
-            "REDDIT_CLIENT_SECRET/REDDIT_USERNAME/REDDIT_PASSWORD not all set. "
-            "Falling back to public .json fetch only (v9.6 behavior)."
-        )
-        return None
-
-    try:
-        client = praw.Reddit(
-            client_id=REDDIT_CLIENT_ID,
-            client_secret=REDDIT_CLIENT_SECRET,
-            username=REDDIT_USERNAME,
-            password=REDDIT_PASSWORD,
-            user_agent=REDDIT_USER_AGENT,
-        )
-        # cheap call to confirm the credentials actually authenticate
-        _ = client.user.me()
-        _praw_client = client
-        log.info("[SERP] Reddit OAuth (PRAW) authenticated — using OAuth as PRIMARY fetch path.")
-        return _praw_client
-    except Exception as exc:
-        log.error(f"[SERP] Reddit OAuth (PRAW) authentication failed: {exc} — "
-                  f"falling back to public .json fetch only for this process lifetime.")
-        _praw_client = None
-        return None
-
-
-def _extract_reddit_submission_id(post_url: str) -> str | None:
-    """Pulls the submission id out of a standard reddit.com post URL
-    (e.g. .../comments/<id>/...). Returns None if it can't be found —
-    caller falls back to the public .json path in that case."""
-    match = re.search(r"/comments/([a-zA-Z0-9]+)", post_url)
-    return match.group(1) if match else None
-
-
-def fetch_reddit_post_via_praw(post_url: str, keyword: str, rank: int) -> dict | None:
-    """
-    Fetches one post via Reddit's authenticated OAuth API (PRAW) instead
-    of the public, unauthenticated .json endpoint. Returns the EXACT SAME
-    item schema as fetch_reddit_post_by_url()'s public-.json path, so
-    nothing downstream (queueing, batching, Claude scoring, Mongo
-    storage) needs to know which path produced it. Returns None (never
-    raises) on any failure — caller falls through to the public .json
-    smart-retry path.
-    """
-    client = get_praw_client()
-    if client is None:
-        return None
-
-    submission_id = _extract_reddit_submission_id(post_url)
-    if not submission_id:
-        log.warning(f"[SERP] Could not extract submission id from {post_url} for PRAW — "
-                    f"falling back to public .json.")
-        return None
-
-    try:
-        submission = client.submission(id=submission_id)
-        # touching .title forces the lazy object to load now, inside this try
-        _ = submission.title
-
-        posted_at = None
-        if submission.created_utc:
-            posted_at = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc).isoformat()
-
-        return {
-            "message_id":           f"reddit_serp_{submission.id}",
-            "platform":             "reddit",
-            "text":                 f"{submission.title or ''}\n\n{submission.selftext or ''}",
-            "username":             str(submission.author) if submission.author else "unknown",
-            "subreddit_or_channel": str(submission.subreddit) if submission.subreddit else "",
-            "post_url":             post_url,
-            "posted_at":            posted_at,
-            "search_keyword":       keyword,
-            "upvotes":              submission.score,
-            "comments":             submission.num_comments,
-            "google_rank":          rank,   # real per-post rank, already set here
-            "search_volume":        None,   # filled in by process_one_keyword() below
-        }
-    except Exception as exc:
-        log.warning(f"[SERP] PRAW fetch failed for {post_url}: {exc} — falling back to public .json.")
-        return None
-
 
 def _reddit_get_with_retry(url: str) -> requests.Response | None:
     """
     v9.6 "smart" GET wrapper for Reddit's public .json endpoint — kept
-    100% as-is as the FALLBACK path when OAuth (PRAW) is unavailable or
-    fails:
+    100% as-is, and as of v9.10 this is the ONLY Reddit per-post fetch
+    path (no OAuth/PRAW primary path anymore):
       - Reddit-recommended User-Agent format (REDDIT_USER_AGENT).
       - Small randomized jitter delay before each attempt, to avoid an
         obviously robotic, perfectly-uniform request cadence.
@@ -1534,20 +1393,13 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
     Fetches the FULL post: text, username, subreddit, upvotes, comments,
     posted_at. This is the ONLY way Reddit data enters this system now.
 
-    BUG 2 FIX (v9.7, carried forward): now tries Reddit's OAuth API
-    (PRAW) FIRST — this is the durable fix for the persistent-403/
-    blanket-IP-block failure mode that no amount of retry/backoff/
-    User-Agent tuning on the public endpoint can solve. If PRAW isn't
-    configured or itself fails, this falls straight through to the
-    ORIGINAL v9.6 public .json smart-retry (with old.reddit.com
-    fallback), completely unchanged below.
+    v9.10: goes straight to Reddit's public, credential-free .json
+    endpoint (smart-retry + old.reddit.com fallback host) — no OAuth, no
+    PRAW, nothing to configure. Real numeric "ups" and "num_comments"
+    come straight off Reddit's own JSON for the post, exactly as before.
     """
     if not post_url:
         return None
-
-    praw_result = fetch_reddit_post_via_praw(post_url, keyword, rank)
-    if praw_result is not None:
-        return praw_result
 
     primary_url = post_url.rstrip("/") + ".json"
     r = _reddit_get_with_retry(primary_url)
@@ -1606,7 +1458,7 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
          number or a random fallback.
       2. Per-result post_url dedup check -> skip already-known posts
          (no fetch, no Claude call for those)
-      3. Reddit fetch (OAuth/PRAW first, public .json fallback) for
+      3. Reddit fetch (public .json, credential-free, smart-retry) for
          genuinely new posts -> stamp the keyword's already-seeded
          search_volume (and its random/real flag) onto each item ->
          queue for Claude scoring
@@ -1694,8 +1546,8 @@ def run_serp_discovery_loop():
         f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}) | "
         f"random fallback range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} "
         f"on failure/no-credits (always logged) | "
-        f"REDDIT FETCH: OAuth(PRAW) {'configured' if REDDIT_OAUTH_CONFIGURED else 'NOT configured'} "
-        f"primary + public .json smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + fallback host) as backup"
+        f"REDDIT FETCH: public .json only, credential-free ({REDDIT_FETCH_MAX_RETRIES}x backoff "
+        f"+ old.reddit.com fallback host, no OAuth/PRAW)"
     )
 
     while True:
@@ -2285,10 +2137,10 @@ async def start_reddit_listener():
     """
     Reddit's ONLY mechanism now: SERP discovery thread (per-keyword
     fetch-once-forever cache + batched search-volume seeding -> Google
-    search -> OAuth(PRAW)/public-.json fetch) + its dedicated batch
+    search -> public, credential-free .json fetch) + its dedicated batch
     processor thread. Governed entirely by REDDIT_ENABLED + RapidAPI
     credentials (RapidAPI is still required for SERP discovery itself;
-    OAuth/PRAW is only used for the per-post fetch step).
+    the per-post fetch step needs no credentials at all — no OAuth/PRAW).
     """
     if not REDDIT_ENABLED:
         log.warning("Reddit platform DISABLED — skipping.")
@@ -2393,18 +2245,20 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v9.9 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + OAuth/PRAW fetch + random-fallback volume) + Twitter Signal Scorer",
+    title="Flintel v9.10 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free .json fetch + random-fallback volume) + Twitter Signal Scorer",
     description=(
         "Reddit (RapidAPI SERP discovery, fetch-once-forever keyword cache — "
         "no re-fetch, ever, once a keyword is done) + Twitter signals: monitor, "
         "score (generic 1-100 relevance/visibility/engagement model), store. "
-        "Search-volume ('search/mo') failures — bad key, exhausted credits, "
-        "rate-limits, timeouts, or no usable field — are NEVER left as a "
-        "permanent None: a random placeholder in a configurable range "
-        "(default 300-5000) is generated instead, and every single "
-        "occurrence is logged with a clearly-labelled 'RANDOM FALLBACK' "
-        "warning naming the exact value + reason, so it's always "
-        "distinguishable in the logs from a real value. This is fully "
+        "Reddit per-post fetch uses ONLY Reddit's public, credential-free .json "
+        "endpoint (smart-retry + old.reddit.com fallback) — no OAuth, no PRAW, "
+        "nothing to configure. Search-volume ('search/mo') failures — bad key, "
+        "exhausted credits, rate-limits, timeouts, or no usable field — are "
+        "NEVER left as a permanent None: a random placeholder in a "
+        "configurable range (default 300-5000) is generated instead, and "
+        "every single occurrence is logged with a clearly-labelled "
+        "'RANDOM FALLBACK' warning naming the exact value + reason, so it's "
+        "always distinguishable in the logs from a real value. This is fully "
         "independent of — and never blocks or is blocked by — the separate "
         "Google-rank/SERP RapidAPI calls, which run on their own host and "
         "their own try/except. Persistent batch state + queue + dedup — no "
@@ -2417,7 +2271,7 @@ app = FastAPI(
         "rescore (re-uses stored enrichment, never re-fetches from Reddit or "
         "RapidAPI) instead of a permanent low score."
     ),
-    version="9.9.0",
+    version="9.10.0",
 )
 
 
@@ -2448,13 +2302,12 @@ def root():
     })
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.9 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + OAuth/PRAW fetch + random-fallback volume + Twitter)",
+        "system":                  "FLINTEL v9.10 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free .json fetch + random-fallback volume + Twitter)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
         "reddit_status":           _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
-        "reddit_oauth_configured": REDDIT_OAUTH_CONFIGURED,
-        "reddit_fetch_primary":    "OAuth (PRAW)" if REDDIT_OAUTH_CONFIGURED else "public .json smart-retry (OAuth not configured)",
+        "reddit_fetch_method":     "public .json (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW",
         "twitter_enabled":         TWITTER_ENABLED,
         "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
         "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
@@ -2463,7 +2316,7 @@ def root():
         "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords)",
         "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE})",
         "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}, always logged, never overrides a real value",
-        "reddit_fetch_reliability":         f"OAuth(PRAW) {'configured' if REDDIT_OAUTH_CONFIGURED else 'not configured'} primary + smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback) backup",
+        "reddit_fetch_reliability":         f"public .json only, credential-free — smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback)",
         "keywords_tracked":               total_keywords_tracked,
         "keywords_due_now":               due_now_count,
         "keywords_missing_search_volume": missing_volume_count,
@@ -2485,6 +2338,7 @@ def root():
         "auth_required":           bool(API_KEY),
         "telegram_removed":        True,
         "reddit_rss_removed":      True,
+        "reddit_oauth_praw_removed": True,
         "fixed_full_cycle_sleep_removed": True,
         "post_url_dedup_before_scoring": True,
         "claude_failure_routes_to_pending": True,
@@ -2505,7 +2359,7 @@ def health():
         "mongodb":                 mongo,
         "reddit_working":          REDDIT_ENABLED and bool(RAPIDAPI_KEY),
         "reddit_indicator":        _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
-        "reddit_oauth_configured": REDDIT_OAUTH_CONFIGURED,
+        "reddit_fetch_method":     "public .json (credential-free) — no OAuth/PRAW",
         "twitter_working":         TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN),
         "twitter_indicator":       _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
         "reddit_queue_size":       reddit_queue.qsize(),
@@ -2607,15 +2461,14 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.9 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
-    log.info("                  + BATCHED SEARCH-VOLUME SEEDING + OAUTH/PRAW FETCH")
-    log.info("                  + RANDOM-FALLBACK SEARCH VOLUME) + TWITTER SIGNAL SCORER")
+    log.info("  FLINTEL v9.10 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
+    log.info("                   + BATCHED SEARCH-VOLUME SEEDING + CREDENTIAL-FREE")
+    log.info("                   .JSON FETCH + RANDOM-FALLBACK SEARCH VOLUME) + TWITTER SIGNAL SCORER")
     log.info("=" * 70)
     log.info(f"  Client               : {CLIENT_ID}")
     log.info(f"  Platforms            : Reddit (SERP discovery, fetch-once-forever) + Twitter/X")
     log.info(f"  Reddit               : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
-    log.info(f"  Reddit OAuth (PRAW)  : {REDDIT_OAUTH_CONFIGURED} | "
-             f"{'primary fetch path' if REDDIT_OAUTH_CONFIGURED else 'NOT configured — using public .json fallback only'}")
+    log.info(f"  Reddit fetch method  : public .json only — credential-free, no OAuth/PRAW, nothing to configure")
     log.info(f"  Twitter              : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
     log.info(f"  Reddit keywords      : {len(REDDIT_SEARCH_KEYWORDS)} (used for SERP discovery)")
     log.info(f"  Twitter keywords     : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
@@ -2627,9 +2480,9 @@ if __name__ == "__main__":
     log.info(f"  Search-volume fallback: RANDOM placeholder {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
              f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} on any failure/no-credits — always clearly logged, "
              f"never overrides a real value")
-    log.info(f"  Reddit fetch         : OAuth(PRAW) primary (v9.7+) + public .json smart-retry fallback "
-             f"({REDDIT_FETCH_MAX_RETRIES}x backoff, jitter {REDDIT_FETCH_JITTER_MIN}-{REDDIT_FETCH_JITTER_MAX}s, "
-             f"old.reddit.com fallback)")
+    log.info(f"  Reddit fetch         : public .json smart-retry only ({REDDIT_FETCH_MAX_RETRIES}x backoff, "
+             f"jitter {REDDIT_FETCH_JITTER_MIN}-{REDDIT_FETCH_JITTER_MAX}s, old.reddit.com fallback) — "
+             f"no OAuth/PRAW")
     log.info(f"  Reddit batch         : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
     log.info(f"  Twitter batch        : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
     log.info(f"  Rescore batch        : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
@@ -2638,6 +2491,7 @@ if __name__ == "__main__":
     log.info(f"  RapidAPI config      : {bool(RAPIDAPI_KEY)} (SOLE provider — google_rank + search_volume)")
     log.info(f"  Telegram             : REMOVED")
     log.info(f"  Reddit RSS           : REMOVED")
+    log.info(f"  Reddit OAuth/PRAW    : REMOVED")
     log.info(f"  Fixed full-cycle sleep: REMOVED (each keyword has its own independent fetch-once-forever state)")
     log.info(f"  MongoDB DB           : {MONGODB_DB}")
     log.info(f"  API auth             : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
