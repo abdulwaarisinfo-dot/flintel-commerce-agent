@@ -259,11 +259,12 @@ REDDIT_SEARCH_KEYWORDS = [
     "scaling finance operations", "outsourced bookkeeping", "outsourced accounting",
     "virtual CFO", "fractional CFO", "need a fractional CFO",
     "part time bookkeeper", "part time accountant",
-      "controller", "VP of finance", "head of finance", "director of finance",
-    "chief financial officer", "CFO", "finance manager", "accounting manager",
-    "bookkeeper", "staff accountant", "senior accountant",
-    "accounts payable manager", "accounts receivable manager",
-    "financial analyst", "FP&A manager",
+
+      "urgently need a bookkeeper", "need books cleaned up ASAP",
+    "tax deadline approaching", "need this done before tax season",
+    "investors asking for financials", "due diligence deadline",
+    "board wants updated financials", "need financials for loan application",
+    "need financials for a loan", "applying for a business loan financials",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
