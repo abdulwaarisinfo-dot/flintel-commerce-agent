@@ -289,6 +289,15 @@ REDDIT_SEARCH_KEYWORDS = [
     "investors asking for financials", "due diligence deadline",
     "board wants updated financials", "need financials for loan application",
     "need financials for a loan", "applying for a business loan financials",
+
+  "QuickBooks is a nightmare", "QuickBooks too complicated",
+    "QuickBooks too expensive", "QuickBooks pricing increase",
+    "QuickBooks alternative", "alternative to QuickBooks",
+    "leaving QuickBooks", "switching from QuickBooks",
+    "migrating from QuickBooks", "QuickBooks customer support terrible",
+    "Xero alternative", "alternative to Xero", "switching from Xero",
+    "leaving Xero", "Xero problem", "Xero issue",
+    "FreshBooks alternative", "switching from FreshBooks",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
