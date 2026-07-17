@@ -190,6 +190,10 @@ REDDIT_SEARCH_KEYWORDS = [
     "scaling finance operations", "outsourced bookkeeping", "outsourced accounting",
     "virtual CFO", "fractional CFO", "need a fractional CFO",
     "part time bookkeeper", "part time accountant",
+  "compliance issue HR", "employment law compliance",
+    "wrongful termination risk", "HR compliance nightmare",
+    "I-9 compliance", "E-Verify issue", "labor law compliance",
+    "wage and hour compliance", "overtime compliance issue",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
