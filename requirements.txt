@@ -15,3 +15,5 @@ uvicorn>=0.29.0
 
 # Scheduling & Async
 asyncio-throttle>=1.0.2
+praw>=7.7.0
+
