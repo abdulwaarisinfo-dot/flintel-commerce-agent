@@ -154,6 +154,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
+CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
 
 # Optional generic label/context — used ONLY as a fallback google_rank
 # lookup for Twitter items (Twitter has no per-post SERP discovery in
