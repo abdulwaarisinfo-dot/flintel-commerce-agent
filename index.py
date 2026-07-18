@@ -1832,7 +1832,7 @@ def _parse_claude_json(raw: str) -> tuple:
 def _call_claude_batch(batch: list) -> list:
     prompt = _build_batch_prompt(batch)
     with anthropic_client.messages.stream(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4.5",
         max_tokens=MAX_TOKENS,
         system=CLAUDE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"Score this batch:\n\n{prompt}"}],
