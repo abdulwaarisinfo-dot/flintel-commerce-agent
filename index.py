@@ -289,6 +289,14 @@ REDDIT_SEARCH_KEYWORDS = [
     "investors asking for financials", "due diligence deadline",
     "board wants updated financials", "need financials for loan application",
     "need financials for a loan", "applying for a business loan financials",
+
+      "head of talent", "head of HR", "head of people",
+    "VP of people", "VP of talent", "chief people officer",
+    "talent acquisition manager", "recruiting manager",
+    "HR manager", "HR business partner", "people operations manager",
+    "HRIS manager", "compensation and benefits manager",
+    "director of talent acquisition", "director of people operations",
+    "technical recruiter", "corporate recruiter", "recruiting coordinator",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
