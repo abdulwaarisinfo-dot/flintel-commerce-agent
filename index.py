@@ -1819,7 +1819,9 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
          genuinely new posts -> stamp the keyword's already-seeded
          search_volume (and its random/real flag) onto each item ->
          queue for Claude scoring
-    Returns (new_items_count, skipped_dupes_count) for logging.
+    Returns (new_items_count, skipped_dupes_count, had_fetch_failure) for
+    logging AND for run_serp_discovery_loop()'s fetched=True decision
+    (see that function for why had_fetch_failure matters).
 
     `volume` and `volume_is_random` are passed in by the caller (read
     straight off the keyword's own flintel_keywords document by
@@ -1829,8 +1831,18 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
     exact same item schema and the exact same queue/Claude/signals flow
     — whether `volume` is real or a random fallback, the SERP rank
     lookup and the Reddit post fetch above always still run.
+
+    had_fetch_failure: the retry/backoff behavior of
+    fetch_reddit_post_by_url() / _reddit_get_with_retry() is completely
+    UNCHANGED (still REDDIT_FETCH_MAX_RETRIES attempts, same jittered
+    exponential backoff, same old.reddit.com fallback host). This flag
+    ONLY records whether fetch_reddit_post_by_url() genuinely exhausted
+    all retries and gave up (e.g. persistent 429/403) for at least one
+    result belonging to this keyword — a 404 (post genuinely gone) is
+    NOT a failure here, it's a legitimate "nothing to fetch" outcome.
     """
     new_items, skipped_dupes = 0, 0
+    had_fetch_failure = False
 
     results = search_google_for_keyword(keyword, months_back=SERP_MONTHS_BACK)
 
@@ -1842,6 +1854,7 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
 
         item = fetch_reddit_post_by_url(result["url"], keyword, result["rank"])
         if not item:
+            had_fetch_failure = True
             continue
         item["search_volume"] = volume   # same cached value for every post from this keyword
         item["search_volume_is_random"] = volume_is_random
@@ -1850,7 +1863,7 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
         new_items += 1
         time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
-    return new_items, skipped_dupes
+    return new_items, skipped_dupes, had_fetch_failure
 
 
 def run_serp_discovery_loop():
@@ -1943,16 +1956,38 @@ def run_serp_discovery_loop():
                 keyword = doc["keyword"]
                 volume = doc.get("search_volume")                     # cached, already seeded — no API call
                 volume_is_random = doc.get("search_volume_is_random", False)
-                new_items, dupes = process_one_keyword(keyword, volume, volume_is_random)
-                mark_keyword_fetched(keyword)
+                new_items, dupes, had_fetch_failure = process_one_keyword(keyword, volume, volume_is_random)
                 total_new += new_items
                 total_dupes += dupes
                 sv_tag = "RANDOM-FALLBACK" if volume_is_random else "real"
-                log.info(
-                    f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
-                    f"search_volume:{volume} ({sv_tag}, from cache) | "
-                    f"marked fetched=True PERMANENTLY — will never be re-fetched"
-                )
+
+                if had_fetch_failure:
+                    # At least one Reddit RSS fetch for this keyword
+                    # genuinely exhausted all retries (e.g. persistent
+                    # 429/403) and gave up — do NOT mark this keyword
+                    # fetched=True. It stays fetched=False in
+                    # flintel_keywords, so get_due_keywords() will pick
+                    # it up again on a future pass and retry the whole
+                    # keyword (SERP search + fetch) — the same
+                    # smart-retry/backoff logic runs again, unchanged.
+                    # Posts that DID fetch successfully this pass are
+                    # already saved/queued and are protected from being
+                    # re-processed by is_post_already_signaled() dedup,
+                    # so re-running this keyword only chases the posts
+                    # that failed.
+                    log.warning(
+                        f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
+                        f"search_volume:{volume} ({sv_tag}, from cache) | "
+                        f"had_fetch_failure:True — NOT marking fetched=True, "
+                        f"will remain due and be retried on a future pass"
+                    )
+                else:
+                    mark_keyword_fetched(keyword)
+                    log.info(
+                        f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
+                        f"search_volume:{volume} ({sv_tag}, from cache) | "
+                        f"marked fetched=True PERMANENTLY — will never be re-fetched"
+                    )
                 time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
             log.info(
