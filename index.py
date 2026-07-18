@@ -4,7 +4,7 @@ FLINTEL v9.11 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
                 + Twitter/X Signal Scorer
 =================================================================================
 Platforms : Reddit — RapidAPI SERP discovery ONLY (Google search,
-            site:reddit.com, real per-post rank -> Reddit public per-post
+            site:reddit.com, real per-post rank -> Reddit public per-post 
             RSS feed, smart-retry, no credentials required)
           + Twitter/X (tweepy v2)
 
