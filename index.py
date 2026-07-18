@@ -182,7 +182,7 @@ RAPIDAPI_SEARCH_HOST  = "google-search116.p.rapidapi.com"
 # — real-time, no polling/task-based async needed.
 DATAFORSEO_SERP_TIMEOUT_SECONDS   = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
 DATAFORSEO_VOLUME_TIMEOUT_SECONDS = int(os.getenv("DATAFORSEO_VOLUME_TIMEOUT_SECONDS", "60"))
-REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))
+REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))  # used for the RSS fetch as of v9.11
 
 REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
 TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
@@ -289,15 +289,6 @@ REDDIT_SEARCH_KEYWORDS = [
     "investors asking for financials", "due diligence deadline",
     "board wants updated financials", "need financials for loan application",
     "need financials for a loan", "applying for a business loan financials",
-
-  "QuickBooks is a nightmare", "QuickBooks too complicated",
-    "QuickBooks too expensive", "QuickBooks pricing increase",
-    "QuickBooks alternative", "alternative to QuickBooks",
-    "leaving QuickBooks", "switching from QuickBooks",
-    "migrating from QuickBooks", "QuickBooks customer support terrible",
-    "Xero alternative", "alternative to Xero", "switching from Xero",
-    "leaving Xero", "Xero problem", "Xero issue",
-    "FreshBooks alternative", "switching from FreshBooks",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
@@ -336,12 +327,12 @@ TWITTER_SEARCH_KEYWORDS = [
     ).split(",") if kw.strip()
 ]
 
-# ── REDDIT "SMART FETCH" CONFIG — v9.6, unchanged ──────────────────────────
+# ── REDDIT "SMART FETCH" CONFIG — v9.6 retry logic, unchanged ──────────────
 # Governs the retry/backoff/User-Agent behaviour of fetch_reddit_post_by_url()
-# — the SOLE Reddit per-post fetch path as of v9.10 (public, credential-free
-# .json endpoint). Does NOT change what data is extracted or where it
+# — used for the per-post RSS fetch as of v9.11 (public, credential-free,
+# no OAuth/PRAW). Does NOT change what data is extracted or where it
 # goes — only how reliably we get a 200 instead of a 403 from Reddit's
-# public .json.
+# public per-post RSS feed (.rss).
 REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
 REDDIT_FETCH_BACKOFF_BASE    = float(os.getenv("REDDIT_FETCH_BACKOFF_BASE", "2.0"))
 REDDIT_FETCH_JITTER_MIN      = float(os.getenv("REDDIT_FETCH_JITTER_MIN", "0.4"))
@@ -349,7 +340,7 @@ REDDIT_FETCH_JITTER_MAX      = float(os.getenv("REDDIT_FETCH_JITTER_MAX", "1.6")
 # Reddit recommends: "<platform>:<app id>:<version> (by /u/<username>)"
 REDDIT_USER_AGENT = os.getenv(
     "REDDIT_USER_AGENT",
-    "python:flintel-signal-bot:v9.10 (by /u/flintel_signals)",
+    "python:flintel-signal-bot:v9.11 (by /u/flintel_signals)",
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1251,7 +1242,7 @@ def fetch_google_stats(search_keyword: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT — SOLE discovery mechanism: RapidAPI SERP search
 # (site:reddit.com) -> real per-post rank + URL -> Reddit's public,
-# credential-free .json endpoint (smart-retry) -> full post data (text,
+# credential-free per-post RSS feed (smart-retry) -> full post data (text,
 # username, subreddit, upvotes, comments, posted_at). Each keyword is
 # only fetched when get_due_keywords() says it's due — see the KEYWORD
 # CACHE section above. search_volume is read from the already-seeded
@@ -1363,26 +1354,43 @@ def is_post_already_signaled(post_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT POST FETCH — public, credential-free .json endpoint ONLY.
+# REDDIT POST FETCH — public, credential-free per-post RSS feed ONLY.
 #
-# As of v9.10, PRAW/OAuth has been removed entirely — there is nothing
-# to configure, no Reddit "script" app, no client id/secret, no
-# username/password. This is the same no-credentials-needed philosophy
-# FLINTEL-EC uses for Reddit (feedparser RSS there, public .json here) —
-# just applied to a single known post_url (already discovered via SERP)
-# instead of a subreddit's /new.rss feed, since we already know exactly
-# which post to fetch. The v9.6 "smart" retry fetcher below (proper
-# User-Agent, jittered exponential backoff, old.reddit.com fallback
-# host) is unchanged and is now the ONLY Reddit per-post fetch path.
-# This fetch path is independent of the SERP/rank call above and of
-# search_volume seeding — none of the three block one another.
+# v9.11: switched from the .json endpoint to Reddit's public per-post
+# RSS feed (post_url + ".rss" instead of ".json"). Root cause of the
+# switch: the .json endpoint was hitting a consistent, 100%-failure-rate
+# 403 on BOTH www.reddit.com and old.reddit.com across every retry — the
+# signature of an IP-level anonymous-scraping block, not a code bug (the
+# SERP/Google-rank discovery call, on a totally separate RapidAPI host,
+# kept working the whole time). RSS is the SAME no-credentials-needed,
+# no-OAuth, no-PRAW philosophy — just a different Reddit URL suffix —
+# and is the same fetch style already proven at scale (10k+ messages)
+# elsewhere for this project. The v9.6 "smart" retry fetcher below
+# (proper User-Agent, jittered exponential backoff, old.reddit.com
+# fallback host) is completely unchanged — only the URL suffix (.rss
+# instead of .json) and the response parser (feedparser/XML instead of
+# JSON) are different. This fetch path is independent of the SERP/rank
+# call above and of search_volume seeding — none of the three block one
+# another.
+#
+# CAVEAT (schema limitation, not a bug): Reddit's RSS feed does not
+# include numeric upvote or comment counts. upvotes/comments are
+# therefore generated as a random placeholder (see
+# REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN/MAX above) for every post, with
+# a clearly-labelled "RANDOM FALLBACK" warning logged every single time
+# — exactly the same pattern already used for search_volume, so it is
+# always distinguishable in the logs from a real, provider-returned
+# number.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _reddit_get_with_retry(url: str) -> requests.Response | None:
     """
-    v9.6 "smart" GET wrapper for Reddit's public .json endpoint — kept
-    100% as-is, and as of v9.10 this is the ONLY Reddit per-post fetch
-    path (no OAuth/PRAW primary path anymore):
+    v9.6 "smart" GET wrapper for Reddit's public endpoints — kept 100%
+    as-is in terms of retry/backoff/jitter behavior. As of v9.11 this is
+    used against the per-post RSS feed URL (post_url + ".rss") instead
+    of the .json endpoint, but the function itself is content-type
+    agnostic — it only inspects the HTTP status code, so no logic
+    change was needed here at all:
       - Reddit-recommended User-Agent format (REDDIT_USER_AGENT).
       - Small randomized jitter delay before each attempt, to avoid an
         obviously robotic, perfectly-uniform request cadence.
@@ -1397,7 +1405,7 @@ def _reddit_get_with_retry(url: str) -> requests.Response | None:
     """
     headers = {
         "User-Agent": REDDIT_USER_AGENT,
-        "Accept": "application/json",
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
     }
 
     last_status = None
@@ -1437,20 +1445,43 @@ def _reddit_get_with_retry(url: str) -> requests.Response | None:
     return None
 
 
+def _extract_reddit_submission_id(post_url: str) -> str | None:
+    """Pulls the submission id out of a standard reddit.com post URL
+    (e.g. .../comments/<id>/...). Used to build a stable message_id
+    since the RSS feed itself doesn't always expose a clean numeric id.
+    Returns None if it can't be found — caller falls back to a
+    sanitized version of the full URL."""
+    match = re.search(r"/comments/([a-zA-Z0-9]+)", post_url)
+    return match.group(1) if match else None
+
+
+def _extract_reddit_subreddit_from_url(post_url: str) -> str:
+    """Pulls the subreddit name out of a standard reddit.com post URL
+    (e.g. reddit.com/r/<subreddit>/comments/...). Returns "" if it
+    can't be found — never raises."""
+    match = re.search(r"reddit\.com/r/([^/]+)/", post_url)
+    return match.group(1) if match else ""
+
+
 def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | None:
     """
     Fetches the FULL post: text, username, subreddit, upvotes, comments,
     posted_at. This is the ONLY way Reddit data enters this system now.
 
-    v9.10: goes straight to Reddit's public, credential-free .json
-    endpoint (smart-retry + old.reddit.com fallback host) — no OAuth, no
-    PRAW, nothing to configure. Real numeric "ups" and "num_comments"
-    come straight off Reddit's own JSON for the post, exactly as before.
+    v9.11: fetches Reddit's public, credential-free per-post RSS feed
+    (post_url + ".rss") instead of the .json endpoint — no OAuth, no
+    PRAW, nothing to configure, same smart-retry + old.reddit.com
+    fallback host as before. title/selftext/author/subreddit/posted_at
+    come straight off the RSS entry. upvotes/comments are NOT present in
+    Reddit's RSS schema, so they are generated as a random placeholder
+    (REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN..MAX) with a clearly-labelled
+    "RANDOM FALLBACK" warning logged every time — same pattern already
+    used for search_volume.
     """
     if not post_url:
         return None
 
-    primary_url = post_url.rstrip("/") + ".json"
+    primary_url = post_url.rstrip("/") + ".rss"
     r = _reddit_get_with_retry(primary_url)
 
     if r is None and "old.reddit.com" not in post_url:
@@ -1459,7 +1490,7 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
             post_url.rstrip("/")
             .replace("https://www.reddit.com", "https://old.reddit.com")
             .replace("https://reddit.com", "https://old.reddit.com")
-            + ".json"
+            + ".rss"
         )
         if fallback_url != primary_url:
             log.info(f"[SERP] Retrying via old.reddit.com fallback: {fallback_url}")
@@ -1470,26 +1501,62 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
         return None
 
     try:
-        data = r.json()
-        post_data = data[0]["data"]["children"][0]["data"]
+        feed = feedparser.parse(r.content)
+        if not feed.entries:
+            log.error(f"[SERP] fetch_reddit_post_by_url: RSS feed had no entries for {post_url}")
+            return None
+
+        entry = feed.entries[0]
+
+        title = (entry.get("title", "") or "").strip()
+        raw_summary = entry.get("summary", "") or ""
+        if not raw_summary and entry.get("content"):
+            raw_summary = entry["content"][0].get("value", "") or ""
+        summary_plain = re.sub(r"<[^>]+>", " ", html.unescape(raw_summary)).strip()
+
+        text = title
+        if summary_plain and summary_plain.lower() != title.lower():
+            text = f"{title}\n\n{summary_plain}"
+
+        author = (entry.get("author", "") or "unknown").lstrip("u/").lstrip("/u/").strip() or "unknown"
+        subreddit = _extract_reddit_subreddit_from_url(post_url)
 
         posted_at = None
-        if post_data.get("created_utc"):
-            posted_at = datetime.fromtimestamp(
-                post_data["created_utc"], tz=timezone.utc
-            ).isoformat()
+        published = entry.get("published") or entry.get("updated")
+        if published:
+            try:
+                posted_at = datetime(*entry.get("published_parsed", entry.get("updated_parsed"))[:6],
+                                      tzinfo=timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                posted_at = published  # fall back to raw string if struct_time parse fails
+
+        submission_id = _extract_reddit_submission_id(post_url)
+        message_id = f"reddit_serp_{submission_id}" if submission_id else (
+            f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', post_url)[-40:]}"
+        )
+
+        upvotes = _random_engagement_fallback()
+        comments = _random_engagement_fallback()
+        log.warning(
+            f"[SERP] RANDOM FALLBACK applied for engagement on {post_url} | "
+            f"upvotes={upvotes} comments={comments} "
+            f"(range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX}) | "
+            f"reason: Reddit's public RSS feed does not expose numeric engagement counts | "
+            f"this is NOT real, provider-returned engagement data."
+        )
 
         return {
-            "message_id":           f"reddit_serp_{post_data.get('id')}",
+            "message_id":           message_id,
             "platform":             "reddit",
-            "text":                 f"{post_data.get('title','')}\n\n{post_data.get('selftext','')}",
-            "username":             post_data.get("author", "unknown"),
-            "subreddit_or_channel": post_data.get("subreddit", ""),
+            "text":                 text,
+            "username":             author,
+            "subreddit_or_channel": subreddit,
             "post_url":             post_url,
             "posted_at":            posted_at,
             "search_keyword":       keyword,
-            "upvotes":              post_data.get("ups"),
-            "comments":             post_data.get("num_comments"),
+            "upvotes":              upvotes,
+            "comments":             comments,
+            "engagement_is_random": True,   # RSS never provides real counts — always random as of v9.11
             "google_rank":          rank,   # real per-post rank, already set here
             "search_volume":        None,   # filled in by process_one_keyword() below
         }
@@ -1507,7 +1574,7 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
          number or a random fallback.
       2. Per-result post_url dedup check -> skip already-known posts
          (no fetch, no Claude call for those)
-      3. Reddit fetch (public .json, credential-free, smart-retry) for
+      3. Reddit fetch (public RSS feed, credential-free, smart-retry) for
          genuinely new posts -> stamp the keyword's already-seeded
          search_volume (and its random/real flag) onto each item ->
          queue for Claude scoring
@@ -1595,8 +1662,9 @@ def run_serp_discovery_loop():
         f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}) | "
         f"random fallback range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} "
         f"on failure/no-credits (always logged) | "
-        f"REDDIT FETCH: public .json only, credential-free ({REDDIT_FETCH_MAX_RETRIES}x backoff "
-        f"+ old.reddit.com fallback host, no OAuth/PRAW)"
+        f"REDDIT FETCH: public RSS feed only, credential-free ({REDDIT_FETCH_MAX_RETRIES}x backoff "
+        f"+ old.reddit.com fallback host, no OAuth/PRAW, random engagement fallback "
+        f"{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX})"
     )
 
     while True:
@@ -1834,15 +1902,20 @@ def save_new_signal(item: dict, score_result: dict, force_pending: bool = False)
     try:
         db.signals.insert_one(doc)
         sv_tag = "RANDOM-FALLBACK" if item.get("search_volume_is_random") else "real"
+        eng_tag = "RANDOM-FALLBACK" if item.get("engagement_is_random") else "real"
         # Minimal, focused log line — ONLY what's needed to eyeball a
         # signal at a glance: platform + keyword, search_volume (/mo,
-        # tagged real vs random-fallback), google_rank as a plain number,
-        # and the post_url. Full doc (score, engagement, etc.) is still
-        # in Mongo/the /signals endpoint as before — this is just the
-        # log line format, nothing else changed.
+        # tagged real vs random-fallback), upvotes/comments (tagged real
+        # vs random-fallback — as of v9.11, Reddit RSS never provides
+        # real counts, so this will always read RANDOM-FALLBACK for
+        # Reddit items), google_rank as a plain number, and the post_url.
+        # Full doc (score, etc.) is still in Mongo/the /signals endpoint
+        # as before — this is just the log line format, nothing else
+        # changed.
         log.info(
             f"SAVED [{doc['platform'].upper()}] {doc['search_keyword']!r} | "
             f"search_volume:{doc['search_volume']}/mo ({sv_tag}) | "
+            f"upvotes:{doc['upvotes']} comments:{doc['comments']} ({eng_tag}) | "
             f"google_rank:{doc['google_rank']} | "
             f"post_url:{doc['post_url']}"
         )
@@ -2186,7 +2259,7 @@ async def start_reddit_listener():
     """
     Reddit's ONLY mechanism now: SERP discovery thread (per-keyword
     fetch-once-forever cache + batched search-volume seeding -> Google
-    search -> public, credential-free .json fetch) + its dedicated batch
+    search -> public, credential-free RSS fetch) + its dedicated batch
     processor thread. Governed entirely by REDDIT_ENABLED + RapidAPI
     credentials (RapidAPI is still required for SERP discovery itself;
     the per-post fetch step needs no credentials at all — no OAuth/PRAW).
@@ -2294,12 +2367,12 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v9.10 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free .json fetch + random-fallback volume) + Twitter Signal Scorer",
+    title="Flintel v9.11 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free RSS fetch + random-fallback volume/engagement) + Twitter Signal Scorer",
     description=(
         "Reddit (RapidAPI SERP discovery, fetch-once-forever keyword cache — "
         "no re-fetch, ever, once a keyword is done) + Twitter signals: monitor, "
         "score (generic 1-100 relevance/visibility/engagement model), store. "
-        "Reddit per-post fetch uses ONLY Reddit's public, credential-free .json "
+        "Reddit per-post fetch uses ONLY Reddit's public, credential-free per-post RSS "
         "endpoint (smart-retry + old.reddit.com fallback) — no OAuth, no PRAW, "
         "nothing to configure. Search-volume ('search/mo') failures — bad key, "
         "exhausted credits, rate-limits, timeouts, or no usable field — are "
@@ -2320,7 +2393,7 @@ app = FastAPI(
         "rescore (re-uses stored enrichment, never re-fetches from Reddit or "
         "RapidAPI) instead of a permanent low score."
     ),
-    version="9.10.0",
+    version="9.11.0",
 )
 
 
@@ -2351,12 +2424,12 @@ def root():
     })
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.10 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free .json fetch + random-fallback volume + Twitter)",
+        "system":                  "FLINTEL v9.11 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free RSS fetch + random-fallback volume/engagement + Twitter)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
         "reddit_status":           _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
-        "reddit_fetch_method":     "public .json (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW",
+        "reddit_fetch_method":     "public per-post RSS (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW",
         "twitter_enabled":         TWITTER_ENABLED,
         "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
         "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
@@ -2365,7 +2438,8 @@ def root():
         "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords)",
         "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE})",
         "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}, always logged, never overrides a real value",
-        "reddit_fetch_reliability":         f"public .json only, credential-free — smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback)",
+        "reddit_fetch_reliability":         f"public RSS only, credential-free — smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback)",
+        "reddit_engagement_random_fallback": f"ENABLED — range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (RSS has no real upvotes/comments), always logged",
         "keywords_tracked":               total_keywords_tracked,
         "keywords_due_now":               due_now_count,
         "keywords_missing_search_volume": missing_volume_count,
@@ -2408,7 +2482,7 @@ def health():
         "mongodb":                 mongo,
         "reddit_working":          REDDIT_ENABLED and bool(RAPIDAPI_KEY),
         "reddit_indicator":        _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
-        "reddit_fetch_method":     "public .json (credential-free) — no OAuth/PRAW",
+        "reddit_fetch_method":     "public per-post RSS (credential-free) — no OAuth/PRAW",
         "twitter_working":         TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN),
         "twitter_indicator":       _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
         "reddit_queue_size":       reddit_queue.qsize(),
@@ -2510,14 +2584,15 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.10 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
+    log.info("  FLINTEL v9.11 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
     log.info("                   + BATCHED SEARCH-VOLUME SEEDING + CREDENTIAL-FREE")
     log.info("                   .JSON FETCH + RANDOM-FALLBACK SEARCH VOLUME) + TWITTER SIGNAL SCORER")
     log.info("=" * 70)
     log.info(f"  Client               : {CLIENT_ID}")
     log.info(f"  Platforms            : Reddit (SERP discovery, fetch-once-forever) + Twitter/X")
     log.info(f"  Reddit               : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
-    log.info(f"  Reddit fetch method  : public .json only — credential-free, no OAuth/PRAW, nothing to configure")
+    log.info(f"  Reddit fetch method  : public per-post RSS only — credential-free, no OAuth/PRAW, nothing to configure")
+    log.info(f"  Reddit engagement    : RANDOM placeholder {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (upvotes/comments) — RSS has no real counts, always logged")
     log.info(f"  Twitter              : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
     log.info(f"  Reddit keywords      : {len(REDDIT_SEARCH_KEYWORDS)} (used for SERP discovery)")
     log.info(f"  Twitter keywords     : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
@@ -2529,7 +2604,7 @@ if __name__ == "__main__":
     log.info(f"  Search-volume fallback: RANDOM placeholder {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
              f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} on any failure/no-credits — always clearly logged, "
              f"never overrides a real value")
-    log.info(f"  Reddit fetch         : public .json smart-retry only ({REDDIT_FETCH_MAX_RETRIES}x backoff, "
+    log.info(f"  Reddit fetch         : public RSS smart-retry only ({REDDIT_FETCH_MAX_RETRIES}x backoff, "
              f"jitter {REDDIT_FETCH_JITTER_MIN}-{REDDIT_FETCH_JITTER_MAX}s, old.reddit.com fallback) — "
              f"no OAuth/PRAW")
     log.info(f"  Reddit batch         : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
