@@ -403,6 +403,27 @@ REDDIT_SEARCH_KEYWORDS = [
 # getting seeded regardless of the current python list contents too.
 KEYWORD_CHECK_INTERVAL_SECONDS  = int(os.getenv("KEYWORD_CHECK_INTERVAL_SECONDS", "60"))
 
+# ── KEYWORD RETRY COOLDOWN (NEW) ────────────────────────────────────────────
+# When a keyword's Reddit RSS fetch genuinely fails (retries exhausted --
+# e.g. persistent 429/403) it is left fetched=False so it gets retried
+# later (see get_due_keywords()/process_one_keyword()'s had_fetch_failure
+# handling). Without a cooldown, that keyword becomes "due" again on the
+# very next KEYWORD_CHECK_INTERVAL_SECONDS pass (as often as every 60s),
+# which means the SAME keyword's Reddit URLs get hit again and again in
+# quick succession -- this pattern is what was making Reddit's rate-
+# limiting on this IP get WORSE over time (going from partial success,
+# e.g. 17-25 posts, down to a near-total block), not better.
+#
+# REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS gives a failed keyword a resting
+# period before it's eligible to be picked up as "due" again -- default
+# 1800s (30 minutes). This does NOT change the retry/backoff behavior
+# INSIDE a single fetch attempt at all (still REDDIT_FETCH_MAX_RETRIES
+# attempts, same jittered exponential backoff, same old.reddit.com
+# fallback -- untouched). It only spaces out how often the SAME keyword
+# gets re-attempted from scratch after a full failure, so Reddit sees a
+# lower, less bursty request pattern from repeatedly-failing keywords.
+REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS = int(os.getenv("REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS", "1800"))
+
 SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "20"))
 SERP_MONTHS_BACK         = int(os.getenv("SERP_MONTHS_BACK", "6"))
 SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
@@ -839,6 +860,7 @@ def get_database():
         db.flintel_keywords.create_index([("keyword", ASCENDING)], unique=True, name="keyword_unique")
         db.flintel_keywords.create_index([("fetched", ASCENDING)], name="keyword_fetched_idx")
         db.flintel_keywords.create_index([("search_volume", ASCENDING)], name="keyword_volume_idx")
+        db.flintel_keywords.create_index([("next_retry_at", ASCENDING)], name="keyword_retry_cooldown_idx")
 
         log.info("MongoDB connected.")
         return db
@@ -1085,6 +1107,7 @@ def sync_keywords_to_db(keywords: list):
                     "search_volume":            None,
                     "search_volume_is_random":  False,
                     "last_fetched_at":          None,
+                    "next_retry_at":            None,
                     "created_at":               now,
                 }},
                 upsert=True,
@@ -1149,16 +1172,64 @@ def get_due_keywords() -> list:
     fetched=False is returned and processed, regardless of whether it's
     still present in the current python list.
 
+    v9.11.2 FIX (retry cooldown): a keyword that fetched=False because
+    its Reddit RSS fetch genuinely failed (retries exhausted) also now
+    needs its "next_retry_at" cooldown to have passed before it's
+    returned here — see REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS and
+    set_keyword_retry_cooldown() below. A keyword with next_retry_at
+    unset/None (brand new, never attempted) or already in the past is
+    still due immediately, exactly as before — the cooldown ONLY delays
+    a keyword that has already failed at least once, so Reddit doesn't
+    see the same failing keyword's URLs re-hit every single
+    KEYWORD_CHECK_INTERVAL_SECONDS pass.
+
     Each returned document already carries its own "search_volume" field
     (seeded ahead of time by seed_search_volume_batch()) — the discovery
     loop reads it straight off this same document, no extra query needed.
     """
     try:
-        cursor = db.flintel_keywords.find({"fetched": False})
+        now = datetime.now(timezone.utc)
+        cursor = db.flintel_keywords.find({
+            "fetched": False,
+            "$or": [
+                {"next_retry_at": None},
+                {"next_retry_at": {"$exists": False}},
+                {"next_retry_at": {"$lte": now}},
+            ],
+        })
         return list(cursor)
     except Exception as exc:
         log.error(f"[KEYWORD-CACHE] get_due_keywords error: {exc}")
         return []
+
+
+def set_keyword_retry_cooldown(keyword: str, cooldown_seconds: int = REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS):
+    """
+    Called (instead of mark_keyword_fetched()) when a keyword's Reddit
+    RSS fetch genuinely failed for at least one post (had_fetch_failure).
+    Keeps fetched=False (so the keyword WILL be retried — nothing about
+    that guarantee changes) but stamps next_retry_at = now + cooldown_
+    seconds, so get_due_keywords() skips it until the cooldown passes
+    instead of picking it right back up on the very next
+    KEYWORD_CHECK_INTERVAL_SECONDS pass. This is purely a pacing/backoff
+    layer on TOP of the existing fetch-once-forever design — it does not
+    change the retry/backoff behavior inside a single fetch attempt at
+    all (REDDIT_FETCH_MAX_RETRIES, jitter, old.reddit.com fallback are
+    all untouched).
+    """
+    now = datetime.now(timezone.utc)
+    next_retry = now + timedelta(seconds=cooldown_seconds)
+    try:
+        db.flintel_keywords.update_one(
+            {"keyword": keyword},
+            {"$set": {"next_retry_at": next_retry}},
+        )
+        log.info(
+            f"[KEYWORD-CACHE] '{keyword}' cooldown set | next_retry_at:{next_retry.isoformat()} "
+            f"({cooldown_seconds}s from now) — will not be re-attempted before then"
+        )
+    except Exception as exc:
+        log.error(f"[KEYWORD-CACHE] set_keyword_retry_cooldown error for {keyword!r}: {exc}")
 
 
 def mark_keyword_fetched(keyword: str):
@@ -1975,11 +2046,25 @@ def run_serp_discovery_loop():
                     # re-processed by is_post_already_signaled() dedup,
                     # so re-running this keyword only chases the posts
                     # that failed.
+                    #
+                    # v9.11.2: rather than leaving this keyword eligible
+                    # to be picked up again on the very next
+                    # KEYWORD_CHECK_INTERVAL_SECONDS pass (which was
+                    # causing the SAME keyword's Reddit URLs to get
+                    # re-hit every ~60s and making Reddit's rate-limiting
+                    # on this IP get progressively WORSE — going from
+                    # partial success down to a near-total block), a
+                    # cooldown is applied via set_keyword_retry_cooldown()
+                    # so this keyword rests for
+                    # REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS before it's
+                    # due again.
+                    set_keyword_retry_cooldown(keyword)
                     log.warning(
                         f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
                         f"search_volume:{volume} ({sv_tag}, from cache) | "
                         f"had_fetch_failure:True — NOT marking fetched=True, "
-                        f"will remain due and be retried on a future pass"
+                        f"cooldown applied ({REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS}s) — "
+                        f"will be retried after cooldown expires"
                     )
                 else:
                     mark_keyword_fetched(keyword)
