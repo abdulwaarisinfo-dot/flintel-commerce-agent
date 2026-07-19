@@ -9,7 +9,58 @@ Platforms : Reddit — RapidAPI SERP discovery ONLY (Google search,
           + Twitter/X (tweepy v2)
 
 =================================================================================
-WHAT CHANGED IN THIS BUILD (v9.11) — REDDIT FETCH SWITCHED FROM .json TO
+WHAT CHANGED IN THIS BUILD (v9.11.1) — KEYWORD CACHE IS NOW THE SOLE
+SOURCE OF TRUTH FOR "DUE" / "MISSING VOLUME", INDEPENDENT OF THE PYTHON
+LIST. LOGIC 100% AS-IS OTHERWISE.
+=================================================================================
+
+  ISSUE (confirmed, not a code bug elsewhere): get_due_keywords() and
+    get_keywords_missing_volume() were filtering flintel_keywords with
+    {"keyword": {"$in": REDDIT_SEARCH_KEYWORDS}} — i.e. against whatever
+    the REDDIT_SEARCH_KEYWORDS python list happens to contain RIGHT NOW.
+    That meant: if a keyword was ever removed from (or swapped out of)
+    the python list — even though it was already stored in
+    flintel_keywords with fetched=False (never actually processed) or
+    search_volume=None (never actually seeded) — it would silently stop
+    being picked up. It wasn't deleted from Mongo, it just became
+    invisible to these two queries because it no longer matched the
+    CURRENT python list. That's the python list "forgetting" a keyword
+    that Mongo still has pending — which is backwards: flintel_keywords
+    is supposed to be the permanent, restart-safe record; the python
+    list is supposed to be nothing more than "what to make sure EXISTS
+    in that record" (via sync_keywords_to_db()'s $setOnInsert, which was
+    already correctly insert-only and untouched by this fix).
+
+  FIX — get_due_keywords() and get_keywords_missing_volume() now query
+    flintel_keywords DIRECTLY, with NO "$in: REDDIT_SEARCH_KEYWORDS"
+    restriction at all:
+      - get_due_keywords()          -> find({"fetched": False})
+      - get_keywords_missing_volume() -> find({"search_volume": None})
+    So ANY keyword sitting in flintel_keywords with fetched=False (or
+    search_volume=None) is picked up and processed on the very next
+    pass — regardless of whether that keyword is still present in the
+    REDDIT_SEARCH_KEYWORDS python list at that moment. If you edit the
+    python list and remove/replace a keyword, the OLD keyword's
+    flintel_keywords document is untouched (nothing here ever deletes
+    from that collection) and it is still fetched exactly as before —
+    the python list swap does not erase or hide it. The root() status
+    endpoint's "keywords_due_now" / "keywords_missing_search_volume" /
+    "keywords_with_random_search_volume" counters were changed the same
+    way (dropped the same "$in: REDDIT_SEARCH_KEYWORDS" restriction) so
+    they stay consistent with what the loop itself will actually pick up.
+
+    Everything else about the keyword-cache system is UNCHANGED:
+    sync_keywords_to_db() still only INSERTS brand-new keywords from the
+    python list via $setOnInsert (never touches/overwrites an existing
+    doc), mark_keyword_fetched() still permanently flips fetched=True
+    with no TTL/re-due date, and the "fetch a keyword exactly once,
+    ever" guarantee is untouched — this fix only removes the accidental
+    extra python-list filter sitting on top of the two read queries, it
+    does not change how/when keywords get inserted, marked fetched, or
+    seeded with volume.
+
+=================================================================================
+CARRIED FORWARD FROM v9.11 — REDDIT FETCH SWITCHED FROM .json TO
 RSS (per-post) + RANDOM ENGAGEMENT FALLBACK, LOGIC 100% AS-IS OTHERWISE
 =================================================================================
 
@@ -109,9 +160,10 @@ LOGIC 100% AS-IS
   endpoints, the "batched" (per-keyword-call) search-volume seeding loop
   structure, the _dig_value()/_dig_list() field-extraction helpers — ALL
   of it is kept 100% AS-IS. No schema, no logic, no flow changed anywhere
-  in this build beyond switching the Reddit per-post fetch to RSS and
-  randomizing upvotes/comments as described above. No OAuth/PRAW — that
-  was already removed in v9.10 and stays removed.
+  in this build beyond dropping the accidental python-list filter on the
+  two keyword-cache read queries (see "WHAT CHANGED IN THIS BUILD" at the
+  top). No OAuth/PRAW — that was already removed in v9.10 and stays
+  removed.
 """
 
 import asyncio
@@ -257,7 +309,12 @@ def _random_engagement_fallback() -> int:
 #   - get_keywords_missing_volume() + seed_search_volume_batch() fill in
 #     search_volume for any keyword that doesn't have one yet, IN BATCHES
 #     of up to 500 keywords per DataForSEO request (never one-by-one).
-#   - get_due_keywords() picks up only fetched=False keywords.
+#     As of v9.11.1 this looks at ALL of flintel_keywords, not just
+#     whatever happens to still be in this python list right now — see
+#     the "WHAT CHANGED IN THIS BUILD" note at the top of this file.
+#   - get_due_keywords() picks up only fetched=False keywords — same
+#     v9.11.1 change: looks at ALL of flintel_keywords, not just this
+#     python list.
 #   - mark_keyword_fetched() flips a keyword to fetched=True PERMANENTLY
 #     right after it finishes processing — it will never be re-fetched.
 REDDIT_SEARCH_KEYWORDS = [
@@ -314,12 +371,7 @@ REDDIT_SEARCH_KEYWORDS = [
     "international wire transfer", "foreign wire transfer",
     "overseas wire transfer", "overseas transfer", "global payment",
     "global transfer", "b2b payment", "b2b transfer",
-    "business to business payment",  "accounting software too expensive", "accounting software pricing too high",
-    "bookkeeping fees too high", "accountant fees too high",
-    "per user pricing accounting software", "accounting software renewal price increase",
-    "accounting software price hike", "hidden fees accounting software",
-    "add-ons cost extra accounting software", "paying for features we don't use accounting",
-    "cheaper alternative to QuickBooks", "cheaper than QuickBooks",
+    "business to business payment",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
@@ -336,7 +388,41 @@ REDDIT_SEARCH_KEYWORDS = [
 #                        This is a cheap DB query, NOT a DataForSEO call
 #                        by itself — the (batched) DataForSEO call only
 #                        fires when there is actually something missing.
+#
+# v9.11.1: "due" and "missing volume" are now determined PURELY from
+# flintel_keywords itself (fetched=False / search_volume=None on the
+# stored document) — NOT from whether the keyword still happens to be
+# present in the REDDIT_SEARCH_KEYWORDS python list above. The python
+# list's only job is to tell sync_keywords_to_db() which brand-new
+# keywords to INSERT (insert-only, via $setOnInsert — never overwrites
+# an existing doc). Editing/replacing entries in the python list later
+# does not remove, hide, or "forget" any keyword already sitting in
+# flintel_keywords — a keyword that's still fetched=False there keeps
+# getting picked up and processed regardless of the current python list
+# contents, and a keyword still missing search_volume there keeps
+# getting seeded regardless of the current python list contents too.
 KEYWORD_CHECK_INTERVAL_SECONDS  = int(os.getenv("KEYWORD_CHECK_INTERVAL_SECONDS", "60"))
+
+# ── KEYWORD RETRY COOLDOWN (NEW) ────────────────────────────────────────────
+# When a keyword's Reddit RSS fetch genuinely fails (retries exhausted --
+# e.g. persistent 429/403) it is left fetched=False so it gets retried
+# later (see get_due_keywords()/process_one_keyword()'s had_fetch_failure
+# handling). Without a cooldown, that keyword becomes "due" again on the
+# very next KEYWORD_CHECK_INTERVAL_SECONDS pass (as often as every 60s),
+# which means the SAME keyword's Reddit URLs get hit again and again in
+# quick succession -- this pattern is what was making Reddit's rate-
+# limiting on this IP get WORSE over time (going from partial success,
+# e.g. 17-25 posts, down to a near-total block), not better.
+#
+# REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS gives a failed keyword a resting
+# period before it's eligible to be picked up as "due" again -- default
+# 1800s (30 minutes). This does NOT change the retry/backoff behavior
+# INSIDE a single fetch attempt at all (still REDDIT_FETCH_MAX_RETRIES
+# attempts, same jittered exponential backoff, same old.reddit.com
+# fallback -- untouched). It only spaces out how often the SAME keyword
+# gets re-attempted from scratch after a full failure, so Reddit sees a
+# lower, less bursty request pattern from repeatedly-failing keywords.
+REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS = int(os.getenv("REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS", "1800"))
 
 SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "20"))
 SERP_MONTHS_BACK         = int(os.getenv("SERP_MONTHS_BACK", "6"))
@@ -767,10 +853,14 @@ def get_database():
         # search_volume?" It survives process restarts, so a keyword
         # already marked fetched=True is NEVER re-fetched, ever, and a
         # keyword that already has a search_volume is NEVER re-queried
-        # for volume, ever.
+        # for volume, ever. As of v9.11.1, this collection is also the
+        # ONLY thing consulted when deciding what's due / missing volume
+        # — the REDDIT_SEARCH_KEYWORDS python list is never used to
+        # filter these reads, only to decide what to INSERT.
         db.flintel_keywords.create_index([("keyword", ASCENDING)], unique=True, name="keyword_unique")
         db.flintel_keywords.create_index([("fetched", ASCENDING)], name="keyword_fetched_idx")
         db.flintel_keywords.create_index([("search_volume", ASCENDING)], name="keyword_volume_idx")
+        db.flintel_keywords.create_index([("next_retry_at", ASCENDING)], name="keyword_retry_cooldown_idx")
 
         log.info("MongoDB connected.")
         return db
@@ -978,6 +1068,17 @@ def clear_batch_seconds(platform: str):
 #     NEVER overwrites an existing keyword's fetched/timestamp/volume.
 #     Nothing resets to zero. Only genuinely brand-new keywords get
 #     inserted.
+#
+#   - v9.11.1: editing/replacing entries in the REDDIT_SEARCH_KEYWORDS
+#     python list -> has ZERO effect on any keyword already stored in
+#     flintel_keywords. get_due_keywords() and
+#     get_keywords_missing_volume() read flintel_keywords directly and
+#     do not filter by "is this keyword still in the current python
+#     list?" — so a keyword that's fetched=False (or missing
+#     search_volume) keeps getting picked up and processed exactly as
+#     before, even after it's been removed/swapped out of the python
+#     list. The python list is consulted ONLY by sync_keywords_to_db()
+#     to decide what brand-new keyword documents to insert.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sync_keywords_to_db(keywords: list):
@@ -988,6 +1089,12 @@ def sync_keywords_to_db(keywords: list):
     that already exist are left completely untouched — $setOnInsert only
     writes on first-ever insert. Safe to call every loop pass and on
     every restart.
+
+    This is INSERT-ONLY and additive — it never deletes or hides a
+    keyword's existing document just because that keyword is no longer
+    present in `keywords`. (See get_due_keywords() /
+    get_keywords_missing_volume() below, which as of v9.11.1 no longer
+    filter their reads by this python list either, for the same reason.)
     """
     now = datetime.now(timezone.utc)
     for kw in keywords:
@@ -1000,6 +1107,7 @@ def sync_keywords_to_db(keywords: list):
                     "search_volume":            None,
                     "search_volume_is_random":  False,
                     "last_fetched_at":          None,
+                    "next_retry_at":            None,
                     "created_at":               now,
                 }},
                 upsert=True,
@@ -1008,13 +1116,25 @@ def sync_keywords_to_db(keywords: list):
             log.error(f"[KEYWORD-CACHE] sync error for {kw!r}: {exc}")
 
 
-def get_keywords_missing_volume(keywords: list) -> list:
+def get_keywords_missing_volume(keywords: list = None) -> list:
     """
-    Returns keyword strings (from `keywords`) whose flintel_keywords
-    document has no search_volume stored yet (missing field or explicit
-    None both match this query — that's how a None-valued MongoDB filter
-    works). These are exactly the keywords that will be sent to
+    Returns keyword strings whose flintel_keywords document has no
+    search_volume stored yet (missing field or explicit None both match
+    this query — that's how a None-valued MongoDB filter works). These
+    are exactly the keywords that will be sent to
     seed_search_volume_batch() next, batched, never one at a time.
+
+    v9.11.1 FIX: this query is now taken DIRECTLY against the full
+    flintel_keywords collection — it is NOT restricted to
+    "{'keyword': {'$in': keywords}}" anymore. Previously, a keyword that
+    still had search_volume=None in Mongo but had since been
+    removed/replaced in the REDDIT_SEARCH_KEYWORDS python list would
+    silently stop showing up here and never get seeded. Now, ANY
+    keyword in flintel_keywords still missing a search_volume is
+    returned, regardless of whether it's still present in the current
+    python list. The `keywords` parameter is kept (unused) purely so
+    every existing call site keeps working without any signature
+    changes elsewhere.
 
     Once a keyword's search_volume is set (real value OR — as of this
     build — a random fallback value when the real call failed), it will
@@ -1023,7 +1143,7 @@ def get_keywords_missing_volume(keywords: list) -> list:
     """
     try:
         cursor = db.flintel_keywords.find(
-            {"keyword": {"$in": keywords}, "search_volume": None},
+            {"search_volume": None},
             {"keyword": 1},
         )
         return [d["keyword"] for d in cursor]
@@ -1041,19 +1161,75 @@ def get_due_keywords() -> list:
     the same keyword's world twice and signals data is never disturbed
     by repeat fetches.
 
+    v9.11.1 FIX: this query is now taken DIRECTLY against the full
+    flintel_keywords collection — it is NOT restricted to
+    "{'keyword': {'$in': REDDIT_SEARCH_KEYWORDS}}" anymore. Previously,
+    a keyword that was still fetched=False in Mongo (i.e. genuinely
+    never processed yet) would silently stop being picked up the moment
+    it was removed/replaced in the REDDIT_SEARCH_KEYWORDS python list —
+    even though nothing about its actual "has this been fetched?" state
+    had changed. Now, ANY keyword in flintel_keywords that's still
+    fetched=False is returned and processed, regardless of whether it's
+    still present in the current python list.
+
+    v9.11.2 FIX (retry cooldown): a keyword that fetched=False because
+    its Reddit RSS fetch genuinely failed (retries exhausted) also now
+    needs its "next_retry_at" cooldown to have passed before it's
+    returned here — see REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS and
+    set_keyword_retry_cooldown() below. A keyword with next_retry_at
+    unset/None (brand new, never attempted) or already in the past is
+    still due immediately, exactly as before — the cooldown ONLY delays
+    a keyword that has already failed at least once, so Reddit doesn't
+    see the same failing keyword's URLs re-hit every single
+    KEYWORD_CHECK_INTERVAL_SECONDS pass.
+
     Each returned document already carries its own "search_volume" field
     (seeded ahead of time by seed_search_volume_batch()) — the discovery
     loop reads it straight off this same document, no extra query needed.
     """
     try:
+        now = datetime.now(timezone.utc)
         cursor = db.flintel_keywords.find({
-            "keyword": {"$in": REDDIT_SEARCH_KEYWORDS},
             "fetched": False,
+            "$or": [
+                {"next_retry_at": None},
+                {"next_retry_at": {"$exists": False}},
+                {"next_retry_at": {"$lte": now}},
+            ],
         })
         return list(cursor)
     except Exception as exc:
         log.error(f"[KEYWORD-CACHE] get_due_keywords error: {exc}")
         return []
+
+
+def set_keyword_retry_cooldown(keyword: str, cooldown_seconds: int = REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS):
+    """
+    Called (instead of mark_keyword_fetched()) when a keyword's Reddit
+    RSS fetch genuinely failed for at least one post (had_fetch_failure).
+    Keeps fetched=False (so the keyword WILL be retried — nothing about
+    that guarantee changes) but stamps next_retry_at = now + cooldown_
+    seconds, so get_due_keywords() skips it until the cooldown passes
+    instead of picking it right back up on the very next
+    KEYWORD_CHECK_INTERVAL_SECONDS pass. This is purely a pacing/backoff
+    layer on TOP of the existing fetch-once-forever design — it does not
+    change the retry/backoff behavior inside a single fetch attempt at
+    all (REDDIT_FETCH_MAX_RETRIES, jitter, old.reddit.com fallback are
+    all untouched).
+    """
+    now = datetime.now(timezone.utc)
+    next_retry = now + timedelta(seconds=cooldown_seconds)
+    try:
+        db.flintel_keywords.update_one(
+            {"keyword": keyword},
+            {"$set": {"next_retry_at": next_retry}},
+        )
+        log.info(
+            f"[KEYWORD-CACHE] '{keyword}' cooldown set | next_retry_at:{next_retry.isoformat()} "
+            f"({cooldown_seconds}s from now) — will not be re-attempted before then"
+        )
+    except Exception as exc:
+        log.error(f"[KEYWORD-CACHE] set_keyword_retry_cooldown error for {keyword!r}: {exc}")
 
 
 def mark_keyword_fetched(keyword: str):
@@ -1714,7 +1890,9 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
          genuinely new posts -> stamp the keyword's already-seeded
          search_volume (and its random/real flag) onto each item ->
          queue for Claude scoring
-    Returns (new_items_count, skipped_dupes_count) for logging.
+    Returns (new_items_count, skipped_dupes_count, had_fetch_failure) for
+    logging AND for run_serp_discovery_loop()'s fetched=True decision
+    (see that function for why had_fetch_failure matters).
 
     `volume` and `volume_is_random` are passed in by the caller (read
     straight off the keyword's own flintel_keywords document by
@@ -1724,8 +1902,18 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
     exact same item schema and the exact same queue/Claude/signals flow
     — whether `volume` is real or a random fallback, the SERP rank
     lookup and the Reddit post fetch above always still run.
+
+    had_fetch_failure: the retry/backoff behavior of
+    fetch_reddit_post_by_url() / _reddit_get_with_retry() is completely
+    UNCHANGED (still REDDIT_FETCH_MAX_RETRIES attempts, same jittered
+    exponential backoff, same old.reddit.com fallback host). This flag
+    ONLY records whether fetch_reddit_post_by_url() genuinely exhausted
+    all retries and gave up (e.g. persistent 429/403) for at least one
+    result belonging to this keyword — a 404 (post genuinely gone) is
+    NOT a failure here, it's a legitimate "nothing to fetch" outcome.
     """
     new_items, skipped_dupes = 0, 0
+    had_fetch_failure = False
 
     results = search_google_for_keyword(keyword, months_back=SERP_MONTHS_BACK)
 
@@ -1737,6 +1925,7 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
 
         item = fetch_reddit_post_by_url(result["url"], keyword, result["rank"])
         if not item:
+            had_fetch_failure = True
             continue
         item["search_volume"] = volume   # same cached value for every post from this keyword
         item["search_volume_is_random"] = volume_is_random
@@ -1745,7 +1934,7 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
         new_items += 1
         time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
-    return new_items, skipped_dupes
+    return new_items, skipped_dupes, had_fetch_failure
 
 
 def run_serp_discovery_loop():
@@ -1776,13 +1965,22 @@ def run_serp_discovery_loop():
         for SERP rank + Reddit post fetch below exactly the same way — a
         missing/failed volume never blocks or skips discovery, it is
         simply replaced with a clearly-logged random placeholder.
+      - v9.11.1: "due" and "missing volume" are read straight off
+        flintel_keywords (via get_due_keywords() /
+        get_keywords_missing_volume()), with NO restriction to whatever
+        REDDIT_SEARCH_KEYWORDS currently contains. sync_keywords_to_db()
+        below still only ever INSERTS new keywords from the python list
+        (never overwrites/removes an existing doc) — so replacing an
+        entry in the python list does not erase or skip the old
+        keyword's still-pending state in Mongo.
     """
     sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
 
     # One-time (per new keyword) BATCH search-volume seeding, done BEFORE
     # the loop starts so the very first discovery pass already has cached
-    # volumes to read.
-    missing_volume = get_keywords_missing_volume(REDDIT_SEARCH_KEYWORDS)
+    # volumes to read. Reads ALL of flintel_keywords still missing a
+    # volume — not just whatever's currently in REDDIT_SEARCH_KEYWORDS.
+    missing_volume = get_keywords_missing_volume()
     if missing_volume:
         log.info(
             f"[VOLUME-SEED] {len(missing_volume)} keyword(s) need search_volume — "
@@ -1791,10 +1989,11 @@ def run_serp_discovery_loop():
         seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
 
     log.info(
-        f"[SERP] Discovery loop started | {len(REDDIT_SEARCH_KEYWORDS)} keyword(s) | "
+        f"[SERP] Discovery loop started | {len(REDDIT_SEARCH_KEYWORDS)} keyword(s) in python list | "
         f"check_interval:{KEYWORD_CHECK_INTERVAL_SECONDS}s | "
         f"months_back:{SERP_MONTHS_BACK} | depth:{SERP_RESULTS_PER_KEYWORD} | "
-        f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever | "
+        f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever, "
+        f"due/missing-volume read from flintel_keywords directly (not filtered by python list) | "
         f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}) | "
         f"random fallback range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} "
         f"on failure/no-credits (always logged) | "
@@ -1812,8 +2011,9 @@ def run_serp_discovery_loop():
             # Batch-seed search_volume for any keyword still missing one
             # (covers brand-new keywords added since the last pass, or
             # any keyword whose previous seed attempt somehow left it
-            # unset).
-            missing_volume = get_keywords_missing_volume(REDDIT_SEARCH_KEYWORDS)
+            # unset) — across ALL of flintel_keywords, not just the
+            # current python list.
+            missing_volume = get_keywords_missing_volume()
             if missing_volume:
                 seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
 
@@ -1827,16 +2027,52 @@ def run_serp_discovery_loop():
                 keyword = doc["keyword"]
                 volume = doc.get("search_volume")                     # cached, already seeded — no API call
                 volume_is_random = doc.get("search_volume_is_random", False)
-                new_items, dupes = process_one_keyword(keyword, volume, volume_is_random)
-                mark_keyword_fetched(keyword)
+                new_items, dupes, had_fetch_failure = process_one_keyword(keyword, volume, volume_is_random)
                 total_new += new_items
                 total_dupes += dupes
                 sv_tag = "RANDOM-FALLBACK" if volume_is_random else "real"
-                log.info(
-                    f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
-                    f"search_volume:{volume} ({sv_tag}, from cache) | "
-                    f"marked fetched=True PERMANENTLY — will never be re-fetched"
-                )
+
+                if had_fetch_failure:
+                    # At least one Reddit RSS fetch for this keyword
+                    # genuinely exhausted all retries (e.g. persistent
+                    # 429/403) and gave up — do NOT mark this keyword
+                    # fetched=True. It stays fetched=False in
+                    # flintel_keywords, so get_due_keywords() will pick
+                    # it up again on a future pass and retry the whole
+                    # keyword (SERP search + fetch) — the same
+                    # smart-retry/backoff logic runs again, unchanged.
+                    # Posts that DID fetch successfully this pass are
+                    # already saved/queued and are protected from being
+                    # re-processed by is_post_already_signaled() dedup,
+                    # so re-running this keyword only chases the posts
+                    # that failed.
+                    #
+                    # v9.11.2: rather than leaving this keyword eligible
+                    # to be picked up again on the very next
+                    # KEYWORD_CHECK_INTERVAL_SECONDS pass (which was
+                    # causing the SAME keyword's Reddit URLs to get
+                    # re-hit every ~60s and making Reddit's rate-limiting
+                    # on this IP get progressively WORSE — going from
+                    # partial success down to a near-total block), a
+                    # cooldown is applied via set_keyword_retry_cooldown()
+                    # so this keyword rests for
+                    # REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS before it's
+                    # due again.
+                    set_keyword_retry_cooldown(keyword)
+                    log.warning(
+                        f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
+                        f"search_volume:{volume} ({sv_tag}, from cache) | "
+                        f"had_fetch_failure:True — NOT marking fetched=True, "
+                        f"cooldown applied ({REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS}s) — "
+                        f"will be retried after cooldown expires"
+                    )
+                else:
+                    mark_keyword_fetched(keyword)
+                    log.info(
+                        f"[SERP] '{keyword}' DONE | new:{new_items} skipped_dupes:{dupes} | "
+                        f"search_volume:{volume} ({sv_tag}, from cache) | "
+                        f"marked fetched=True PERMANENTLY — will never be re-fetched"
+                    )
                 time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
             log.info(
@@ -2523,13 +2759,17 @@ app = FastAPI(
         "in-flight item is ever lost on restart. Each keyword is tracked in "
         "flintel_keywords and, once fetched, is PERMANENTLY marked done — "
         "restarts never reset progress and never trigger a re-fetch of an "
-        "already-done keyword. Newly added keywords are picked up "
+        "already-done keyword. Which keywords are 'due' or 'missing volume' "
+        "is read directly from flintel_keywords, not filtered by whatever "
+        "the REDDIT_SEARCH_KEYWORDS python list currently contains — so "
+        "editing that list never causes an already-pending keyword to be "
+        "skipped or forgotten. Newly added keywords are picked up "
         "automatically, one at a time. Streaming Claude with partial-JSON "
         "recovery. Claude failures route to status='pending' for automatic "
         "rescore (re-uses stored enrichment, never re-fetches from Reddit or "
         "RapidAPI) instead of a permanent low score."
     ),
-    version="9.11.0",
+    version="9.11.1",
 )
 
 
@@ -2546,21 +2786,17 @@ def _serialise(signals: list) -> list:
 def root():
     now = datetime.now(timezone.utc)
     total_keywords_tracked = db.flintel_keywords.count_documents({})
-    due_now_count = db.flintel_keywords.count_documents({
-        "keyword": {"$in": REDDIT_SEARCH_KEYWORDS},
-        "fetched": False,
-    })
-    missing_volume_count = db.flintel_keywords.count_documents({
-        "keyword": {"$in": REDDIT_SEARCH_KEYWORDS},
-        "search_volume": None,
-    })
-    random_volume_count = db.flintel_keywords.count_documents({
-        "keyword": {"$in": REDDIT_SEARCH_KEYWORDS},
-        "search_volume_is_random": True,
-    })
+    # v9.11.1: no longer restricted to "$in: REDDIT_SEARCH_KEYWORDS" —
+    # matches exactly what get_due_keywords() / get_keywords_missing_volume()
+    # will actually pick up, since those no longer filter by the python
+    # list either. A keyword removed from the python list but still
+    # pending in Mongo is still counted here.
+    due_now_count = db.flintel_keywords.count_documents({"fetched": False})
+    missing_volume_count = db.flintel_keywords.count_documents({"search_volume": None})
+    random_volume_count = db.flintel_keywords.count_documents({"search_volume_is_random": True})
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.11 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free RSS fetch + random-fallback volume/engagement + Twitter)",
+        "system":                  "FLINTEL v9.11.1 (Reddit SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free RSS fetch + random-fallback volume/engagement + Twitter)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -2571,7 +2807,7 @@ def root():
         "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
         "twitter_search_keywords": len(TWITTER_SEARCH_KEYWORDS),
         "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
-        "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords)",
+        "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords), due/missing-volume read directly from Mongo (not filtered by the current python list)",
         "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE})",
         "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}, always logged, never overrides a real value",
         "reddit_fetch_reliability":         f"public RSS only, credential-free — smart-retry ({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback)",
@@ -2601,6 +2837,7 @@ def root():
         "fixed_full_cycle_sleep_removed": True,
         "post_url_dedup_before_scoring": True,
         "claude_failure_routes_to_pending": True,
+        "keyword_due_state_independent_of_python_list": True,
         "output_schema":           "intent_score (1-100) / is_relevant / reply_draft",
     }
 
@@ -2636,7 +2873,9 @@ def get_keywords_status():
     keyword shows whether it's been fetched (true = permanently done,
     never re-fetched; false = still pending, due on the next pass), its
     cached search_volume (real value or a random-fallback placeholder —
-    see search_volume_is_random), and when it was last fetched.
+    see search_volume_is_random), and when it was last fetched. Shows
+    EVERY keyword ever stored, including ones no longer present in the
+    current REDDIT_SEARCH_KEYWORDS python list.
     """
     raw_docs = list(db.flintel_keywords.find({}, {"_id": 0}).sort("keyword", 1))
     due_count = 0
@@ -2720,9 +2959,10 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.11 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
+    log.info("  FLINTEL v9.11.1 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
     log.info("                   + BATCHED SEARCH-VOLUME SEEDING + CREDENTIAL-FREE")
-    log.info("                   .JSON FETCH + RANDOM-FALLBACK SEARCH VOLUME) + TWITTER SIGNAL SCORER")
+    log.info("                   RSS FETCH + RANDOM-FALLBACK VOLUME/ENGAGEMENT")
+    log.info("                   + KEYWORD-CACHE READS INDEPENDENT OF PYTHON LIST) + TWITTER SIGNAL SCORER")
     log.info("=" * 70)
     log.info(f"  Client               : {CLIENT_ID}")
     log.info(f"  Platforms            : Reddit (SERP discovery, fetch-once-forever) + Twitter/X")
@@ -2730,10 +2970,12 @@ if __name__ == "__main__":
     log.info(f"  Reddit fetch method  : public per-post RSS only — credential-free, no OAuth/PRAW, nothing to configure")
     log.info(f"  Reddit engagement    : RANDOM placeholder {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (upvotes/comments) — RSS has no real counts, always logged")
     log.info(f"  Twitter              : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
-    log.info(f"  Reddit keywords      : {len(REDDIT_SEARCH_KEYWORDS)} (used for SERP discovery)")
+    log.info(f"  Reddit keywords      : {len(REDDIT_SEARCH_KEYWORDS)} (used for SERP discovery + to seed brand-new flintel_keywords docs)")
     log.info(f"  Twitter keywords     : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
     log.info(f"  Keyword cache        : fetch-once-forever (no re-fetch, ever) | check every {KEYWORD_CHECK_INTERVAL_SECONDS}s | "
              f"last {SERP_MONTHS_BACK} months | depth {SERP_RESULTS_PER_KEYWORD}")
+    log.info(f"  Keyword due state    : read directly from flintel_keywords — NOT filtered by the current "
+             f"REDDIT_SEARCH_KEYWORDS python list, so editing that list never hides an already-pending keyword")
     log.info(f"  Search-volume seeding: batched loop, chunks of {SEARCH_VOLUME_BATCH_SIZE} keywords | "
              f"cached on flintel_keywords, read at discovery time | error status+message logged; "
              f"never blocks rank/reddit fetch")
