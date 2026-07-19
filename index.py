@@ -1,72 +1,12 @@
 """
-FLINTEL v9.12 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
-                + BATCHED SEARCH-VOLUME PRE-SEEDING + reddit34 RapidAPI
-                POST FETCH)
+FLINTEL v9.11 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
+                + BATCHED SEARCH-VOLUME PRE-SEEDING)
                 + Twitter/X Signal Scorer
 =================================================================================
-Platforms : Reddit — RapidAPI SERP discovery (Google search,
-            site:reddit.com, real per-post rank) -> reddit34 RapidAPI
-            provider (getPostDetails, no direct Reddit requests, no
-            credentials to Reddit itself needed)
+Platforms : Reddit — RapidAPI SERP discovery ONLY (Google search,
+            site:reddit.com, real per-post rank -> Reddit public per-post 
+            RSS feed, smart-retry, no credentials required)
           + Twitter/X (tweepy v2)
-
-=================================================================================
-WHAT CHANGED IN THIS BUILD (v9.12) — REDDIT PER-POST FETCH SWITCHED FROM
-RSS TO THE reddit34 RAPIDAPI PROVIDER. LOGIC 100% AS-IS OTHERWISE.
-=================================================================================
-
-  ROOT CAUSE: Reddit's public per-post RSS feed (introduced in v9.11 to
-    replace the .json endpoint, which itself had started 403'ing) began
-    hitting persistent 429 rate-limiting on this IP, on both
-    www.reddit.com and the old.reddit.com fallback host, across repeated
-    retries. Reddit's official Data API was separately applied for and
-    REJECTED under Reddit's "Responsible Builder Policy" (submission
-    deemed non-compliant / insufficient detail) — so neither the
-    unofficial RSS/.json paths nor the official OAuth path are viable
-    long-term options for this IP.
-
-  FIX — fetch_reddit_post_by_url() now fetches each post through the
-    reddit34 (SocialMiner) RapidAPI marketplace provider's
-    "getPostDetails" endpoint (https://reddit34.p.rapidapi.com/
-    getPostDetails?post_url=<url>) instead of Reddit's own RSS feed.
-    This IP no longer sends ANY request directly to reddit.com or
-    old.reddit.com — the provider fetches the data on its own
-    infrastructure. Uses the SAME RAPIDAPI_KEY already configured for
-    the other two RapidAPI hosts in this file (SERP + search-volume) —
-    one key, three hosts, same pattern already established here.
-
-    CONFIRMED (from the provider's published endpoint list): there is
-    NO bulk/batch endpoint on this provider — every one of its 28+
-    endpoints is a single-item GET call. So this remains exactly
-    "one post URL = one request", the same shape the RSS fetch already
-    had — no new batching layer/collection was introduced, none was
-    needed or requested.
-
-    The retry/backoff behavior (REDDIT_FETCH_MAX_RETRIES, exponential
-    backoff via REDDIT_FETCH_BACKOFF_BASE, jitter window via
-    REDDIT_FETCH_JITTER_MIN/MAX) is kept 100% AS-IS in value and logic —
-    only the request target changed. A keyword whose fetch still
-    exhausts all retries against this new provider is handled exactly
-    as before (v9.11.2's had_fetch_failure + retry-cooldown mechanism —
-    see REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS below — is fully
-    unchanged and applies here too).
-
-    ENGAGEMENT IMPROVEMENT (incidental, not a logic change): Reddit's
-    RSS feed never exposed numeric upvote/comment counts, so v9.11
-    always used a random placeholder for every single Reddit post. This
-    provider's response is checked for real upvotes/comments fields
-    first (via the same defensive _dig_value() candidate-key pattern
-    used for SERP rank/search-volume elsewhere in this file); the random
-    placeholder is now only used as a fallback when the provider
-    genuinely doesn't return a usable value for a given post — same
-    "always logged, never silently indistinguishable from a real value"
-    rule as before, just no longer unconditionally forced on every item.
-
-    Everything else — item schema, queueing, batching, Claude scoring,
-    Mongo storage, the keyword cache, the retry-cooldown, the
-    search-volume seeding — is completely UNCHANGED. See the untouched
-    change history below for everything prior to this build.
-=================================================================================
 
 =================================================================================
 WHAT CHANGED IN THIS BUILD (v9.11.1) — KEYWORD CACHE IS NOW THE SOLE
@@ -234,6 +174,7 @@ import time
 import queue
 import random
 import re
+import html
 import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -242,6 +183,7 @@ import anthropic
 import httpx
 import tweepy
 import requests
+import feedparser
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 from fastapi import FastAPI, HTTPException, Security, Depends
@@ -287,23 +229,12 @@ RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")  # .env boht used same key
 RAPIDAPI_KEYWORD_HOST = "seo-keyword-research.p.rapidapi.com"
 RAPIDAPI_SEARCH_HOST  = "google-search116.p.rapidapi.com"
 
-# ── RapidAPI — reddit34 (SocialMiner) — Reddit post-fetch provider.
-# Replaces Reddit's own public RSS feed (which was hitting persistent
-# 429/403 IP-level rate-limiting with no official-API alternative
-# available — see conversation history). Uses the SAME RAPIDAPI_KEY as
-# the other two RapidAPI hosts above (one key, multiple hosts, same
-# pattern already used in this file). No credentials to Reddit itself
-# are needed — this provider fetches Reddit data on our behalf from its
-# own infrastructure, so this IP never talks to Reddit directly anymore.
-REDDIT_API_HOST = "reddit34.p.rapidapi.com"
-REDDIT_API_KEY  = RAPIDAPI_KEY
-
 # ── RapidAPI call timeouts — configurable so a slow keyword doesn't
 # get killed early. These are LIVE endpoint calls
 # — real-time, no polling/task-based async needed.
 DATAFORSEO_SERP_TIMEOUT_SECONDS   = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
 DATAFORSEO_VOLUME_TIMEOUT_SECONDS = int(os.getenv("DATAFORSEO_VOLUME_TIMEOUT_SECONDS", "60"))
-REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))  # used for the reddit34 RapidAPI post-fetch call
+REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))  # used for the RSS fetch as of v9.11
 
 REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
 TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
@@ -514,17 +445,20 @@ TWITTER_SEARCH_KEYWORDS = [
 ]
 
 # ── REDDIT "SMART FETCH" CONFIG — v9.6 retry logic, unchanged ──────────────
-# Governs the retry/backoff behaviour of fetch_reddit_post_by_url(). As of
-# this build, Reddit post data is fetched via the reddit34 RapidAPI
-# provider (getPostDetails) instead of Reddit's own RSS feed — this IP no
-# longer talks to Reddit directly at all. The retry/backoff constants
-# below are kept 100% unchanged in value and behavior — same max
-# attempts, same exponential backoff, same jitter window — just applied
-# to the RapidAPI call now instead of a direct Reddit request.
+# Governs the retry/backoff/User-Agent behaviour of fetch_reddit_post_by_url()
+# — used for the per-post RSS fetch as of v9.11 (public, credential-free,
+# no OAuth/PRAW). Does NOT change what data is extracted or where it
+# goes — only how reliably we get a 200 instead of a 403 from Reddit's
+# public per-post RSS feed (.rss).
 REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
 REDDIT_FETCH_BACKOFF_BASE    = float(os.getenv("REDDIT_FETCH_BACKOFF_BASE", "2.0"))
 REDDIT_FETCH_JITTER_MIN      = float(os.getenv("REDDIT_FETCH_JITTER_MIN", "0.4"))
 REDDIT_FETCH_JITTER_MAX      = float(os.getenv("REDDIT_FETCH_JITTER_MAX", "1.6"))
+# Reddit recommends: "<platform>:<app id>:<version> (by /u/<username>)"
+REDDIT_USER_AGENT = os.getenv(
+    "REDDIT_USER_AGENT",
+    "python:flintel-signal-bot:v9.11 (by /u/flintel_signals)",
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API KEY AUTH (unchanged)
@@ -663,27 +597,6 @@ VOLUME_FIELD_CANDIDATES = [
     "search_volume", "searchVolume", "volume", "monthly_searches",
     "avg_monthly_searches", "monthlySearchVolume", "search_volume_monthly",
     "avg_search_volume",
-]
-
-# Candidate field names for the reddit34 (SocialMiner) RapidAPI
-# "getPostDetails" response — RapidAPI marketplace providers don't
-# guarantee exact field names any more than the SERP/volume hosts above
-# do, so the same _dig_value()/_dig_list() defensive extraction pattern
-# is reused here rather than assuming one hard-coded schema.
-REDDIT_POST_TITLE_CANDIDATES = ["title", "post_title", "name", "headline"]
-REDDIT_POST_BODY_CANDIDATES = [
-    "selftext", "text", "body", "post_text", "content", "description", "caption",
-]
-REDDIT_POST_AUTHOR_CANDIDATES = ["author", "username", "author_name", "user", "author_fullname"]
-REDDIT_POST_SUBREDDIT_CANDIDATES = ["subreddit", "subreddit_name", "community", "subredditName"]
-REDDIT_POST_UPVOTES_CANDIDATES = [
-    "upvotes", "ups", "score", "likes", "upvote_count", "vote_count", "voteCount",
-]
-REDDIT_POST_COMMENTS_CANDIDATES = [
-    "comments", "num_comments", "comment_count", "commentCount", "total_comments", "numComments",
-]
-REDDIT_POST_CREATED_CANDIDATES = [
-    "created_utc", "created", "posted_at", "created_at", "date", "timestamp", "publish_date",
 ]
 
 
@@ -1640,8 +1553,8 @@ def fetch_google_stats(search_keyword: str) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT — SOLE discovery mechanism: RapidAPI SERP search
-# (site:reddit.com) -> real per-post rank + URL -> reddit34 RapidAPI
-# provider (getPostDetails, smart-retry) -> full post data (text,
+# (site:reddit.com) -> real per-post rank + URL -> Reddit's public,
+# credential-free per-post RSS feed (smart-retry) -> full post data (text,
 # username, subreddit, upvotes, comments, posted_at). Each keyword is
 # only fetched when get_due_keywords() says it's due — see the KEYWORD
 # CACHE section above. search_volume is read from the already-seeded
@@ -1753,74 +1666,59 @@ def is_post_already_signaled(post_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDDIT POST FETCH — reddit34 (SocialMiner) RapidAPI provider ONLY.
+# REDDIT POST FETCH — public, credential-free per-post RSS feed ONLY.
 #
-# CHANGE: Reddit's own public RSS feed (and, before that, the .json
-# endpoint) were both hitting persistent IP-level rate-limiting (403s,
-# then 429s) with no reliable fix available from this side — Reddit's
-# official Data API is separately gated behind a manual approval process
-# under the "Responsible Builder Policy" that this project's application
-# was rejected under. Reddit's per-post data is now fetched through the
-# reddit34 RapidAPI provider's "getPostDetails" endpoint instead — this
-# IP no longer sends ANY request directly to reddit.com or
-# old.reddit.com. The provider fetches Reddit's data on its own
-# infrastructure and returns it as JSON.
+# v9.11: switched from the .json endpoint to Reddit's public per-post
+# RSS feed (post_url + ".rss" instead of ".json"). Root cause of the
+# switch: the .json endpoint was hitting a consistent, 100%-failure-rate
+# 403 on BOTH www.reddit.com and old.reddit.com across every retry — the
+# signature of an IP-level anonymous-scraping block, not a code bug (the
+# SERP/Google-rank discovery call, on a totally separate RapidAPI host,
+# kept working the whole time). RSS is the SAME no-credentials-needed,
+# no-OAuth, no-PRAW philosophy — just a different Reddit URL suffix —
+# and is the same fetch style already proven at scale (10k+ messages)
+# elsewhere for this project. The v9.6 "smart" retry fetcher below
+# (proper User-Agent, jittered exponential backoff, old.reddit.com
+# fallback host) is completely unchanged — only the URL suffix (.rss
+# instead of .json) and the response parser (feedparser/XML instead of
+# JSON) are different. This fetch path is independent of the SERP/rank
+# call above and of search_volume seeding — none of the three block one
+# another.
 #
-# One post URL = one request to this provider — there is no bulk/batch
-# endpoint on this provider (confirmed against its published endpoint
-# list), so this mirrors the exact same "one call per post" shape the
-# RSS fetch already had. Nothing about the surrounding discovery flow
-# changes: process_one_keyword() still calls this function once per
-# SERP result, exactly as before.
-#
-# The retry/backoff behavior below (REDDIT_FETCH_MAX_RETRIES, same
-# exponential backoff, same jitter window) is kept 100% as-is in value
-# and logic — only the target URL/host/headers changed, from a direct
-# Reddit RSS request to a RapidAPI request.
-#
-# FIELD EXTRACTION: this provider's exact JSON response field names
-# could not be confirmed against live documentation (RapidAPI's docs
-# pages are JS-rendered and not fetchable), so — exactly like the SERP
-# rank and search-volume extraction elsewhere in this file —
-# _dig_value() is used with a list of common candidate field names
-# rather than one hard-coded schema. If the live response uses
-# different field names than the candidates below, adjust the
-# REDDIT_POST_*_CANDIDATES lists above; no other code needs to change.
-#
-# ENGAGEMENT: if this provider returns real upvote/comment numbers,
-# they are used as-is (engagement_is_random=False). If a field is
-# missing or unparseable, the exact same "random fallback, always
-# logged, never silently indistinguishable from a real value" pattern
-# already used for search_volume elsewhere in this file is applied here
-# too — this was NOT possible with the old RSS feed (which never
-# exposed these numbers at all), so real engagement data is now
-# possible where it wasn't before.
+# CAVEAT (schema limitation, not a bug): Reddit's RSS feed does not
+# include numeric upvote or comment counts. upvotes/comments are
+# therefore generated as a random placeholder (see
+# REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN/MAX above) for every post, with
+# a clearly-labelled "RANDOM FALLBACK" warning logged every single time
+# — exactly the same pattern already used for search_volume, so it is
+# always distinguishable in the logs from a real, provider-returned
+# number.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _rapidapi_reddit_get_with_retry(post_url: str) -> requests.Response | None:
+def _reddit_get_with_retry(url: str) -> requests.Response | None:
     """
-    Smart GET wrapper for the reddit34 RapidAPI "getPostDetails"
-    endpoint. Mirrors the EXACT SAME retry/backoff structure previously
-    used for Reddit's own RSS feed (same REDDIT_FETCH_MAX_RETRIES, same
-    jittered exponential backoff via REDDIT_FETCH_BACKOFF_BASE/
-    JITTER_MIN/JITTER_MAX) — only the request target changed, from a
-    direct Reddit URL to this RapidAPI host.
-      - Retries (with backoff) on 403 / 429 / 5xx — the classes of error
-        retrying can plausibly help with.
-      - A 404 (or any other unexpected status) is NOT retried — treated
-        as "this post isn't available from this provider right now."
+    v9.6 "smart" GET wrapper for Reddit's public endpoints — kept 100%
+    as-is in terms of retry/backoff/jitter behavior. As of v9.11 this is
+    used against the per-post RSS feed URL (post_url + ".rss") instead
+    of the .json endpoint, but the function itself is content-type
+    agnostic — it only inspects the HTTP status code, so no logic
+    change was needed here at all:
+      - Reddit-recommended User-Agent format (REDDIT_USER_AGENT).
+      - Small randomized jitter delay before each attempt, to avoid an
+        obviously robotic, perfectly-uniform request cadence.
+      - Exponential backoff retry, up to REDDIT_FETCH_MAX_RETRIES times,
+        specifically for 403 / 429 / 5xx responses (these are the
+        classes of error retrying can plausibly help with; a 404 means
+        the post is genuinely gone and is not retried).
     Returns the Response on success (status 200), or None if every
-    attempt failed — caller treats None exactly like before (skip this
-    post, it stays undiscovered until a future pass, since it was never
-    saved to `signals`).
+    attempt failed — caller treats None exactly like the old code
+    treated a raised exception (skip this post, try again on a future
+    discovery pass since it was never saved to `signals`).
     """
-    url = f"https://{REDDIT_API_HOST}/getPostDetails"
     headers = {
-        "x-rapidapi-key": REDDIT_API_KEY,
-        "x-rapidapi-host": REDDIT_API_HOST,
-        "Content-Type": "application/json",
+        "User-Agent": REDDIT_USER_AGENT,
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
     }
-    querystring = {"post_url": post_url}
 
     last_status = None
     for attempt in range(1, REDDIT_FETCH_MAX_RETRIES + 1):
@@ -1828,38 +1726,41 @@ def _rapidapi_reddit_get_with_retry(post_url: str) -> requests.Response | None:
         # request timing doesn't look perfectly mechanical
         time.sleep(random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX))
         try:
-            r = requests.get(url, headers=headers, params=querystring, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
+            r = requests.get(url, headers=headers, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
             last_status = r.status_code
             if r.status_code == 200:
                 return r
             if r.status_code == 404:
-                log.debug(f"[REDDIT-API] 404 (not found) for {post_url} — not retrying.")
+                # post genuinely removed/deleted — retrying won't help
+                log.debug(f"[SERP] 404 (gone) for {url} — not retrying.")
                 return None
             if r.status_code in (403, 429) or r.status_code >= 500:
                 wait = (REDDIT_FETCH_BACKOFF_BASE ** attempt) + random.uniform(0, 1.0)
                 log.warning(
-                    f"[REDDIT-API] fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
-                    f"got {r.status_code} for {post_url} — backing off {wait:.1f}s..."
+                    f"[SERP] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
+                    f"got {r.status_code} for {url} — backing off {wait:.1f}s..."
                 )
                 time.sleep(wait)
                 continue
-            log.error(f"[REDDIT-API] Unexpected status {r.status_code} for {post_url}")
+            # any other status — don't spin, just fail
+            log.error(f"[SERP] Unexpected status {r.status_code} for {url}")
             return None
         except requests.RequestException as exc:
             log.warning(
-                f"[REDDIT-API] fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
-                f"network error for {post_url}: {exc}"
+                f"[SERP] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
+                f"network error for {url}: {exc}"
             )
             time.sleep((REDDIT_FETCH_BACKOFF_BASE ** attempt))
 
-    log.error(f"[REDDIT-API] fetch exhausted {REDDIT_FETCH_MAX_RETRIES} attempts for {post_url} "
+    log.error(f"[SERP] Reddit fetch exhausted {REDDIT_FETCH_MAX_RETRIES} attempts for {url} "
               f"(last_status:{last_status})")
     return None
 
 
 def _extract_reddit_submission_id(post_url: str) -> str | None:
     """Pulls the submission id out of a standard reddit.com post URL
-    (e.g. .../comments/<id>/...). Used to build a stable message_id.
+    (e.g. .../comments/<id>/...). Used to build a stable message_id
+    since the RSS feed itself doesn't always expose a clean numeric id.
     Returns None if it can't be found — caller falls back to a
     sanitized version of the full URL."""
     match = re.search(r"/comments/([a-zA-Z0-9]+)", post_url)
@@ -1868,9 +1769,8 @@ def _extract_reddit_submission_id(post_url: str) -> str | None:
 
 def _extract_reddit_subreddit_from_url(post_url: str) -> str:
     """Pulls the subreddit name out of a standard reddit.com post URL
-    (e.g. reddit.com/r/<subreddit>/comments/...). Used as a fallback
-    when the provider's response doesn't include a subreddit field.
-    Returns "" if it can't be found — never raises."""
+    (e.g. reddit.com/r/<subreddit>/comments/...). Returns "" if it
+    can't be found — never raises."""
     match = re.search(r"reddit\.com/r/([^/]+)/", post_url)
     return match.group(1) if match else ""
 
@@ -1880,92 +1780,81 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
     Fetches the FULL post: text, username, subreddit, upvotes, comments,
     posted_at. This is the ONLY way Reddit data enters this system now.
 
-    Fetches via the reddit34 RapidAPI provider's "getPostDetails"
-    endpoint (post_url passed as a query param) instead of Reddit's own
-    RSS feed — no direct request to reddit.com/old.reddit.com happens
-    anymore, no OAuth/PRAW, nothing to configure beyond RAPIDAPI_KEY
-    (shared with the other two RapidAPI hosts in this file). Same
-    smart-retry behavior as before, just pointed at this provider.
+    v9.11: fetches Reddit's public, credential-free per-post RSS feed
+    (post_url + ".rss") instead of the .json endpoint — no OAuth, no
+    PRAW, nothing to configure, same smart-retry + old.reddit.com
+    fallback host as before. title/selftext/author/subreddit/posted_at
+    come straight off the RSS entry. upvotes/comments are NOT present in
+    Reddit's RSS schema, so they are generated as a random placeholder
+    (REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN..MAX) with a clearly-labelled
+    "RANDOM FALLBACK" warning logged every time — same pattern already
+    used for search_volume.
     """
     if not post_url:
         return None
 
-    r = _rapidapi_reddit_get_with_retry(post_url)
+    primary_url = post_url.rstrip("/") + ".rss"
+    r = _reddit_get_with_retry(primary_url)
+
+    if r is None and "old.reddit.com" not in post_url:
+        # last-resort fallback host
+        fallback_url = (
+            post_url.rstrip("/")
+            .replace("https://www.reddit.com", "https://old.reddit.com")
+            .replace("https://reddit.com", "https://old.reddit.com")
+            + ".rss"
+        )
+        if fallback_url != primary_url:
+            log.info(f"[SERP] Retrying via old.reddit.com fallback: {fallback_url}")
+            r = _reddit_get_with_retry(fallback_url)
+
     if r is None:
-        log.error(f"[REDDIT-API] fetch_reddit_post_by_url gave up for {post_url}")
+        log.error(f"[SERP] fetch_reddit_post_by_url gave up for {post_url}")
         return None
 
     try:
-        data = r.json()
-    except ValueError:
-        log.error(f"[REDDIT-API] non-JSON response for {post_url}")
-        return None
+        feed = feedparser.parse(r.content)
+        if not feed.entries:
+            log.error(f"[SERP] fetch_reddit_post_by_url: RSS feed had no entries for {post_url}")
+            return None
 
-    try:
-        title = _dig_value(data, REDDIT_POST_TITLE_CANDIDATES)
-        title = str(title).strip() if title is not None else ""
+        entry = feed.entries[0]
 
-        body = _dig_value(data, REDDIT_POST_BODY_CANDIDATES)
-        body = str(body).strip() if body is not None else ""
+        title = (entry.get("title", "") or "").strip()
+        raw_summary = entry.get("summary", "") or ""
+        if not raw_summary and entry.get("content"):
+            raw_summary = entry["content"][0].get("value", "") or ""
+        summary_plain = re.sub(r"<[^>]+>", " ", html.unescape(raw_summary)).strip()
 
         text = title
-        if body and body.lower() != title.lower():
-            text = f"{title}\n\n{body}" if title else body
+        if summary_plain and summary_plain.lower() != title.lower():
+            text = f"{title}\n\n{summary_plain}"
 
-        author = _dig_value(data, REDDIT_POST_AUTHOR_CANDIDATES)
-        author = str(author).lstrip("u/").lstrip("/u/").strip() if author else "unknown"
-        author = author or "unknown"
+        author = (entry.get("author", "") or "unknown").lstrip("u/").lstrip("/u/").strip() or "unknown"
+        subreddit = _extract_reddit_subreddit_from_url(post_url)
 
-        subreddit = _dig_value(data, REDDIT_POST_SUBREDDIT_CANDIDATES)
-        if not subreddit:
-            subreddit = _extract_reddit_subreddit_from_url(post_url)
-        subreddit = str(subreddit).lstrip("r/").strip() if subreddit else ""
-
-        # ── Engagement — use real values from the provider when present,
-        # fall back to the random placeholder (logged) only when a field
-        # is genuinely missing or unparseable — same pattern already
-        # used for search_volume elsewhere in this file.
-        raw_upvotes = _dig_value(data, REDDIT_POST_UPVOTES_CANDIDATES)
-        raw_comments = _dig_value(data, REDDIT_POST_COMMENTS_CANDIDATES)
-
-        try:
-            upvotes = int(raw_upvotes) if raw_upvotes is not None else None
-        except (TypeError, ValueError):
-            upvotes = None
-
-        try:
-            comments = int(raw_comments) if raw_comments is not None else None
-        except (TypeError, ValueError):
-            comments = None
-
-        engagement_is_random = False
-        if upvotes is None or comments is None:
-            if upvotes is None:
-                upvotes = _random_engagement_fallback()
-            if comments is None:
-                comments = _random_engagement_fallback()
-            engagement_is_random = True
-            log.warning(
-                f"[REDDIT-API] RANDOM FALLBACK applied for engagement on {post_url} | "
-                f"upvotes={upvotes} comments={comments} "
-                f"(range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX}) | "
-                f"reason: reddit34 provider did not return a usable upvotes/comments field "
-                f"for this post | this is NOT real, provider-returned engagement data."
-            )
-
-        raw_created = _dig_value(data, REDDIT_POST_CREATED_CANDIDATES)
         posted_at = None
-        if raw_created is not None:
+        published = entry.get("published") or entry.get("updated")
+        if published:
             try:
-                # numeric epoch (seconds) — Reddit's own created_utc style
-                posted_at = datetime.fromtimestamp(float(raw_created), tz=timezone.utc).isoformat()
+                posted_at = datetime(*entry.get("published_parsed", entry.get("updated_parsed"))[:6],
+                                      tzinfo=timezone.utc).isoformat()
             except (TypeError, ValueError):
-                # already a formatted date/string from the provider
-                posted_at = str(raw_created)
+                posted_at = published  # fall back to raw string if struct_time parse fails
 
         submission_id = _extract_reddit_submission_id(post_url)
         message_id = f"reddit_serp_{submission_id}" if submission_id else (
             f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', post_url)[-40:]}"
+        )
+
+        upvotes = _random_engagement_fallback()
+        comments = _random_engagement_fallback()
+        log.warning(
+            f"[SERP] RANDOM FALLBACK applied for engagement on {post_url} | "
+            f"upvotes={upvotes} comments={comments} "
+            f"(range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX}) | "
+            f"reason: Reddit's public RSS feed does not expose numeric engagement counts | "
+            f"this is NOT real, provider-returned engagement data."
         )
 
         return {
@@ -1979,12 +1868,12 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
             "search_keyword":       keyword,
             "upvotes":              upvotes,
             "comments":             comments,
-            "engagement_is_random": engagement_is_random,
+            "engagement_is_random": True,   # RSS never provides real counts — always random as of v9.11
             "google_rank":          rank,   # real per-post rank, already set here
             "search_volume":        None,   # filled in by process_one_keyword() below
         }
     except Exception as exc:
-        log.error(f"[REDDIT-API] fetch_reddit_post_by_url parse error for {post_url}: {exc}")
+        log.error(f"[SERP] fetch_reddit_post_by_url parse error for {post_url}: {exc}")
         return None
 
 
@@ -1997,7 +1886,7 @@ def process_one_keyword(keyword: str, volume, volume_is_random: bool = False) ->
          number or a random fallback.
       2. Per-result post_url dedup check -> skip already-known posts
          (no fetch, no Claude call for those)
-      3. Reddit fetch (reddit34 RapidAPI provider, smart-retry) for
+      3. Reddit fetch (public RSS feed, credential-free, smart-retry) for
          genuinely new posts -> stamp the keyword's already-seeded
          search_volume (and its random/real flag) onto each item ->
          queue for Claude scoring
@@ -2108,8 +1997,8 @@ def run_serp_discovery_loop():
         f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}) | "
         f"random fallback range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} "
         f"on failure/no-credits (always logged) | "
-        f"REDDIT FETCH: reddit34 RapidAPI provider ({REDDIT_FETCH_MAX_RETRIES}x backoff, "
-        f"no direct Reddit requests, engagement real-when-available else random fallback "
+        f"REDDIT FETCH: public RSS feed only, credential-free ({REDDIT_FETCH_MAX_RETRIES}x backoff "
+        f"+ old.reddit.com fallback host, no OAuth/PRAW, random engagement fallback "
         f"{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX})"
     )
 
@@ -2389,10 +2278,9 @@ def save_new_signal(item: dict, score_result: dict, force_pending: bool = False)
         # Minimal, focused log line — ONLY what's needed to eyeball a
         # signal at a glance: platform + keyword, search_volume (/mo,
         # tagged real vs random-fallback), upvotes/comments (tagged real
-        # vs random-fallback — as of v9.12, the reddit34 provider can
-        # return real engagement counts, so this is only RANDOM-FALLBACK
-        # when that provider didn't return a usable value for a given
-        # post), google_rank as a plain number, and the post_url.
+        # vs random-fallback — as of v9.11, Reddit RSS never provides
+        # real counts, so this will always read RANDOM-FALLBACK for
+        # Reddit items), google_rank as a plain number, and the post_url.
         # Full doc (score, etc.) is still in Mongo/the /signals endpoint
         # as before — this is just the log line format, nothing else
         # changed.
@@ -2743,11 +2631,10 @@ async def start_reddit_listener():
     """
     Reddit's ONLY mechanism now: SERP discovery thread (per-keyword
     fetch-once-forever cache + batched search-volume seeding -> Google
-    search -> reddit34 RapidAPI post fetch) + its dedicated batch
-    processor thread. Governed entirely by REDDIT_ENABLED + RAPIDAPI_KEY
-    (RapidAPI is required for SERP discovery AND for the reddit34
-    per-post fetch step — both use the same shared key/credential; no
-    OAuth/PRAW, no direct Reddit credentials of any kind).
+    search -> public, credential-free RSS fetch) + its dedicated batch
+    processor thread. Governed entirely by REDDIT_ENABLED + RapidAPI
+    credentials (RapidAPI is still required for SERP discovery itself;
+    the per-post fetch step needs no credentials at all — no OAuth/PRAW).
     """
     if not REDDIT_ENABLED:
         log.warning("Reddit platform DISABLED — skipping.")
@@ -2852,15 +2739,14 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v9.12 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + reddit34 RapidAPI post fetch + random-fallback volume/engagement) + Twitter Signal Scorer",
+    title="Flintel v9.11 — Reddit (SERP + fetch-once-forever keyword cache + batched search-volume seeding + credential-free RSS fetch + random-fallback volume/engagement) + Twitter Signal Scorer",
     description=(
         "Reddit (RapidAPI SERP discovery, fetch-once-forever keyword cache — "
         "no re-fetch, ever, once a keyword is done) + Twitter signals: monitor, "
         "score (generic 1-100 relevance/visibility/engagement model), store. "
-        "Reddit per-post fetch uses the reddit34 RapidAPI marketplace provider's "
-        "getPostDetails endpoint (smart-retry, same RAPIDAPI_KEY as the other "
-        "two RapidAPI hosts) — this IP sends no direct requests to Reddit at "
-        "all. Search-volume ('search/mo') failures — bad key, "
+        "Reddit per-post fetch uses ONLY Reddit's public, credential-free per-post RSS "
+        "endpoint (smart-retry + old.reddit.com fallback) — no OAuth, no PRAW, "
+        "nothing to configure. Search-volume ('search/mo') failures — bad key, "
         "exhausted credits, rate-limits, timeouts, or no usable field — are "
         "NEVER left as a permanent None: a random placeholder in a "
         "configurable range (default 300-5000) is generated instead, and "
@@ -2877,15 +2763,13 @@ app = FastAPI(
         "is read directly from flintel_keywords, not filtered by whatever "
         "the REDDIT_SEARCH_KEYWORDS python list currently contains — so "
         "editing that list never causes an already-pending keyword to be "
-        "skipped or forgotten. A keyword whose Reddit fetch genuinely fails "
-        "gets a retry cooldown (REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS) instead "
-        "of being retried on the very next pass. Newly added keywords are "
-        "picked up automatically, one at a time. Streaming Claude with "
-        "partial-JSON recovery. Claude failures route to status='pending' for "
-        "automatic rescore (re-uses stored enrichment, never re-fetches from "
-        "Reddit or RapidAPI) instead of a permanent low score."
+        "skipped or forgotten. Newly added keywords are picked up "
+        "automatically, one at a time. Streaming Claude with partial-JSON "
+        "recovery. Claude failures route to status='pending' for automatic "
+        "rescore (re-uses stored enrichment, never re-fetches from Reddit or "
+        "RapidAPI) instead of a permanent low score."
     ),
-    version="9.12.0",
+    version="9.11.1",
 )
 
 
