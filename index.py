@@ -349,6 +349,24 @@ REDDIT_SEARCH_KEYWORDS = [
     "overseas wire transfer", "overseas transfer", "global payment",
     "global transfer", "b2b payment", "b2b transfer",
     "business to business payment",
+
+  "send money to", "sending money to", "transfer money to",
+    "transferring money to", "wire money to", "wiring money to",
+    "move money to", "moving money to", "remit money to",
+    "remitting money to", "pay my supplier", "paying my supplier",
+    "pay a supplier", "paying a supplier", "pay my vendor",
+    "paying my vendor", "pay my manufacturer", "pay my factory",
+    "pay my partner", "pay my contractor", "pay an invoice",
+    "paying an invoice", "settle an invoice", "settling an invoice",
+    "pay a business", "business payment to", "supplier payment to",
+    "vendor payment to", "invoice payment to", "international payment to",
+    "overseas payment to", "cross border payment", "cross-border payment",
+    "cross border transfer", "cross-border transfer",
+    "international transfer", "international wire",
+    "international wire transfer", "foreign wire transfer",
+    "overseas wire transfer", "overseas transfer", "global payment",
+    "global transfer", "b2b payment", "b2b transfer",
+    "business to business payment",
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG — UNTOUCHED from v9.11.1. ──
