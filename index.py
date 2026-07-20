@@ -139,6 +139,48 @@ still go through passes_keyword_filter() exactly as before — zero change
 to Twitter's behavior. This is the ONLY functional change in this file
 relative to v9.12; everything else is preserved 100% as-is.
 =================================================================================
+v9.12.2 PATCH NOTE (bug fix on top of v9.12.1, applied per user request) —
+TWO issues in run_batch_processor(), both invisible in logs before this fix:
+
+  BUG A — ITEM-LOSS WINDOW BETWEEN DEQUEUE AND PERSIST.
+    Previously, remove_queue_message(platform_key, item.get("message_id"))
+    was called IMMEDIATELY after q.get() succeeded — i.e. the instant an
+    item was pulled off the in-memory reddit_queue/twitter_queue, its
+    Mongo-persisted backup row in flintel_queue_messages was deleted right
+    away, BEFORE it was known whether that item would be added to
+    current_batch/flintel_pending_batch or dropped. If the process crashed
+    or was killed in the gap between q.get() and save_pending_batch()
+    (e.g. during a Mongo hiccup, an unhandled exception, a container
+    restart), that item existed in NEITHER flintel_queue_messages NOR
+    flintel_pending_batch — it was silently and permanently lost, and
+    would not be recovered on restart (load_queue_messages() would never
+    see it again, since it had already been deleted).
+
+    FIX — remove_queue_message() is now called ONLY after the item's fate
+    is fully decided AND persisted: either (a) it has been appended to
+    current_batch and save_pending_batch() has successfully written that
+    batch to flintel_pending_batch, or (b) it has been genuinely dropped
+    for a documented, logged reason (too-short text, or — for Twitter only
+    — failing passes_keyword_filter()). This closes the gap: at every
+    point in time, an in-flight item exists in at least one of
+    flintel_queue_messages or flintel_pending_batch, never in neither.
+
+  BUG B — SILENT, UNTRACEABLE SHORT-TEXT DROP.
+    The `if not text or len(text) < 10: q.task_done(); continue` branch
+    dropped items with no log line and no counter increment
+    (total_dropped was never touched here) — making it impossible to
+    distinguish "item never arrived" from "item silently dropped for
+    being too short" purely from the logs.
+
+    FIX — this branch now logs a WARNING with message_id/post_url/text
+    length, and increments total_dropped, exactly like the redundant-
+    keyword-filter drop path already did for Twitter.
+
+Everything else in this file — SERP discovery, Reddit fetch loop, fuzzy
+keyword generation/matching, Claude batch scorer, rescore processor,
+FastAPI endpoints, Mongo schemas/indexes — is preserved 100% as-is,
+byte-for-byte identical to v9.12.1. Only run_batch_processor() changed.
+=================================================================================
 """
 
 import asyncio
@@ -2156,10 +2198,13 @@ def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: di
 # ─────────────────────────────────────────────────────────────────────────────
 # GENERIC BATCH PROCESSOR — one instance per platform queue.
 #
-# v9.12.1 PATCH: the redundant Reddit-side re-filter is now skipped (see
-# patch note at top of file). Everything else in this function — batching
-# logic, timeout/gap handling, persistence, enrichment, Claude call — is
-# UNCHANGED.
+# v9.12.2 PATCH (this build): remove_queue_message() is now called ONLY
+# after an item's fate is fully decided AND persisted (either appended to
+# current_batch + save_pending_batch() succeeded, or genuinely dropped for
+# a logged reason). The too-short-text drop path is now logged and counted
+# in total_dropped. Batching logic, timeout/gap handling, enrichment, and
+# the Claude call are otherwise 100% UNCHANGED from v9.12.1 — including the
+# v9.12.1 fix that skips passes_keyword_filter() for Reddit items.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -2198,29 +2243,51 @@ def run_batch_processor(
 
             if got_item:
                 total_received += 1
-                remove_queue_message(platform_key, item.get("message_id"))
+                # NOTE (v9.12.2): remove_queue_message() is intentionally
+                # NOT called here anymore. It is now called further below,
+                # only once this item's fate (added to a persisted batch,
+                # or genuinely dropped) has been decided AND written to
+                # Mongo — so the item always exists in at least one of
+                # flintel_queue_messages / flintel_pending_batch until it
+                # is fully accounted for. This closes the item-loss window
+                # that previously existed between q.get() and
+                # save_pending_batch()/drop.
+                message_id = item.get("message_id")
 
                 text = (item.get("text") or "").strip()
 
                 if not text or len(text) < 10:
+                    total_dropped += 1
+                    log.warning(
+                        f"[{platform_label}] DROPPED (text too short: {len(text)} char(s), "
+                        f"min 10 required) | message_id:{message_id} | "
+                        f"post_url:{item.get('post_url', '')!r}"
+                    )
+                    remove_queue_message(platform_key, message_id)
                     q.task_done()
                     continue
 
-                # v9.12.1 FIX — Reddit items only ever reach this queue after
-                # already passing passes_fuzzy_filter() in
-                # run_reddit_fetch_loop() (matched against that post's own
-                # stored fuzzy_keywords + original search_keyword — the
-                # authoritative relevance decision for Reddit). Re-checking
-                # here against the FULL REDDIT_SEARCH_KEYWORDS phrase list
-                # (exact full-phrase substring only) was silently dropping
-                # items that had matched via a fuzzy variant rather than the
-                # complete original phrase — they never reached
+                # v9.12.1 FIX (preserved as-is) — Reddit items only ever
+                # reach this queue after already passing
+                # passes_fuzzy_filter() in run_reddit_fetch_loop() (matched
+                # against that post's own stored fuzzy_keywords + original
+                # search_keyword — the authoritative relevance decision for
+                # Reddit). Re-checking here against the FULL
+                # REDDIT_SEARCH_KEYWORDS phrase list (exact full-phrase
+                # substring only) was silently dropping items that had
+                # matched via a fuzzy variant rather than the complete
+                # original phrase — they never reached
                 # current_batch/save_pending_batch(), so they never showed
                 # up in flintel_pending_batch and never got scored by
                 # Claude. Twitter items are never pre-filtered upstream, so
                 # this filter still applies to them exactly as before.
                 if platform_key != "reddit" and not passes_keyword_filter(text, keyword_filter_list):
                     total_dropped += 1
+                    log.info(
+                        f"[{platform_label}] DROPPED (failed keyword filter) | "
+                        f"message_id:{message_id}"
+                    )
+                    remove_queue_message(platform_key, message_id)
                     q.task_done()
                     continue
 
@@ -2231,6 +2298,12 @@ def run_batch_processor(
                 current_batch.append(item)
                 save_pending_batch(platform_key, current_batch, batch_start_time)
                 save_batch_seconds(platform_key, batch_start_time)
+
+                # Only remove the item from its persistent queue-store
+                # backup AFTER save_pending_batch() has successfully
+                # written it into flintel_pending_batch — at no point in
+                # time is the item absent from both collections.
+                remove_queue_message(platform_key, message_id)
 
                 log.info(f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | u/{item.get('username')}")
                 q.task_done()
@@ -2454,7 +2527,7 @@ async def start_reddit_listener():
          flintel_google_posts directly, fetches RSS, fuzzy-filters,
          queues.
       3. Batch processor (run_batch_processor) — consumes reddit_queue
-         exactly as before, with the v9.12.1 redundant-filter fix.
+         exactly as before, with the v9.12.1/v9.12.2 fixes.
     Governed entirely by REDDIT_ENABLED + RapidAPI credentials (RapidAPI
     is required for SERP discovery; the per-post RSS fetch step itself
     needs no credentials at all).
@@ -2584,11 +2657,12 @@ app = FastAPI(
         "cache, builds the exact same item schema as before, and queues it "
         "for Claude scoring exactly as always. flintel_keywords and all "
         "Google-rank/SERP code are 100% unmodified from v9.11.1. v9.12.1 "
-        "additionally fixes a redundant Reddit-side re-filter in the batch "
-        "processor that was silently dropping fuzzy-matched items before "
-        "they reached flintel_pending_batch."
+        "fixed a redundant Reddit-side re-filter in the batch processor. "
+        "v9.12.2 additionally closes an item-loss window between dequeue "
+        "and persistence, and makes the too-short-text drop path logged "
+        "and counted instead of silent."
     ),
-    version="9.12.1",
+    version="9.12.2",
 )
 
 
@@ -2616,7 +2690,7 @@ def root():
 
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.12.1 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter; redundant batch-filter bug fixed)",
+        "system":                  "FLINTEL v9.12.2 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter; redundant batch-filter bug fixed; batch-processor item-loss window closed)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -2632,6 +2706,8 @@ def root():
         "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} — UNTOUCHED",
         "reddit_serp_reddit_fetch_decoupled": True,
         "reddit_batch_redundant_filter_fixed": True,
+        "batch_processor_item_loss_window_fixed": True,
+        "batch_processor_short_text_drop_logged": True,
         "google_posts_collection":        "flintel_google_posts",
         "google_posts_tracked":           total_google_posts,
         "google_posts_pending_reddit_fetch": pending_reddit_fetch,
@@ -2824,11 +2900,12 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.12.1 — REDDIT SERP-DISCOVERY / REDDIT-FETCH DECOUPLED")
+    log.info("  FLINTEL v9.12.2 — REDDIT SERP-DISCOVERY / REDDIT-FETCH DECOUPLED")
     log.info("                   VIA NEW flintel_google_posts COLLECTION +")
     log.info("                   PYTHON AUTO-FUZZY KEYWORD GENERATION/FILTERING")
     log.info("                   + TWITTER SIGNAL SCORER")
     log.info("                   (+ redundant Reddit batch-filter bug FIXED)")
+    log.info("                   (+ batch-processor item-loss window CLOSED)")
     log.info("=" * 70)
     log.info(f"  Client                : {CLIENT_ID}")
     log.info(f"  Platforms             : Reddit (SERP discovery + separate fetch loop) + Twitter/X")
@@ -2847,6 +2924,7 @@ if __name__ == "__main__":
     log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time (generate_fuzzy_keywords()) — stored on the post's own document, used to filter fetched RSS content (passes_fuzzy_filter())")
     log.info(f"  Search-volume source  : flintel_keywords cache, looked up per search_keyword at Reddit-fetch/queue time — untouched cache, untouched seeding logic")
     log.info(f"  Batch processor fix   : Reddit items no longer re-filtered by passes_keyword_filter() against the full keyword-phrase list — fuzzy match upstream is now the sole gate for Reddit; Twitter unaffected")
+    log.info(f"  Batch processor fix 2 : remove_queue_message() moved to AFTER an item's fate is persisted (batch save or logged drop) — closes item-loss window between dequeue and persist; short-text drops now logged + counted")
     log.info(f"  Reddit batch          : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
     log.info(f"  Twitter batch         : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
     log.info(f"  Rescore batch         : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
