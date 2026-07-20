@@ -112,6 +112,33 @@ ARE 100% UNTOUCHED — BYTE-FOR-BYTE IDENTICAL TO v9.11.1.
   GET /google-posts, to inspect the new collection) — is kept 100%
   as-is or purely additive. No .json Reddit endpoint anywhere in this
   file — RSS (.rss) only, exactly as v9.11 established. No OAuth/PRAW.
+
+=================================================================================
+v9.12.1 PATCH NOTE (bug fix on top of v9.12, applied per user request) —
+run_batch_processor() had a SECOND, redundant relevance filter
+(passes_keyword_filter(text, keyword_filter_list)) that ran AFTER an item
+was pulled off reddit_queue. Reddit items only ever reach reddit_queue
+after ALREADY passing passes_fuzzy_filter() inside run_reddit_fetch_loop()
+— that fuzzy check (against the post's own stored fuzzy_keywords + its
+original search_keyword) is the single authoritative relevance decision
+for Reddit. The second filter checked the fetched text against the FULL
+REDDIT_SEARCH_KEYWORDS phrase list (exact full-phrase substring only) —
+so any item that had matched via a fuzzy variant (a single significant
+word, a bigram, or a singular/plural variant) rather than the complete
+original phrase was silently dropped here: total_dropped incremented,
+q.task_done() called, item discarded, current_batch.append()/
+save_pending_batch() never reached. That is why items could be seen
+being logged as "[REDDIT-FETCH] QUEUED" yet never appear in
+flintel_pending_batch and never reach Claude scoring.
+
+FIX — this second filter is now skipped entirely for Reddit items (the
+"reddit" platform_key), since fuzzy-filtering already happened upstream
+and re-checking against the full phrase list only produces false
+negatives. Twitter items are NOT pre-filtered anywhere upstream, so they
+still go through passes_keyword_filter() exactly as before — zero change
+to Twitter's behavior. This is the ONLY functional change in this file
+relative to v9.12; everything else is preserved 100% as-is.
+=================================================================================
 """
 
 import asyncio
@@ -464,10 +491,12 @@ twitter_queue: queue.Queue = queue.Queue()
 
 
 def passes_keyword_filter(text: str, keywords: list) -> bool:
-    """Generic keyword gate — UNCHANGED. Still used as a second-layer
-    safety filter inside run_batch_processor() before a batch is sent to
-    Claude, completely independent of the new fuzzy-keyword filter used
-    at Reddit-fetch time (passes_fuzzy_filter(), below)."""
+    """Generic keyword gate — UNCHANGED in implementation. Still used as
+    a second-layer safety filter inside run_batch_processor() before a
+    batch is sent to Claude — but as of v9.12.1 it is only actually
+    invoked for Twitter items (see run_batch_processor() below). Reddit
+    items are pre-filtered upstream by passes_fuzzy_filter(), which is
+    the authoritative relevance check for that platform."""
     t = text.lower()
     for kw in keywords:
         if kw.lower() in t:
@@ -2125,7 +2154,12 @@ def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: di
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR — one instance per platform queue. UNCHANGED.
+# GENERIC BATCH PROCESSOR — one instance per platform queue.
+#
+# v9.12.1 PATCH: the redundant Reddit-side re-filter is now skipped (see
+# patch note at top of file). Everything else in this function — batching
+# logic, timeout/gap handling, persistence, enrichment, Claude call — is
+# UNCHANGED.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -2172,7 +2206,20 @@ def run_batch_processor(
                     q.task_done()
                     continue
 
-                if not passes_keyword_filter(text, keyword_filter_list):
+                # v9.12.1 FIX — Reddit items only ever reach this queue after
+                # already passing passes_fuzzy_filter() in
+                # run_reddit_fetch_loop() (matched against that post's own
+                # stored fuzzy_keywords + original search_keyword — the
+                # authoritative relevance decision for Reddit). Re-checking
+                # here against the FULL REDDIT_SEARCH_KEYWORDS phrase list
+                # (exact full-phrase substring only) was silently dropping
+                # items that had matched via a fuzzy variant rather than the
+                # complete original phrase — they never reached
+                # current_batch/save_pending_batch(), so they never showed
+                # up in flintel_pending_batch and never got scored by
+                # Claude. Twitter items are never pre-filtered upstream, so
+                # this filter still applies to them exactly as before.
+                if platform_key != "reddit" and not passes_keyword_filter(text, keyword_filter_list):
                     total_dropped += 1
                     q.task_done()
                     continue
@@ -2406,8 +2453,8 @@ async def start_reddit_listener():
       2. Reddit fetch (run_reddit_fetch_loop) — NEW, reads
          flintel_google_posts directly, fetches RSS, fuzzy-filters,
          queues.
-      3. Batch processor (run_batch_processor) — unchanged, consumes
-         reddit_queue exactly as before.
+      3. Batch processor (run_batch_processor) — consumes reddit_queue
+         exactly as before, with the v9.12.1 redundant-filter fix.
     Governed entirely by REDDIT_ENABLED + RapidAPI credentials (RapidAPI
     is required for SERP discovery; the per-post RSS fetch step itself
     needs no credentials at all).
@@ -2536,9 +2583,12 @@ app = FastAPI(
         "reads search_volume from the completely untouched flintel_keywords "
         "cache, builds the exact same item schema as before, and queues it "
         "for Claude scoring exactly as always. flintel_keywords and all "
-        "Google-rank/SERP code are 100% unmodified from v9.11.1."
+        "Google-rank/SERP code are 100% unmodified from v9.11.1. v9.12.1 "
+        "additionally fixes a redundant Reddit-side re-filter in the batch "
+        "processor that was silently dropping fuzzy-matched items before "
+        "they reached flintel_pending_batch."
     ),
-    version="9.12.0",
+    version="9.12.1",
 )
 
 
@@ -2566,7 +2616,7 @@ def root():
 
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.12.0 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter)",
+        "system":                  "FLINTEL v9.12.1 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter; redundant batch-filter bug fixed)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -2581,6 +2631,7 @@ def root():
         "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE}) — UNTOUCHED",
         "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} — UNTOUCHED",
         "reddit_serp_reddit_fetch_decoupled": True,
+        "reddit_batch_redundant_filter_fixed": True,
         "google_posts_collection":        "flintel_google_posts",
         "google_posts_tracked":           total_google_posts,
         "google_posts_pending_reddit_fetch": pending_reddit_fetch,
@@ -2773,10 +2824,11 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.12.0 — REDDIT SERP-DISCOVERY / REDDIT-FETCH DECOUPLED")
+    log.info("  FLINTEL v9.12.1 — REDDIT SERP-DISCOVERY / REDDIT-FETCH DECOUPLED")
     log.info("                   VIA NEW flintel_google_posts COLLECTION +")
     log.info("                   PYTHON AUTO-FUZZY KEYWORD GENERATION/FILTERING")
     log.info("                   + TWITTER SIGNAL SCORER")
+    log.info("                   (+ redundant Reddit batch-filter bug FIXED)")
     log.info("=" * 70)
     log.info(f"  Client                : {CLIENT_ID}")
     log.info(f"  Platforms             : Reddit (SERP discovery + separate fetch loop) + Twitter/X")
@@ -2794,6 +2846,7 @@ if __name__ == "__main__":
     log.info(f"  Reddit fetch interval : check every {REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | retry cooldown {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s on genuine fetch failure")
     log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time (generate_fuzzy_keywords()) — stored on the post's own document, used to filter fetched RSS content (passes_fuzzy_filter())")
     log.info(f"  Search-volume source  : flintel_keywords cache, looked up per search_keyword at Reddit-fetch/queue time — untouched cache, untouched seeding logic")
+    log.info(f"  Batch processor fix   : Reddit items no longer re-filtered by passes_keyword_filter() against the full keyword-phrase list — fuzzy match upstream is now the sole gate for Reddit; Twitter unaffected")
     log.info(f"  Reddit batch          : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
     log.info(f"  Twitter batch         : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
     log.info(f"  Rescore batch         : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
