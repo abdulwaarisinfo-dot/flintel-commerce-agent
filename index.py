@@ -442,6 +442,34 @@ REDDIT_SEARCH_KEYWORDS = [
     "better than WorldRemit", "better than Western Union",
     "competitors to Wise", "Wise competitors", "Payoneer competitors",
 
+  # ── RECOMMENDATION REQUESTS ──────────────────────────────────────────────
+    "recommend a payment", "recommend a transfer", "recommend a service",
+    "recommend a platform", "recommend an app", "recommend a provider",
+    "recommend a solution", "anyone recommend", "can anyone recommend",
+    "does anyone recommend", "what payment service", "what transfer service",
+    "what payment platform", "what transfer platform", "what payment app",
+    "what transfer app", "which payment service", "which transfer service",
+    "which payment platform", "which transfer platform",
+    "which payment app", "which transfer app", "which payment provider",
+    "which service is best", "which platform is best", "which app is best",
+    "best payment service", "best transfer service", "best payment platform",
+    "best transfer platform", "best payment app", "best transfer app",
+    "best way to send", "best way to transfer", "best way to pay",
+    "fastest way to send", "fastest way to transfer",
+    "cheapest way to send", "cheapest way to transfer",
+    "how do I send", "how do I transfer", "how do I pay",
+    "how can I send", "how can I transfer", "how can I pay",
+    "looking for a payment", "looking for a transfer",
+    "looking for a platform", "looking for a service",
+    "looking for a solution", "searching for a payment",
+    "need a payment solution", "need a transfer solution",
+    "need a payment platform", "need a transfer platform",
+    "anyone using", "does anyone use", "has anyone used",
+    "who uses", "who do you use", "what do you use", "what are you using",
+    "tried everything", "tried so many", "tried multiple", "tried several",
+    "nothing works", "none of them work", "still haven't found",
+    "still looking for", "still searching for",
+
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG — UNTOUCHED from v9.11.1. ──
