@@ -398,6 +398,33 @@ REDDIT_SEARCH_KEYWORDS = [
     "money disappeared", "payment disappeared", "transfer disappeared",
     "no tracking", "can't track my transfer", "can't track my payment",
     "no update on my transfer", "no update on my payment",
+
+      # ── FEE FRUSTRATION ──────────────────────────────────────────────────────
+    "SWIFT fees", "SWIFT charges", "wire transfer fees",
+    "wire transfer charges", "international transfer fees",
+    "international wire fees", "transfer fees too high",
+    "transfer fees killing", "fees killing my margins",
+    "fees eating my margins", "fees eating my profit",
+    "exchange rate terrible", "exchange rate awful", "exchange rate bad",
+    "terrible exchange rate", "awful exchange rate", "bad exchange rate",
+    "worst exchange rate", "exchange rate ripoff", "exchange rate rip off",
+    "hidden fees", "hidden charges", "unexpected fees",
+    "unexpected charges", "FX fees", "FX charges", "FX markup",
+    "FX spread", "currency conversion fee", "currency conversion charge",
+    "conversion fee too high", "conversion markup",
+    "losing money on transfer", "losing money on fees",
+    "losing money to fees", "losing money exchanging",
+    "percentage on transfer", "percentage on payment",
+    "ripping me off", "highway robbery", "daylight robbery",
+    "absolute ripoff", "total ripoff", "complete ripoff",
+    "charging too much", "too expensive to send", "too expensive to transfer",
+    "cheapest way to send", "cheapest way to transfer",
+    "cheapest international transfer", "cheapest cross border",
+    "better rate than", "better rates than", "cheaper than SWIFT",
+    "cheaper than wire", "SWIFT alternative", "alternative to SWIFT",
+    "avoid SWIFT fees", "avoid wire fees", "correspondent bank fees",
+    "intermediary bank fees", "intermediary fees",
+
 ]
 
 # ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG — UNTOUCHED from v9.11.1. ──
