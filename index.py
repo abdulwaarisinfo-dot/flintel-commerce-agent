@@ -181,6 +181,21 @@ keyword generation/matching, Claude batch scorer, rescore processor,
 FastAPI endpoints, Mongo schemas/indexes — is preserved 100% as-is,
 byte-for-byte identical to v9.12.1. Only run_batch_processor() changed.
 =================================================================================
+INDEX.PY NOTE — CLAUDE NOW CALLED VIA RAPIDAPI, NOT THE OFFICIAL SDK
+=================================================================================
+The only functional change in THIS file relative to v9.12.2 is how the
+Claude scoring call is made. Previously this used the official
+`anthropic` Python SDK (anthropic_client.messages.stream(...)) talking
+directly to api.anthropic.com. In this file that call is replaced with a
+plain `requests.post()` to the RapidAPI-hosted endpoint
+"https://claude-sonnet-4-6.p.rapidapi.com/chat/completions", using the
+SAME RAPIDAPI_KEY / RapidAPI account already used elsewhere in this file
+for the SEO-keyword and Google-search RapidAPI hosts — one key, three
+RapidAPI hosts, all plain `requests` calls, nothing mixed with the
+official `anthropic` SDK anywhere. No other logic, schema, batching,
+retry, Mongo, or FastAPI behavior is changed. See _call_claude_batch()
+and _extract_text_from_rapidapi_response() below.
+=================================================================================
 """
 
 import asyncio
@@ -196,8 +211,6 @@ import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-import anthropic
-import httpx
 import tweepy
 import requests
 import feedparser
@@ -229,8 +242,6 @@ TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET   = os.getenv("TWITTER_API_SECRET")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
@@ -241,11 +252,22 @@ CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
 # empty, Twitter items simply get google_rank=None / search_volume=None.
 SEARCH_KEYWORD = os.getenv("SEARCH_KEYWORD", "")
 
-# ── RapidAPI — SOLE provider for both Google rank AND search volume.
-# UNTOUCHED from v9.11.1.
+# ── RapidAPI — SOLE provider for Google rank, search volume, AND (in this
+# file) Claude scoring. Same key used across all three RapidAPI hosts.
+# UNTOUCHED from v9.11.1 for the keyword/search hosts.
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")  # .env boht used same key
 RAPIDAPI_KEYWORD_HOST = "seo-keyword-research.p.rapidapi.com"
 RAPIDAPI_SEARCH_HOST  = "google-search116.p.rapidapi.com"
+
+# ── Claude, via RapidAPI (replaces the official `anthropic` SDK) ───────────
+# Same RAPIDAPI_KEY as above — this is just a third RapidAPI host, called
+# with plain `requests`, exactly like RAPIDAPI_KEYWORD_HOST / RAPIDAPI_SEARCH_HOST
+# above. No official Anthropic SDK, no api.anthropic.com call, anywhere in
+# this file.
+CLAUDE_RAPIDAPI_HOST            = "claude-sonnet-4-6.p.rapidapi.com"
+CLAUDE_RAPIDAPI_URL             = f"https://{CLAUDE_RAPIDAPI_HOST}/chat/completions"
+CLAUDE_RAPIDAPI_MODEL           = "claude-sonnet-4-6"
+CLAUDE_RAPIDAPI_TIMEOUT_SECONDS = int(os.getenv("CLAUDE_RAPIDAPI_TIMEOUT_SECONDS", "120"))
 
 # ── RapidAPI call timeouts — UNTOUCHED from v9.11.1.
 DATAFORSEO_SERP_TIMEOUT_SECONDS   = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
@@ -637,7 +659,7 @@ REDDIT_USER_AGENT = os.getenv(
 #                        gets retried, but not on the very next pass —
 #                        next_retry_at spaces retries out exactly like
 #                        v9.11.2's per-keyword cooldown did, just scoped to
-#                        one post_url instead of one keyword now.
+#                        one post_url now.
 REDDIT_FETCH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDDIT_FETCH_CHECK_INTERVAL_SECONDS", "30"))
 REDDIT_POST_RETRY_COOLDOWN_SECONDS  = int(os.getenv("REDDIT_POST_RETRY_COOLDOWN_SECONDS", "1800"))
 
@@ -1135,17 +1157,6 @@ def get_database():
 
 
 db = get_database()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ANTHROPIC CLIENT — streaming
-# ─────────────────────────────────────────────────────────────────────────────
-
-anthropic_client = anthropic.Anthropic(
-    api_key=ANTHROPIC_API_KEY,
-    http_client=httpx.Client(
-        timeout=httpx.Timeout(connect=30.0, read=None, write=60.0, pool=30.0)
-    ),
-)
 
 
 def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
@@ -2208,8 +2219,17 @@ def run_reddit_fetch_loop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER — streaming transport + partial-JSON recovery.
-# UNCHANGED from v9.11.1.
+# CLAUDE BATCH SCORER — via RapidAPI (claude-sonnet-4-6.p.rapidapi.com).
+#
+# This is the ONLY functionally-changed section relative to v9.12.2. The
+# official `anthropic` SDK / streaming call is gone — scoring is now a
+# plain `requests.post()` to RapidAPI, using the SAME RAPIDAPI_KEY as the
+# rest of this file's RapidAPI calls (RAPIDAPI_KEYWORD_HOST /
+# RAPIDAPI_SEARCH_HOST above). Batch construction (_build_batch_prompt),
+# JSON parsing/partial-recovery (_parse_claude_json,
+# _salvage_partial_json_array, _strip_code_fences), fallback-scoring
+# (_fallback_score), retry_with_backoff() wrapping, and everything that
+# consumes the returned `results` list are all UNCHANGED from v9.12.2.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
@@ -2297,20 +2317,103 @@ def _parse_claude_json(raw: str) -> tuple:
         return _salvage_partial_json_array(cleaned), True
 
 
+def _extract_text_from_rapidapi_response(result: dict) -> str:
+    """
+    Pulls the model's raw reply text out of whatever shape the RapidAPI
+    claude-sonnet-4-6 endpoint returns.
+
+    Tries, in order:
+      1. OpenAI-style: {"choices": [{"message": {"content": "..."}}]}
+         — this is the shape implied by the RapidAPI example payload
+         (POST /chat/completions, "messages": [...]).
+      2. Anthropic-native style: {"content": [{"type": "text", "text": "..."}]}
+         — in case the RapidAPI host proxies the raw Anthropic response
+         format instead.
+      3. A handful of common single-field fallbacks
+         ("response" / "output" / "result" / "text").
+
+    Raises ValueError if none of these shapes match, so
+    retry_with_backoff() in score_batch_with_claude() sees a genuine
+    failure (and retries / falls back to _fallback_score()) instead of
+    silently scoring on empty/garbage text.
+    """
+    if not isinstance(result, dict):
+        raise ValueError(f"RapidAPI Claude response was not a JSON object: {type(result).__name__}")
+
+    # 1) OpenAI-style choices[0].message.content
+    choices = result.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict) and message.get("content"):
+                return message["content"]
+            if first.get("text"):
+                return first["text"]
+
+    # 2) Anthropic-native content blocks
+    content = result.get("content")
+    if isinstance(content, list) and content:
+        texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+        if texts:
+            return "\n".join(texts)
+
+    # 3) Common single-field fallbacks used by some RapidAPI proxies
+    for key in ("response", "output", "result", "text"):
+        val = result.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+
+    raise ValueError(f"Could not find text content in RapidAPI Claude response: keys={list(result.keys())}")
+
+
 def _call_claude_batch(batch: list) -> list:
+    """
+    Sends one batch of posts to Claude for scoring, via RapidAPI — a
+    plain `requests.post()` to CLAUDE_RAPIDAPI_URL, exactly mirroring
+    the RapidAPI call style already used for RAPIDAPI_KEYWORD_HOST /
+    RAPIDAPI_SEARCH_HOST elsewhere in this file (same RAPIDAPI_KEY,
+    same x-rapidapi-key / x-rapidapi-host header pattern). No streaming,
+    no official `anthropic` SDK, no api.anthropic.com call anywhere.
+    """
     prompt = _build_batch_prompt(batch)
-    with anthropic_client.messages.stream(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=MAX_TOKENS,
-        system=CLAUDE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Score this batch:\n\n{prompt}"}],
-    ) as stream:
-        raw = stream.get_final_text().strip()
+
+    payload = {
+        "model": CLAUDE_RAPIDAPI_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": f"{CLAUDE_SYSTEM_PROMPT}\n\nScore this batch:\n\n{prompt}",
+            }
+        ],
+    }
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,  # same RapidAPI key/account as every other RapidAPI call in this file
+        "x-rapidapi-host": CLAUDE_RAPIDAPI_HOST,
+        "Content-Type": "application/json",
+    }
+
+    r = requests.post(
+        CLAUDE_RAPIDAPI_URL,
+        json=payload,
+        headers=headers,
+        timeout=CLAUDE_RAPIDAPI_TIMEOUT_SECONDS,
+    )
+    r.raise_for_status()
+
+    try:
+        result = r.json()
+    except ValueError as exc:
+        raise ValueError(
+            f"[Claude-Batch] Non-JSON response from RapidAPI Claude endpoint | status:{r.status_code}"
+        ) from exc
+
+    raw = _extract_text_from_rapidapi_response(result).strip()
 
     results, was_truncated = _parse_claude_json(raw)
 
     if was_truncated:
-        recovered = {int(r["index"]) for r in results if isinstance(r, dict) and "index" in r}
+        recovered = {int(r_["index"]) for r_ in results if isinstance(r_, dict) and "index" in r_}
         missing = sorted(set(range(1, len(batch) + 1)) - recovered)
         log.warning(f"[Claude-Batch] PARTIAL RECOVERY | batch_size:{len(batch)} | "
                     f"recovered:{len(recovered)} | missing:{len(missing)}")
@@ -2325,14 +2428,14 @@ def _call_claude_batch(batch: list) -> list:
     if not isinstance(results, list):
         raise ValueError("Claude returned non-list after parsing.")
 
-    for r in results:
-        r.setdefault("is_relevant", False)
-        r.setdefault("reply_draft", None)
-        r.setdefault("_is_fallback", False)
-        if r.get("intent_score", 1) < 1:
-            r["intent_score"] = 1
-        if r.get("intent_score", 1) > 100:
-            r["intent_score"] = 100
+    for res in results:
+        res.setdefault("is_relevant", False)
+        res.setdefault("reply_draft", None)
+        res.setdefault("_is_fallback", False)
+        if res.get("intent_score", 1) < 1:
+            res["intent_score"] = 1
+        if res.get("intent_score", 1) > 100:
+            res["intent_score"] = 100
 
     return results
 
@@ -2430,13 +2533,15 @@ def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: di
 # ─────────────────────────────────────────────────────────────────────────────
 # GENERIC BATCH PROCESSOR — one instance per platform queue.
 #
-# v9.12.2 PATCH (this build): remove_queue_message() is now called ONLY
-# after an item's fate is fully decided AND persisted (either appended to
-# current_batch + save_pending_batch() succeeded, or genuinely dropped for
-# a logged reason). The too-short-text drop path is now logged and counted
-# in total_dropped. Batching logic, timeout/gap handling, enrichment, and
-# the Claude call are otherwise 100% UNCHANGED from v9.12.1 — including the
-# v9.12.1 fix that skips passes_keyword_filter() for Reddit items.
+# v9.12.2 PATCH (preserved as-is): remove_queue_message() is now called
+# ONLY after an item's fate is fully decided AND persisted (either
+# appended to current_batch + save_pending_batch() succeeded, or
+# genuinely dropped for a logged reason). The too-short-text drop path is
+# logged and counted in total_dropped. Batching logic, timeout/gap
+# handling, enrichment are otherwise 100% UNCHANGED — including the
+# v9.12.1 fix that skips passes_keyword_filter() for Reddit items. Only
+# the Claude call it eventually invokes (score_batch_with_claude(), via
+# RapidAPI now) changed.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -2601,7 +2706,8 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR — UNCHANGED from v9.11.1.
+# RESCORE PROCESSOR — UNCHANGED from v9.11.1 (calls score_batch_with_claude()
+# exactly as before; only that function's internals now hit RapidAPI).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_rescore_processor():
@@ -2759,7 +2865,9 @@ async def start_reddit_listener():
          flintel_google_posts directly, fetches RSS, fuzzy-filters,
          queues.
       3. Batch processor (run_batch_processor) — consumes reddit_queue
-         exactly as before, with the v9.12.1/v9.12.2 fixes.
+         exactly as before, with the v9.12.1/v9.12.2 fixes, and now
+         scores via the RapidAPI Claude endpoint instead of the
+         official SDK.
     Governed entirely by REDDIT_ENABLED + RapidAPI credentials (RapidAPI
     is required for SERP discovery; the per-post RSS fetch step itself
     needs no credentials at all).
@@ -2873,7 +2981,7 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v9.12 — Reddit (SERP discovery decoupled from Reddit fetch via flintel_google_posts + Python auto-fuzzy keyword filtering) + Twitter Signal Scorer",
+    title="Flintel v9.12 — Reddit (SERP discovery decoupled from Reddit fetch via flintel_google_posts + Python auto-fuzzy keyword filtering) + Twitter Signal Scorer (Claude via RapidAPI)",
     description=(
         "Reddit SERP discovery (RapidAPI, untouched) now saves every result "
         "into a NEW flintel_google_posts collection (post_url + google_rank + "
@@ -2888,13 +2996,16 @@ app = FastAPI(
         "reads search_volume from the completely untouched flintel_keywords "
         "cache, builds the exact same item schema as before, and queues it "
         "for Claude scoring exactly as always. flintel_keywords and all "
-        "Google-rank/SERP code are 100% unmodified from v9.11.1. v9.12.1 "
+        "Google-rank/SERP code are 100% unmodified from v9.11.1. Claude "
+        "scoring itself is now called via RapidAPI (claude-sonnet-4-6."
+        "p.rapidapi.com) instead of the official Anthropic SDK, using the "
+        "same RAPIDAPI_KEY as the other RapidAPI calls in this file. v9.12.1 "
         "fixed a redundant Reddit-side re-filter in the batch processor. "
         "v9.12.2 additionally closes an item-loss window between dequeue "
         "and persistence, and makes the too-short-text drop path logged "
         "and counted instead of silent."
     ),
-    version="9.12.2",
+    version="9.12.2-rapidapi-claude",
 )
 
 
@@ -2922,7 +3033,7 @@ def root():
 
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.12.2 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter; redundant batch-filter bug fixed; batch-processor item-loss window closed)",
+        "system":                  "FLINTEL v9.12.2 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter; redundant batch-filter bug fixed; batch-processor item-loss window closed; Claude scoring via RapidAPI)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -2930,6 +3041,8 @@ def root():
         "reddit_fetch_method":     "public per-post RSS (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW, no .json endpoint anywhere",
         "twitter_enabled":         TWITTER_ENABLED,
         "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
+        "claude_provider":         "RapidAPI (claude-sonnet-4-6.p.rapidapi.com) — official Anthropic SDK not used",
+        "claude_rapidapi_configured": bool(RAPIDAPI_KEY),
         "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
         "twitter_search_keywords": len(TWITTER_SEARCH_KEYWORDS),
         "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
@@ -2998,6 +3111,9 @@ def health():
         "reddit_serp_reddit_fetch_decoupled": True,
         "twitter_working":         TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN),
         "twitter_indicator":       _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
+        "claude_provider":         "RapidAPI (claude-sonnet-4-6.p.rapidapi.com)",
+        "claude_working":          bool(RAPIDAPI_KEY),
+        "claude_indicator":        _working(bool(RAPIDAPI_KEY)),
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
         "google_posts_pending_reddit_fetch": db.flintel_google_posts.count_documents({"reddit_fetched": False}),
@@ -3138,6 +3254,7 @@ if __name__ == "__main__":
     log.info("                   + TWITTER SIGNAL SCORER")
     log.info("                   (+ redundant Reddit batch-filter bug FIXED)")
     log.info("                   (+ batch-processor item-loss window CLOSED)")
+    log.info("                   (+ Claude scoring now via RapidAPI, not the SDK)")
     log.info("=" * 70)
     log.info(f"  Client                : {CLIENT_ID}")
     log.info(f"  Platforms             : Reddit (SERP discovery + separate fetch loop) + Twitter/X")
@@ -3145,6 +3262,7 @@ if __name__ == "__main__":
     log.info(f"  Reddit fetch method   : public per-post RSS only — credential-free, no OAuth/PRAW, no .json anywhere")
     log.info(f"  Reddit engagement     : RANDOM placeholder {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (upvotes/comments) — RSS has no real counts, always logged")
     log.info(f"  Twitter               : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
+    log.info(f"  Claude provider       : RapidAPI ({CLAUDE_RAPIDAPI_HOST}) | {_working(bool(RAPIDAPI_KEY))} | official anthropic SDK NOT used")
     log.info(f"  Reddit keywords       : {len(REDDIT_SEARCH_KEYWORDS)} (used ONLY to seed brand-new flintel_keywords docs)")
     log.info(f"  Twitter keywords      : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
     log.info(f"  Keyword cache         : flintel_keywords — fetch-once-forever, UNTOUCHED from v9.11.1")
@@ -3160,8 +3278,8 @@ if __name__ == "__main__":
     log.info(f"  Reddit batch          : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
     log.info(f"  Twitter batch         : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
     log.info(f"  Rescore batch         : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
-    log.info(f"  Claude streaming      : True | prompt: generic 1-100 relevance/visibility/engagement")
-    log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — google_rank + search_volume, UNTOUCHED)")
+    log.info(f"  Claude call style     : plain requests.post() to RapidAPI (no streaming, no anthropic SDK) | prompt: generic 1-100 relevance/visibility/engagement")
+    log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — google_rank + search_volume + Claude scoring, ONE key across three hosts)")
     log.info(f"  Telegram              : REMOVED")
     log.info(f"  Reddit .json endpoint : REMOVED (never used — RSS only)")
     log.info(f"  Reddit OAuth/PRAW     : REMOVED")
