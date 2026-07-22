@@ -2380,6 +2380,7 @@ def _call_claude_batch(batch: list) -> list:
 
     payload = {
         "model": CLAUDE_RAPIDAPI_MODEL,
+        "max_tokens": MAX_TOKENS,          
         "messages": [
             {
                 "role": "user",
@@ -2399,6 +2400,8 @@ def _call_claude_batch(batch: list) -> list:
         headers=headers,
         timeout=CLAUDE_RAPIDAPI_TIMEOUT_SECONDS,
     )
+    log.error(f"[DEBUG] status:{r.status_code} body:{r.text[:500]}")   # ← TEMP DEBUG LINE
+
     r.raise_for_status()
 
     try:
