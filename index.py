@@ -181,20 +181,30 @@ keyword generation/matching, Claude batch scorer, rescore processor,
 FastAPI endpoints, Mongo schemas/indexes — is preserved 100% as-is,
 byte-for-byte identical to v9.12.1. Only run_batch_processor() changed.
 =================================================================================
-INDEX.PY NOTE — CLAUDE NOW CALLED VIA RAPIDAPI, NOT THE OFFICIAL SDK
+
 =================================================================================
-The only functional change in THIS file relative to v9.12.2 is how the
-Claude scoring call is made. Previously this used the official
-`anthropic` Python SDK (anthropic_client.messages.stream(...)) talking
-directly to api.anthropic.com. In this file that call is replaced with a
-plain `requests.post()` to the RapidAPI-hosted endpoint
-"https://claude-sonnet-4-6.p.rapidapi.com/chat/completions", using the
-SAME RAPIDAPI_KEY / RapidAPI account already used elsewhere in this file
-for the SEO-keyword and Google-search RapidAPI hosts — one key, three
-RapidAPI hosts, all plain `requests` calls, nothing mixed with the
-official `anthropic` SDK anywhere. No other logic, schema, batching,
-retry, Mongo, or FastAPI behavior is changed. See _call_claude_batch()
-and _extract_text_from_rapidapi_response() below.
+v9.13 PATCH NOTE (applied per user request — ONLY these two things changed,
+everything else in this file is 100% untouched from v9.12.2) —
+
+  CHANGE 1 — LLM SCORING PROVIDER SWAPPED (Claude API -> RapidAPI GPT-5).
+    _call_claude_batch() no longer calls anthropic_client.messages.stream().
+    It now calls the RapidAPI "chatgpt-gpt5.p.rapidapi.com/ask" endpoint via
+    plain requests.post(), sending the combined system+batch prompt as the
+    "query" field, using a NEW dedicated key (CHATGPT_RAPIDAPI_KEY). The
+    function's contract (input: batch list -> output: parsed list of score
+    dicts) is unchanged, so score_batch_with_claude(), run_batch_processor(),
+    and run_rescore_processor() needed ZERO changes. Response-text extraction
+    is defensive (tries several common response shapes) since the exact
+    response schema of this third-party endpoint isn't guaranteed.
+
+  CHANGE 2 — SEPARATE RAPIDAPI KEY FOR GOOGLE SERP / RANK CALLS.
+    search_google_for_keyword() and fetch_google_rank() (both call the
+    google-search116.p.rapidapi.com host) now authenticate with a NEW,
+    dedicated key: GOOGLE_RAPIDAPI_KEY. fetch_search_volume() /
+    seed_search_volume_batch() (seo-keyword-research.p.rapidapi.com host)
+    are UNTOUCHED and continue to use the original RAPIDAPI_KEY. No other
+    logic, retry behavior, schema, filtering, batching, or endpoint
+    structure changed anywhere in this file.
 =================================================================================
 """
 
@@ -211,6 +221,8 @@ import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
+import anthropic
+import httpx
 import tweepy
 import requests
 import feedparser
@@ -242,6 +254,8 @@ TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET   = os.getenv("TWITTER_API_SECRET")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
@@ -252,22 +266,25 @@ CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
 # empty, Twitter items simply get google_rank=None / search_volume=None.
 SEARCH_KEYWORD = os.getenv("SEARCH_KEYWORD", "")
 
-# ── RapidAPI — SOLE provider for Google rank, search volume, AND (in this
-# file) Claude scoring. Same key used across all three RapidAPI hosts.
-# UNTOUCHED from v9.11.1 for the keyword/search hosts.
+# ── RapidAPI — SOLE provider for search volume (seo-keyword-research host).
+# UNTOUCHED from v9.11.1.
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")  # .env boht used same key
 RAPIDAPI_KEYWORD_HOST = "seo-keyword-research.p.rapidapi.com"
 RAPIDAPI_SEARCH_HOST  = "google-search116.p.rapidapi.com"
 
-# ── Claude, via RapidAPI (replaces the official `anthropic` SDK) ───────────
-# Same RAPIDAPI_KEY as above — this is just a third RapidAPI host, called
-# with plain `requests`, exactly like RAPIDAPI_KEYWORD_HOST / RAPIDAPI_SEARCH_HOST
-# above. No official Anthropic SDK, no api.anthropic.com call, anywhere in
-# this file.
-CLAUDE_RAPIDAPI_HOST            = "claude-sonnet-4-6.p.rapidapi.com"
-CLAUDE_RAPIDAPI_URL             = f"https://{CLAUDE_RAPIDAPI_HOST}/chat/completions"
-CLAUDE_RAPIDAPI_MODEL           = "claude-sonnet-4-6"
-CLAUDE_RAPIDAPI_TIMEOUT_SECONDS = int(os.getenv("CLAUDE_RAPIDAPI_TIMEOUT_SECONDS", "120"))
+# ── NEW (v9.13) — dedicated RapidAPI key for the Google SERP / rank calls
+# (google-search116.p.rapidapi.com), kept SEPARATE from RAPIDAPI_KEY above,
+# which remains the sole key used for search-volume lookups
+# (seo-keyword-research.p.rapidapi.com). Falls back to RAPIDAPI_KEY if not
+# explicitly set, so existing single-key setups keep working.
+GOOGLE_RAPIDAPI_KEY = os.getenv("GOOGLE_RAPIDAPI_KEY", "") or RAPIDAPI_KEY
+
+# ── NEW (v9.13) — dedicated RapidAPI key for the GPT-5 scoring endpoint
+# (chatgpt-gpt5.p.rapidapi.com), used in place of the Anthropic Claude API.
+CHATGPT_RAPIDAPI_KEY = os.getenv("CHATGPT_RAPIDAPI_KEY", "")
+CHATGPT_RAPIDAPI_HOST = "chatgpt-gpt5.p.rapidapi.com"
+CHATGPT_RAPIDAPI_URL  = "https://chatgpt-gpt5.p.rapidapi.com/ask"
+CHATGPT_TIMEOUT_SECONDS = int(os.getenv("CHATGPT_TIMEOUT_SECONDS", "120"))
 
 # ── RapidAPI call timeouts — UNTOUCHED from v9.11.1.
 DATAFORSEO_SERP_TIMEOUT_SECONDS   = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
@@ -659,7 +676,7 @@ REDDIT_USER_AGENT = os.getenv(
 #                        gets retried, but not on the very next pass —
 #                        next_retry_at spaces retries out exactly like
 #                        v9.11.2's per-keyword cooldown did, just scoped to
-#                        one post_url now.
+#                        one post_url instead of one keyword now.
 REDDIT_FETCH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDDIT_FETCH_CHECK_INTERVAL_SECONDS", "30"))
 REDDIT_POST_RETRY_COOLDOWN_SECONDS  = int(os.getenv("REDDIT_POST_RETRY_COOLDOWN_SECONDS", "1800"))
 
@@ -1158,6 +1175,20 @@ def get_database():
 
 db = get_database()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ANTHROPIC CLIENT — kept for compatibility, no longer used for scoring as of
+# v9.13 (scoring now goes through the RapidAPI GPT-5 endpoint — see
+# _call_claude_batch() below). Left in place untouched since it is not one of
+# the two things requested to change.
+# ─────────────────────────────────────────────────────────────────────────────
+
+anthropic_client = anthropic.Anthropic(
+    api_key=ANTHROPIC_API_KEY,
+    http_client=httpx.Client(
+        timeout=httpx.Timeout(connect=30.0, read=None, write=60.0, pool=30.0)
+    ),
+)
+
 
 def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
     for attempt in range(1, retries + 1):
@@ -1402,7 +1433,9 @@ def mark_keyword_fetched(keyword: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SEARCH-VOLUME BATCH SEEDING — 100% UNTOUCHED from v9.11.1.
+# SEARCH-VOLUME BATCH SEEDING — 100% UNTOUCHED from v9.11.1. Still uses the
+# original RAPIDAPI_KEY (seo-keyword-research.p.rapidapi.com host) — NOT the
+# new GOOGLE_RAPIDAPI_KEY, which is only for the google-search116 SERP host.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SEARCH_VOLUME_BATCH_SIZE):
@@ -1516,8 +1549,12 @@ def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENRICHMENT — RapidAPI is the SOLE provider for Google rank + volume.
-# 100% UNTOUCHED from v9.11.1.
+# ENRICHMENT.
+#
+# v9.13 CHANGE 2: fetch_search_volume() (seo-keyword-research host) is
+# UNTOUCHED and still uses RAPIDAPI_KEY. fetch_google_rank() (google-search116
+# host) now uses the NEW, dedicated GOOGLE_RAPIDAPI_KEY instead. Nothing else
+# in either function changed.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_search_volume(search_keyword: str) -> int | None:
@@ -1587,7 +1624,8 @@ def fetch_search_volume(search_keyword: str) -> int | None:
 
 
 def fetch_google_rank(search_keyword: str) -> int | None:
-    if not RAPIDAPI_KEY or not search_keyword:
+    # v9.13 CHANGE 2: uses GOOGLE_RAPIDAPI_KEY (dedicated key), not RAPIDAPI_KEY.
+    if not GOOGLE_RAPIDAPI_KEY or not search_keyword:
         return None
     try:
         url = "https://google-search116.p.rapidapi.com/"
@@ -1595,7 +1633,7 @@ def fetch_google_rank(search_keyword: str) -> int | None:
         querystring = {"query": search_keyword}
 
         headers = {
-            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
+            "x-rapidapi-key": GOOGLE_RAPIDAPI_KEY, # .env — dedicated Google SERP key (v9.13)
             "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
             "Content-Type": "application/json"
         }
@@ -1626,17 +1664,18 @@ def fetch_google_stats(search_keyword: str) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT — SOLE discovery mechanism: RapidAPI SERP search
-# (site:reddit.com) -> real per-post rank + URL. search_google_for_keyword()
-# itself is 100% UNTOUCHED from v9.11.1 — same single RapidAPI call, same
-# independent host, same try/except. The ONLY thing that changed anywhere
-# near this function is what process_one_keyword() (further below) does
-# with its results afterward — it now SAVES them into flintel_google_posts
-# instead of immediately fetching Reddit RSS content in-line.
+# (site:reddit.com) -> real per-post rank + URL.
+#
+# v9.13 CHANGE 2: this function now authenticates with the dedicated
+# GOOGLE_RAPIDAPI_KEY instead of RAPIDAPI_KEY (same google-search116 host,
+# same query shape, same result parsing — only the key changed). Everything
+# else about what process_one_keyword() does with its results (saving into
+# flintel_google_posts instead of fetching Reddit RSS in-line) is unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK) -> list:
-    if not RAPIDAPI_KEY:
-        log.warning("[SERP] RapidAPI key not set — skipping SERP search.")
+    if not GOOGLE_RAPIDAPI_KEY:
+        log.warning("[SERP] Google RapidAPI key not set — skipping SERP search.")
         return []
 
     today = datetime.now(timezone.utc)
@@ -1651,7 +1690,7 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
         querystring = {"query": query}
 
         headers = {
-            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
+            "x-rapidapi-key": GOOGLE_RAPIDAPI_KEY, # .env — dedicated Google SERP key (v9.13)
             "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
             "Content-Type": "application/json"
         }
@@ -1720,11 +1759,10 @@ def is_post_already_signaled(post_url: str) -> bool:
 # This collection is the single source of truth for "which Reddit post_url
 # has SERP discovery found, and has it actually been Reddit-fetched yet?"
 # It is populated ONLY by save_google_post() (called from
-# process_one_keyword(), right after search_google_for_keyword() — the
-# untouched Google call — returns), and consumed ONLY by
-# run_reddit_fetch_loop() below. Neither side keeps its own separate
-# python list of subreddits/keywords/fuzzy-keywords — everything lives on
-# these documents.
+# process_one_keyword(), right after search_google_for_keyword() returns),
+# and consumed ONLY by run_reddit_fetch_loop() below. Neither side keeps its
+# own separate python list of subreddits/keywords/fuzzy-keywords — everything
+# lives on these documents.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit: str, fuzzy_keywords: list) -> bool:
@@ -1990,19 +2028,18 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NEW (v9.12) — process_one_keyword() no longer fetches Reddit at all.
-# It ONLY runs the untouched search_google_for_keyword() and immediately
-# persists every result into flintel_google_posts. Google SERP data is
-# saved and that keyword is marked done WITHOUT waiting on any Reddit
-# HTTP call whatsoever.
+# It ONLY runs search_google_for_keyword() and immediately persists every
+# result into flintel_google_posts. Google SERP data is saved and that
+# keyword is marked done WITHOUT waiting on any Reddit HTTP call whatsoever.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_one_keyword(keyword: str) -> tuple:
     """
     Full SERP-discovery work for ONE keyword that get_due_keywords() has
     flagged as due right now:
-      1. RapidAPI SERP search (site:reddit.com, last N months) — the
-         exact same untouched search_google_for_keyword() call as
-         v9.11.1.
+      1. RapidAPI SERP search (site:reddit.com, last N months) — same
+         search_google_for_keyword() call as before (now authenticated
+         with GOOGLE_RAPIDAPI_KEY as of v9.13 — see that function).
       2. For every result: generate that result's fuzzy keywords
          (generate_fuzzy_keywords(), run once here) and save it into
          flintel_google_posts via save_google_post() — insert-only, so
@@ -2219,17 +2256,18 @@ def run_reddit_fetch_loop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER — via RapidAPI (claude-sonnet-4-6.p.rapidapi.com).
+# LLM BATCH SCORER — streaming transport + partial-JSON recovery.
 #
-# This is the ONLY functionally-changed section relative to v9.12.2. The
-# official `anthropic` SDK / streaming call is gone — scoring is now a
-# plain `requests.post()` to RapidAPI, using the SAME RAPIDAPI_KEY as the
-# rest of this file's RapidAPI calls (RAPIDAPI_KEYWORD_HOST /
-# RAPIDAPI_SEARCH_HOST above). Batch construction (_build_batch_prompt),
-# JSON parsing/partial-recovery (_parse_claude_json,
-# _salvage_partial_json_array, _strip_code_fences), fallback-scoring
-# (_fallback_score), retry_with_backoff() wrapping, and everything that
-# consumes the returned `results` list are all UNCHANGED from v9.12.2.
+# v9.13 CHANGE 1: _call_claude_batch() no longer calls the Anthropic Claude
+# API. It now calls the RapidAPI GPT-5 "/ask" endpoint
+# (chatgpt-gpt5.p.rapidapi.com) via a plain requests.post(), using the NEW
+# dedicated CHATGPT_RAPIDAPI_KEY. The function's public contract is
+# unchanged (batch list in -> parsed list of score dicts out), so
+# score_batch_with_claude(), run_batch_processor(), and
+# run_rescore_processor() below needed ZERO changes — they still just call
+# score_batch_with_claude(). Prompt-building, code-fence stripping, partial-
+# JSON salvage, truncation handling, and score clamping are all UNCHANGED
+# from v9.12.2.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
@@ -2299,7 +2337,7 @@ def _salvage_partial_json_array(raw: str) -> list:
                 try:
                     objects.append(json.loads(candidate))
                 except (json.JSONDecodeError, ValueError):
-                    log.warning("[Claude-Batch] Skipped one malformed salvaged object.")
+                    log.warning("[LLM-Batch] Skipped one malformed salvaged object.")
                 obj_start = None
         i += 1
     return objects
@@ -2310,118 +2348,107 @@ def _parse_claude_json(raw: str) -> tuple:
     try:
         parsed = json.loads(cleaned)
         if not isinstance(parsed, list):
-            raise ValueError("Claude returned non-list.")
+            raise ValueError("LLM returned non-list.")
         return parsed, False
     except (json.JSONDecodeError, ValueError) as exc:
-        log.warning(f"[Claude-Batch] Full parse failed ({exc}) — attempting partial recovery.")
+        log.warning(f"[LLM-Batch] Full parse failed ({exc}) — attempting partial recovery.")
         return _salvage_partial_json_array(cleaned), True
 
 
-def _extract_text_from_rapidapi_response(result: dict) -> str:
+def _extract_gpt_rapidapi_text(data) -> str:
     """
-    Pulls the model's raw reply text out of whatever shape the RapidAPI
-    claude-sonnet-4-6 endpoint returns.
-
-    Tries, in order:
-      1. OpenAI-style: {"choices": [{"message": {"content": "..."}}]}
-         — this is the shape implied by the RapidAPI example payload
-         (POST /chat/completions, "messages": [...]).
-      2. Anthropic-native style: {"content": [{"type": "text", "text": "..."}]}
-         — in case the RapidAPI host proxies the raw Anthropic response
-         format instead.
-      3. A handful of common single-field fallbacks
-         ("response" / "output" / "result" / "text").
-
-    Raises ValueError if none of these shapes match, so
-    retry_with_backoff() in score_batch_with_claude() sees a genuine
-    failure (and retries / falls back to _fallback_score()) instead of
-    silently scoring on empty/garbage text.
+    NEW (v9.13). The chatgpt-gpt5.p.rapidapi.com/ask endpoint's exact
+    response shape isn't guaranteed the same way the Anthropic SDK's
+    was, so this defensively tries the common shapes third-party GPT
+    RapidAPI wrappers use, in order, before giving up:
+      - {"result": "..."}                              (as documented by
+                                                          the user-provided
+                                                          snippet)
+      - {"response": "..."}
+      - {"answer": "..."}
+      - {"text": "..."}
+      - {"output": "..."}
+      - {"message": "..."}
+      - {"choices": [{"message": {"content": "..."}}]}  (OpenAI-style)
+      - {"choices": [{"text": "..."}]}
+      - a bare JSON string response
+    Falls back to str(data) if nothing recognizable is found, so
+    downstream JSON parsing/salvage still gets *something* to work with
+    (and will simply fail-safe into _fallback_score() entries if that
+    text truly isn't usable).
     """
-    if not isinstance(result, dict):
-        raise ValueError(f"RapidAPI Claude response was not a JSON object: {type(result).__name__}")
+    if isinstance(data, str):
+        return data
 
-    # 1) OpenAI-style choices[0].message.content
-    choices = result.get("choices")
-    if isinstance(choices, list) and choices:
-        first = choices[0]
-        if isinstance(first, dict):
-            message = first.get("message")
-            if isinstance(message, dict) and message.get("content"):
-                return message["content"]
-            if first.get("text"):
-                return first["text"]
+    if isinstance(data, dict):
+        for key in ("result", "response", "answer", "text", "output", "message", "content"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
 
-    # 2) Anthropic-native content blocks
-    content = result.get("content")
-    if isinstance(content, list) and content:
-        texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-        if texts:
-            return "\n".join(texts)
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                msg = first.get("message")
+                if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                    return msg["content"]
+                if isinstance(first.get("text"), str):
+                    return first["text"]
 
-    # 3) Common single-field fallbacks used by some RapidAPI proxies
-    for key in ("response", "output", "result", "text"):
-        val = result.get(key)
-        if isinstance(val, str) and val.strip():
-            return val
+        data_field = data.get("data")
+        if isinstance(data_field, str) and data_field.strip():
+            return data_field
+        if isinstance(data_field, dict):
+            nested = _extract_gpt_rapidapi_text(data_field)
+            if nested:
+                return nested
 
-    raise ValueError(f"Could not find text content in RapidAPI Claude response: keys={list(result.keys())}")
+    return str(data)
 
 
 def _call_claude_batch(batch: list) -> list:
     """
-    Sends one batch of posts to Claude for scoring, via RapidAPI — a
-    plain `requests.post()` to CLAUDE_RAPIDAPI_URL, exactly mirroring
-    the RapidAPI call style already used for RAPIDAPI_KEYWORD_HOST /
-    RAPIDAPI_SEARCH_HOST elsewhere in this file (same RAPIDAPI_KEY,
-    same x-rapidapi-key / x-rapidapi-host header pattern). No streaming,
-    no official `anthropic` SDK, no api.anthropic.com call anywhere.
+    NAME KEPT AS _call_claude_batch() for zero-change compatibility with
+    score_batch_with_claude() below — as of v9.13 this calls the RapidAPI
+    GPT-5 "/ask" endpoint instead of the Anthropic Claude API.
     """
     prompt = _build_batch_prompt(batch)
+    full_query = f"{CLAUDE_SYSTEM_PROMPT}\n\nScore this batch:\n\n{prompt}"
 
-    payload = {
-        "model": CLAUDE_RAPIDAPI_MODEL,
-        "max_tokens": MAX_TOKENS,          
-        "messages": [
-            {
-                "role": "user",
-                "content": f"{CLAUDE_SYSTEM_PROMPT}\n\nScore this batch:\n\n{prompt}",
-            }
-        ],
-    }
+    payload = {"query": full_query}
     headers = {
-        "x-rapidapi-key": RAPIDAPI_KEY,  # same RapidAPI key/account as every other RapidAPI call in this file
-        "x-rapidapi-host": CLAUDE_RAPIDAPI_HOST,
-        "Content-Type": "application/json",
+        "x-rapidapi-key": CHATGPT_RAPIDAPI_KEY,
+        "x-rapidapi-host": CHATGPT_RAPIDAPI_HOST,
+        "Content-Type": "application/json"
     }
 
-    r = requests.post(
-        CLAUDE_RAPIDAPI_URL,
+    resp = requests.post(
+        CHATGPT_RAPIDAPI_URL,
         json=payload,
         headers=headers,
-        timeout=CLAUDE_RAPIDAPI_TIMEOUT_SECONDS,
+        timeout=CHATGPT_TIMEOUT_SECONDS,
     )
-    log.error(f"[DEBUG] status:{r.status_code} body:{r.text[:500]}")   # ← TEMP DEBUG LINE
-
-    r.raise_for_status()
+    resp.raise_for_status()
 
     try:
-        result = r.json()
-    except ValueError as exc:
-        raise ValueError(
-            f"[Claude-Batch] Non-JSON response from RapidAPI Claude endpoint | status:{r.status_code}"
-        ) from exc
+        data = resp.json()
+    except ValueError:
+        raw = resp.text
+    else:
+        raw = _extract_gpt_rapidapi_text(data)
 
-    raw = _extract_text_from_rapidapi_response(result).strip()
+    raw = (raw or "").strip()
 
     results, was_truncated = _parse_claude_json(raw)
 
     if was_truncated:
-        recovered = {int(r_["index"]) for r_ in results if isinstance(r_, dict) and "index" in r_}
+        recovered = {int(r["index"]) for r in results if isinstance(r, dict) and "index" in r}
         missing = sorted(set(range(1, len(batch) + 1)) - recovered)
-        log.warning(f"[Claude-Batch] PARTIAL RECOVERY | batch_size:{len(batch)} | "
+        log.warning(f"[LLM-Batch] PARTIAL RECOVERY | batch_size:{len(batch)} | "
                     f"recovered:{len(recovered)} | missing:{len(missing)}")
         log_operator_alert(
-            title="Claude Response Truncated (max_tokens) — Partial Recovery",
+            title="LLM Response Truncated/Unparseable — Partial Recovery",
             detail=f"batch_size:{len(batch)} recovered:{len(recovered)} missing:{missing[:30]}",
             level="ERROR",
         )
@@ -2429,29 +2456,29 @@ def _call_claude_batch(batch: list) -> list:
             results.append(_fallback_score(idx, "Truncated — not recovered."))
 
     if not isinstance(results, list):
-        raise ValueError("Claude returned non-list after parsing.")
+        raise ValueError("LLM returned non-list after parsing.")
 
-    for res in results:
-        res.setdefault("is_relevant", False)
-        res.setdefault("reply_draft", None)
-        res.setdefault("_is_fallback", False)
-        if res.get("intent_score", 1) < 1:
-            res["intent_score"] = 1
-        if res.get("intent_score", 1) > 100:
-            res["intent_score"] = 100
+    for r in results:
+        r.setdefault("is_relevant", False)
+        r.setdefault("reply_draft", None)
+        r.setdefault("_is_fallback", False)
+        if r.get("intent_score", 1) < 1:
+            r["intent_score"] = 1
+        if r.get("intent_score", 1) > 100:
+            r["intent_score"] = 100
 
     return results
 
 
 def score_batch_with_claude(batch: list) -> list:
-    result = retry_with_backoff(_call_claude_batch, batch, retries=3, delay=5, label="Claude-Batch")
+    result = retry_with_backoff(_call_claude_batch, batch, retries=3, delay=5, label="LLM-Batch")
     if result is None:
         log_operator_alert(
-            title="Claude API Unavailable",
+            title="LLM API Unavailable",
             detail=f"All 3 retry attempts failed for a batch of {len(batch)} items.",
             level="CRITICAL",
         )
-        return [_fallback_score(i + 1, "Claude API unavailable after 3 retries.") for i in range(len(batch))]
+        return [_fallback_score(i + 1, "LLM API unavailable after 3 retries.") for i in range(len(batch))]
     return result
 
 
@@ -2536,15 +2563,15 @@ def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: di
 # ─────────────────────────────────────────────────────────────────────────────
 # GENERIC BATCH PROCESSOR — one instance per platform queue.
 #
-# v9.12.2 PATCH (preserved as-is): remove_queue_message() is now called
-# ONLY after an item's fate is fully decided AND persisted (either
-# appended to current_batch + save_pending_batch() succeeded, or
-# genuinely dropped for a logged reason). The too-short-text drop path is
-# logged and counted in total_dropped. Batching logic, timeout/gap
-# handling, enrichment are otherwise 100% UNCHANGED — including the
-# v9.12.1 fix that skips passes_keyword_filter() for Reddit items. Only
-# the Claude call it eventually invokes (score_batch_with_claude(), via
-# RapidAPI now) changed.
+# v9.12.2 PATCH (preserved as-is): remove_queue_message() is called ONLY
+# after an item's fate is fully decided AND persisted (either appended to
+# current_batch + save_pending_batch() succeeded, or genuinely dropped for
+# a logged reason). The too-short-text drop path is logged and counted in
+# total_dropped. Batching logic, timeout/gap handling, enrichment, and the
+# LLM call are otherwise 100% UNCHANGED from v9.12.1 — including the
+# v9.12.1 fix that skips passes_keyword_filter() for Reddit items. Nothing
+# in this function changed for v9.13 (score_batch_with_claude()'s contract
+# is unchanged).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -2618,9 +2645,9 @@ def run_batch_processor(
                 # matched via a fuzzy variant rather than the complete
                 # original phrase — they never reached
                 # current_batch/save_pending_batch(), so they never showed
-                # up in flintel_pending_batch and never got scored by
-                # Claude. Twitter items are never pre-filtered upstream, so
-                # this filter still applies to them exactly as before.
+                # up in flintel_pending_batch and never got scored. Twitter
+                # items are never pre-filtered upstream, so this filter
+                # still applies to them exactly as before.
                 if platform_key != "reddit" and not passes_keyword_filter(text, keyword_filter_list):
                     total_dropped += 1
                     log.info(
@@ -2709,8 +2736,8 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR — UNCHANGED from v9.11.1 (calls score_batch_with_claude()
-# exactly as before; only that function's internals now hit RapidAPI).
+# RESCORE PROCESSOR — UNCHANGED from v9.11.1 (still calls
+# score_batch_with_claude(), whose contract is unchanged in v9.13).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_rescore_processor():
@@ -2861,25 +2888,23 @@ def poll_twitter(client: tweepy.Client):
 async def start_reddit_listener():
     """
     Reddit now runs on THREE independent threads instead of two:
-      1. SERP discovery (run_serp_discovery_loop) — untouched Google
-         call, saves results into flintel_google_posts, never waits on
-         Reddit.
-      2. Reddit fetch (run_reddit_fetch_loop) — NEW, reads
-         flintel_google_posts directly, fetches RSS, fuzzy-filters,
-         queues.
+      1. SERP discovery (run_serp_discovery_loop) — Google call (now via
+         GOOGLE_RAPIDAPI_KEY as of v9.13), saves results into
+         flintel_google_posts, never waits on Reddit.
+      2. Reddit fetch (run_reddit_fetch_loop) — reads flintel_google_posts
+         directly, fetches RSS, fuzzy-filters, queues.
       3. Batch processor (run_batch_processor) — consumes reddit_queue
-         exactly as before, with the v9.12.1/v9.12.2 fixes, and now
-         scores via the RapidAPI Claude endpoint instead of the
-         official SDK.
-    Governed entirely by REDDIT_ENABLED + RapidAPI credentials (RapidAPI
-    is required for SERP discovery; the per-post RSS fetch step itself
-    needs no credentials at all).
+         exactly as before, with the v9.12.1/v9.12.2 fixes, scoring now
+         via the RapidAPI GPT-5 endpoint (v9.13).
+    Governed entirely by REDDIT_ENABLED + GOOGLE_RAPIDAPI_KEY (required for
+    SERP discovery; the per-post RSS fetch step itself needs no
+    credentials at all).
     """
     if not REDDIT_ENABLED:
         log.warning("Reddit platform DISABLED — skipping.")
         return
-    if not RAPIDAPI_KEY:
-        log.warning("Reddit not started — RAPIDAPI_KEY not set (required for SERP discovery).")
+    if not GOOGLE_RAPIDAPI_KEY:
+        log.warning("Reddit not started — GOOGLE_RAPIDAPI_KEY not set (required for SERP discovery).")
         return
 
     resumed = load_queue_messages("reddit")
@@ -2984,11 +3009,11 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v9.12 — Reddit (SERP discovery decoupled from Reddit fetch via flintel_google_posts + Python auto-fuzzy keyword filtering) + Twitter Signal Scorer (Claude via RapidAPI)",
+    title="Flintel v9.13 — Reddit (SERP discovery decoupled from Reddit fetch via flintel_google_posts + Python auto-fuzzy keyword filtering) + Twitter Signal Scorer",
     description=(
-        "Reddit SERP discovery (RapidAPI, untouched) now saves every result "
-        "into a NEW flintel_google_posts collection (post_url + google_rank + "
-        "the exact search_keyword used + subreddit + Python auto-generated "
+        "Reddit SERP discovery now saves every result into a "
+        "flintel_google_posts collection (post_url + google_rank + the exact "
+        "search_keyword used + subreddit + Python auto-generated "
         "fuzzy_keywords) the instant it's found — Google SERP storage never "
         "waits on Reddit. A fully separate Reddit-fetch loop reads that same "
         "collection directly (no parallel python list of subreddits/keywords "
@@ -2996,19 +3021,14 @@ app = FastAPI(
         "(credential-free, smart-retry + old.reddit.com fallback, no OAuth/"
         "PRAW, no .json endpoint anywhere), filters the fetched content "
         "against that post's own stored fuzzy keywords, and — on a match — "
-        "reads search_volume from the completely untouched flintel_keywords "
-        "cache, builds the exact same item schema as before, and queues it "
-        "for Claude scoring exactly as always. flintel_keywords and all "
-        "Google-rank/SERP code are 100% unmodified from v9.11.1. Claude "
-        "scoring itself is now called via RapidAPI (claude-sonnet-4-6."
-        "p.rapidapi.com) instead of the official Anthropic SDK, using the "
-        "same RAPIDAPI_KEY as the other RapidAPI calls in this file. v9.12.1 "
-        "fixed a redundant Reddit-side re-filter in the batch processor. "
-        "v9.12.2 additionally closes an item-loss window between dequeue "
-        "and persistence, and makes the too-short-text drop path logged "
-        "and counted instead of silent."
+        "reads search_volume from the flintel_keywords cache, builds the "
+        "exact same item schema as before, and queues it for LLM scoring "
+        "exactly as always. v9.13: scoring now goes through the RapidAPI "
+        "GPT-5 /ask endpoint instead of the Anthropic Claude API, and Google "
+        "SERP/rank calls now use a dedicated GOOGLE_RAPIDAPI_KEY separate "
+        "from the search-volume RAPIDAPI_KEY."
     ),
-    version="9.12.2-rapidapi-claude",
+    version="9.13.0",
 )
 
 
@@ -3036,22 +3056,22 @@ def root():
 
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.12.2 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter; redundant batch-filter bug fixed; batch-processor item-loss window closed; Claude scoring via RapidAPI)",
+        "system":                  "FLINTEL v9.13 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter; scoring via RapidAPI GPT-5; Google SERP calls on a dedicated RapidAPI key)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
-        "reddit_status":           _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
+        "reddit_status":           _working(REDDIT_ENABLED and bool(GOOGLE_RAPIDAPI_KEY)),
         "reddit_fetch_method":     "public per-post RSS (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW, no .json endpoint anywhere",
         "twitter_enabled":         TWITTER_ENABLED,
         "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
-        "claude_provider":         "RapidAPI (claude-sonnet-4-6.p.rapidapi.com) — official Anthropic SDK not used",
-        "claude_rapidapi_configured": bool(RAPIDAPI_KEY),
         "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
         "twitter_search_keywords": len(TWITTER_SEARCH_KEYWORDS),
         "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
         "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords) — UNTOUCHED from v9.11.1",
-        "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE}) — UNTOUCHED",
+        "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE}) — UNTOUCHED, uses RAPIDAPI_KEY",
         "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} — UNTOUCHED",
+        "google_serp_rank_key":            "GOOGLE_RAPIDAPI_KEY (dedicated, v9.13) — separate from search-volume RAPIDAPI_KEY",
+        "scoring_provider":                "RapidAPI GPT-5 (chatgpt-gpt5.p.rapidapi.com/ask) — v9.13, replaces Anthropic Claude API",
         "reddit_serp_reddit_fetch_decoupled": True,
         "reddit_batch_redundant_filter_fixed": True,
         "batch_processor_item_loss_window_fixed": True,
@@ -3079,7 +3099,9 @@ def root():
         "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
         "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
         "rescore_batch_gap_s":     RESCORE_BATCH_GAP_SECONDS,
-        "rapidapi_configured":    bool(RAPIDAPI_KEY),
+        "rapidapi_search_volume_configured": bool(RAPIDAPI_KEY),
+        "rapidapi_google_serp_configured":   bool(GOOGLE_RAPIDAPI_KEY),
+        "rapidapi_chatgpt_configured":       bool(CHATGPT_RAPIDAPI_KEY),
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
         "rescore_pending":         db.signals.count_documents({"status": "pending"}),
@@ -3092,7 +3114,7 @@ def root():
         "claude_failure_routes_to_pending": True,
         "keyword_due_state_independent_of_python_list": True,
         "flintel_keywords_untouched": True,
-        "google_rank_serp_logic_untouched": True,
+        "google_rank_serp_logic_untouched_except_key": True,
         "output_schema":           "intent_score (1-100) / is_relevant / reply_draft",
     }
 
@@ -3108,15 +3130,14 @@ def health():
     return {
         "status":                  "ok",
         "mongodb":                 mongo,
-        "reddit_working":          REDDIT_ENABLED and bool(RAPIDAPI_KEY),
-        "reddit_indicator":        _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
+        "reddit_working":          REDDIT_ENABLED and bool(GOOGLE_RAPIDAPI_KEY),
+        "reddit_indicator":        _working(REDDIT_ENABLED and bool(GOOGLE_RAPIDAPI_KEY)),
         "reddit_fetch_method":     "public per-post RSS (credential-free) — no OAuth/PRAW",
         "reddit_serp_reddit_fetch_decoupled": True,
         "twitter_working":         TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN),
         "twitter_indicator":       _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
-        "claude_provider":         "RapidAPI (claude-sonnet-4-6.p.rapidapi.com)",
-        "claude_working":          bool(RAPIDAPI_KEY),
-        "claude_indicator":        _working(bool(RAPIDAPI_KEY)),
+        "scoring_provider":        "RapidAPI GPT-5",
+        "scoring_configured":      bool(CHATGPT_RAPIDAPI_KEY),
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
         "google_posts_pending_reddit_fetch": db.flintel_google_posts.count_documents({"reddit_fetched": False}),
@@ -3160,9 +3181,9 @@ def get_keywords_status():
 @app.get("/google-posts", dependencies=[Depends(verify_api_key)])
 def get_google_posts_status(reddit_fetched: bool = None, fuzzy_matched: bool = None, limit: int = 200):
     """
-    NEW (v9.12) — inspect the flintel_google_posts collection directly:
-    every Reddit post_url SERP discovery has ever found, its google_rank,
-    the search_keyword + auto-generated fuzzy_keywords it was discovered
+    Inspect the flintel_google_posts collection directly: every Reddit
+    post_url SERP discovery has ever found, its google_rank, the
+    search_keyword + auto-generated fuzzy_keywords it was discovered
     under, its subreddit, whether it's been Reddit-fetched yet
     (reddit_fetched), and — once fetched — whether its content actually
     matched the fuzzy keywords (fuzzy_matched: true/false/null).
@@ -3251,38 +3272,38 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.12.2 — REDDIT SERP-DISCOVERY / REDDIT-FETCH DECOUPLED")
-    log.info("                   VIA NEW flintel_google_posts COLLECTION +")
+    log.info("  FLINTEL v9.13 — REDDIT SERP-DISCOVERY / REDDIT-FETCH DECOUPLED")
+    log.info("                   VIA flintel_google_posts COLLECTION +")
     log.info("                   PYTHON AUTO-FUZZY KEYWORD GENERATION/FILTERING")
     log.info("                   + TWITTER SIGNAL SCORER")
-    log.info("                   (+ redundant Reddit batch-filter bug FIXED)")
-    log.info("                   (+ batch-processor item-loss window CLOSED)")
-    log.info("                   (+ Claude scoring now via RapidAPI, not the SDK)")
+    log.info("                   (+ scoring provider swapped: Claude -> RapidAPI GPT-5)")
+    log.info("                   (+ Google SERP/rank calls on a dedicated RapidAPI key)")
     log.info("=" * 70)
     log.info(f"  Client                : {CLIENT_ID}")
     log.info(f"  Platforms             : Reddit (SERP discovery + separate fetch loop) + Twitter/X")
-    log.info(f"  Reddit                : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
+    log.info(f"  Reddit                : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(GOOGLE_RAPIDAPI_KEY))}")
     log.info(f"  Reddit fetch method   : public per-post RSS only — credential-free, no OAuth/PRAW, no .json anywhere")
     log.info(f"  Reddit engagement     : RANDOM placeholder {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (upvotes/comments) — RSS has no real counts, always logged")
     log.info(f"  Twitter               : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
-    log.info(f"  Claude provider       : RapidAPI ({CLAUDE_RAPIDAPI_HOST}) | {_working(bool(RAPIDAPI_KEY))} | official anthropic SDK NOT used")
     log.info(f"  Reddit keywords       : {len(REDDIT_SEARCH_KEYWORDS)} (used ONLY to seed brand-new flintel_keywords docs)")
     log.info(f"  Twitter keywords      : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
     log.info(f"  Keyword cache         : flintel_keywords — fetch-once-forever, UNTOUCHED from v9.11.1")
-    log.info(f"  Google SERP / rank    : search_google_for_keyword() / fetch_google_rank() / fetch_search_volume() — UNTOUCHED, byte-for-byte")
-    log.info(f"  NEW collection        : flintel_google_posts — stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched")
+    log.info(f"  Google SERP / rank    : search_google_for_keyword() / fetch_google_rank() — UNCHANGED logic, now authenticate with dedicated GOOGLE_RAPIDAPI_KEY (v9.13)")
+    log.info(f"  Search-volume         : fetch_search_volume() / seed_search_volume_batch() — UNTOUCHED, still on RAPIDAPI_KEY")
+    log.info(f"  Google-posts coll.    : flintel_google_posts — stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched")
     log.info(f"  SERP -> Google-posts  : every SERP result saved immediately, does NOT wait on Reddit fetch to complete")
     log.info(f"  Reddit fetch loop     : fully separate thread, reads flintel_google_posts directly (no python list of subreddits/keywords/fuzzy-keywords kept anywhere)")
     log.info(f"  Reddit fetch interval : check every {REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | retry cooldown {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s on genuine fetch failure")
     log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time (generate_fuzzy_keywords()) — stored on the post's own document, used to filter fetched RSS content (passes_fuzzy_filter())")
-    log.info(f"  Search-volume source  : flintel_keywords cache, looked up per search_keyword at Reddit-fetch/queue time — untouched cache, untouched seeding logic")
-    log.info(f"  Batch processor fix   : Reddit items no longer re-filtered by passes_keyword_filter() against the full keyword-phrase list — fuzzy match upstream is now the sole gate for Reddit; Twitter unaffected")
+    log.info(f"  Scoring provider      : RapidAPI GPT-5 ({CHATGPT_RAPIDAPI_URL}) — replaces Anthropic Claude API (v9.13) | configured:{bool(CHATGPT_RAPIDAPI_KEY)}")
+    log.info(f"  Batch processor fix   : Reddit items no longer re-filtered by passes_keyword_filter() against the full keyword-phrase list — fuzzy match upstream is the sole gate for Reddit; Twitter unaffected")
     log.info(f"  Batch processor fix 2 : remove_queue_message() moved to AFTER an item's fate is persisted (batch save or logged drop) — closes item-loss window between dequeue and persist; short-text drops now logged + counted")
     log.info(f"  Reddit batch          : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
     log.info(f"  Twitter batch         : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
     log.info(f"  Rescore batch         : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
-    log.info(f"  Claude call style     : plain requests.post() to RapidAPI (no streaming, no anthropic SDK) | prompt: generic 1-100 relevance/visibility/engagement")
-    log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — google_rank + search_volume + Claude scoring, ONE key across three hosts)")
+    log.info(f"  RapidAPI search-volume key : {bool(RAPIDAPI_KEY)} (seo-keyword-research host, UNTOUCHED)")
+    log.info(f"  RapidAPI Google SERP key   : {bool(GOOGLE_RAPIDAPI_KEY)} (google-search116 host, DEDICATED key, v9.13)")
+    log.info(f"  RapidAPI ChatGPT-5 key     : {bool(CHATGPT_RAPIDAPI_KEY)} (chatgpt-gpt5 host, scoring, v9.13)")
     log.info(f"  Telegram              : REMOVED")
     log.info(f"  Reddit .json endpoint : REMOVED (never used — RSS only)")
     log.info(f"  Reddit OAuth/PRAW     : REMOVED")
