@@ -306,7 +306,7 @@ RESCORE_POLL_INTERVAL     = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
 
 TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
 
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "50000"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
 
 # ── SEARCH-VOLUME RANDOM FALLBACK CONFIG — UNTOUCHED from v9.11.1. ─────────
 SEARCH_VOLUME_RANDOM_FALLBACK_MIN = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MIN", "300"))
@@ -2429,16 +2429,46 @@ def _call_claude_batch(batch: list) -> list:
         headers=headers,
         timeout=CHATGPT_TIMEOUT_SECONDS,
     )
+
+    # DEBUG (v9.13.1) — log status + a preview of the raw HTTP body BEFORE
+    # any parsing is attempted, so a bad/empty/error response is visible in
+    # the logs immediately instead of only surfacing as an opaque
+    # "Expecting value: line 1 column 1 (char 0)" JSON error further down.
+    log.info(
+        f"[LLM-Batch] RapidAPI GPT-5 response | status:{resp.status_code} | "
+        f"content-type:{resp.headers.get('Content-Type')} | "
+        f"body_len:{len(resp.content)} | body_preview:{resp.text[:500]!r}"
+    )
+
     resp.raise_for_status()
 
     try:
         data = resp.json()
     except ValueError:
+        log.warning(
+            f"[LLM-Batch] RapidAPI GPT-5 response was not valid JSON — "
+            f"falling back to raw response text (len:{len(resp.text)})."
+        )
         raw = resp.text
     else:
         raw = _extract_gpt_rapidapi_text(data)
+        if not (raw or "").strip():
+            log.warning(
+                f"[LLM-Batch] Could not extract usable text from RapidAPI GPT-5 "
+                f"JSON response — got type:{type(data).__name__} | "
+                f"keys:{list(data.keys()) if isinstance(data, dict) else 'n/a'} | "
+                f"full_response:{json.dumps(data, ensure_ascii=False)[:1000]!r}"
+            )
 
     raw = (raw or "").strip()
+
+    if not raw:
+        log.error(
+            "[LLM-Batch] RapidAPI GPT-5 returned no usable text at all — "
+            "treating this as a hard failure for this batch (will retry via "
+            "retry_with_backoff)."
+        )
+        raise ValueError("RapidAPI GPT-5 returned empty/unusable response text.")
 
     results, was_truncated = _parse_claude_json(raw)
 
