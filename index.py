@@ -1,22 +1,96 @@
 """
-FLINTEL v9.13 — Reddit (SERP Discovery decoupled from Reddit fetch via a
-                NEW flintel_google_posts collection + Python auto-fuzzy
-                keyword generation/filtering)
+FLINTEL v9.12 — Reddit (SERP Discovery, FETCH-ONCE-FOREVER KEYWORD CACHE
+                + BATCHED SEARCH-VOLUME PRE-SEEDING)
                 + Twitter/X Signal Scorer
 =================================================================================
-Platforms : Reddit — RapidAPI SERP discovery (Google search, site:reddit.com,
-            real per-post rank) -> NEW flintel_google_posts collection ->
-            SEPARATE Reddit-fetch loop (public per-post RSS feed, smart-retry,
-            no credentials required, fuzzy-keyword content filter)
-          + Twitter (tweepy v2)
+Platforms : Reddit — RapidAPI SERP discovery ONLY (Google search,
+            site:reddit.com, real per-post rank -> flintel_google_posts cache
+            -> subreddit RSS polling + fuzzy-keyword + URL-match confirmation,
+            no credentials required)
+          + Twitter/X (tweepy v2)
 
 =================================================================================
-NOTE ON THIS BUILD — scoring provider is Anthropic's Claude API, using the
-Claude Haiku 4.5 model (model string: claude-haiku-4-5-20251001). All other
-logic in this file (SERP discovery, the flintel_google_posts decoupling,
-fuzzy-keyword generation/filtering, the flintel_keywords fetch-once-forever
-cache, batching, dedup, retry/cooldown handling, FastAPI endpoints, Mongo
-schemas/indexes, Twitter polling) is preserved exactly as-is.
+WHAT CHANGED IN THIS BUILD (v9.12) — REDDIT PER-POST FETCH DECOUPLED FROM
+SERP DISCOVERY VIA A NEW flintel_google_posts CACHE + AUTO-GENERATED FUZZY
+KEYWORDS + SUBREDDIT-RSS MATCHING. flintel_keywords, THE SEARCH-VOLUME
+SEEDING LOGIC, AND THE GOOGLE-RANK/SERP CALL ARE 100% UNTOUCHED.
+=================================================================================
+
+  ISSUE (confirmed, not a code bug elsewhere): Reddit's public, anonymous
+    per-post RSS fetch (post_url + ".rss") was called SYNCHRONOUSLY right
+    inside SERP discovery (process_one_keyword()) for every single
+    discovered post_url, one at a time, immediately after the Google SERP
+    call returned. This meant: (a) SERP discovery (which is cheap and
+    reliable — its own RapidAPI host) was throttled by however slow/
+    unreliable Reddit's anonymous RSS endpoint happened to be for a given
+    IP that day, and (b) a keyword could only be marked fetched=True once
+    EVERY discovered post's Reddit RSS fetch had been attempted, tying the
+    keyword-cache's "done" state to Reddit's fetch reliability instead of
+    to the SERP discovery step alone.
+
+  FIX — Reddit per-post fetching is now fully decoupled from SERP
+    discovery via a NEW collection, flintel_google_posts:
+
+      1. process_one_keyword() (SERP discovery) NO LONGER calls
+         fetch_reddit_post_by_url() at all. Instead, for every Google SERP
+         result belonging to a due keyword, it:
+           - extracts the subreddit name from the post_url
+           - auto-generates 6-7 "fuzzy keywords" from the matched Google
+             search keyword (deterministic, smart word-combination based —
+             see generate_fuzzy_keywords()) so a later RSS-based matching
+             pass can recognize related posts by text even without
+             depending on Reddit's per-post endpoint
+           - stores ONE document in flintel_google_posts:
+               {post_url, google_rank, matched_keyword, fuzzy_keywords,
+                subreddit, fetched: False, created_at}
+         This save happens immediately and does NOT wait on any Reddit
+         fetch — SERP discovery's throughput is now independent of
+         Reddit's RSS reliability entirely.
+
+      2. A brand-new, fully independent background thread
+         (run_google_posts_rss_matching_loop()) is the ONLY place that
+         talks to Reddit's RSS feeds now. It:
+           - reads flintel_google_posts directly (NOT any python list) for
+             every DISTINCT subreddit that still has fetched=False
+             documents
+           - polls that subreddit's public, credential-free
+             https://www.reddit.com/r/<subreddit>/new.rss feed (same
+             smart-retry + old.reddit.com fallback host logic as before)
+           - for every RSS entry, checks it against the pending
+             flintel_google_posts documents for that subreddit by exact
+             post_url match (the authoritative signal — we already know
+             this exact URL was discovered via SERP) and cross-references
+             the entry's title/text against that document's stored
+             fuzzy_keywords purely for extra traceability in the logs
+           - the instant a post_url match is found: pulls that keyword's
+             already-seeded search_volume straight off flintel_keywords
+             (read-only — NEVER re-queries the search-volume API here),
+             builds the exact same item schema as before (message_id,
+             platform, text, username, subreddit_or_channel, post_url,
+             posted_at, search_keyword, upvotes, comments,
+             engagement_is_random, google_rank, search_volume,
+             search_volume_is_random), pushes it into reddit_queue +
+             save_queue_message(), and marks that flintel_google_posts
+             document fetched=True — permanently, same fetch-once-forever
+             spirit as flintel_keywords.
+
+    flintel_keywords is NEVER written to by this new loop except for the
+    existing read-only search_volume lookup — sync_keywords_to_db(),
+    get_due_keywords(), get_keywords_missing_volume(),
+    mark_keyword_fetched(), set_keyword_retry_cooldown(),
+    seed_search_volume_batch(), search_google_for_keyword(),
+    fetch_google_rank(), fetch_search_volume() are BYTE-FOR-BYTE UNCHANGED
+    from v9.11.1. process_one_keyword() itself keeps marking a keyword
+    fetched=True once its SERP results have all been saved to
+    flintel_google_posts — that marking no longer depends on Reddit RSS
+    succeeding at all, since Reddit RSS fetching is now a fully separate,
+    later, independent stage.
+
+    Subreddits/keywords/fuzzy-keywords are NEVER stored in a python list
+    for this new stage — run_google_posts_rss_matching_loop() reads
+    flintel_google_posts directly, every single pass, exactly the way
+    flintel_keywords is read directly (no REDDIT_SEARCH_KEYWORDS-style
+    python list involved for this part at all).
 =================================================================================
 """
 
@@ -68,10 +142,6 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-# ── Claude model used for batch scoring. Haiku 4.5 — fast + cheap, a good
-# fit for this high-volume, structured-JSON-output scoring task.
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
-
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
@@ -82,23 +152,17 @@ CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
 # empty, Twitter items simply get google_rank=None / search_volume=None.
 SEARCH_KEYWORD = os.getenv("SEARCH_KEYWORD", "")
 
-# ── RapidAPI — SOLE provider for search volume (seo-keyword-research host).
-# UNTOUCHED from v9.11.1.
+# ── RapidAPI — SOLE provider for both Google rank AND search volume.
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")  # .env boht used same key
 RAPIDAPI_KEYWORD_HOST = "seo-keyword-research.p.rapidapi.com"
 RAPIDAPI_SEARCH_HOST  = "google-search116.p.rapidapi.com"
 
-# ── dedicated RapidAPI key for the Google SERP / rank calls
-# (google-search116.p.rapidapi.com), kept SEPARATE from RAPIDAPI_KEY above,
-# which remains the sole key used for search-volume lookups
-# (seo-keyword-research.p.rapidapi.com). Falls back to RAPIDAPI_KEY if not
-# explicitly set, so existing single-key setups keep working.
-GOOGLE_RAPIDAPI_KEY = os.getenv("GOOGLE_RAPIDAPI_KEY", "") or RAPIDAPI_KEY
-
-# ── RapidAPI call timeouts — UNTOUCHED from v9.11.1.
+# ── RapidAPI call timeouts — configurable so a slow keyword doesn't
+# get killed early. These are LIVE endpoint calls
+# — real-time, no polling/task-based async needed.
 DATAFORSEO_SERP_TIMEOUT_SECONDS   = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
 DATAFORSEO_VOLUME_TIMEOUT_SECONDS = int(os.getenv("DATAFORSEO_VOLUME_TIMEOUT_SECONDS", "60"))
-REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))  # used for the RSS fetch
+REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))  # used for the RSS fetch as of v9.11
 
 REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
 TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
@@ -117,31 +181,69 @@ TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
 
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
 
-# ── SEARCH-VOLUME RANDOM FALLBACK CONFIG — UNTOUCHED from v9.11.1. ─────────
+# ── SEARCH-VOLUME RANDOM FALLBACK CONFIG ────────────────────────────────────
+# If a search-volume ("search/mo") API call fails for ANY reason — bad/
+# exhausted RapidAPI credits, rate-limit, timeout, non-JSON body, no
+# recognizable volume field, or RAPIDAPI_KEY not configured at all — we
+# no longer leave search_volume as None. Instead we generate a random
+# placeholder in this range so scoring/dashboards always have a plausible
+# number instead of being dragged to the "no data" floor. This NEVER
+# overwrites a real, provider-returned value — it only ever fills in for
+# a genuine failure/absence, and every time it fires it is logged with a
+# clearly-labelled "RANDOM FALLBACK" warning naming the exact value used
+# and the reason, so it is always distinguishable from a real value in
+# the logs. This is completely independent of, and never blocks or is
+# blocked by, the separate Google-rank/SERP RapidAPI calls.
 SEARCH_VOLUME_RANDOM_FALLBACK_MIN = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MIN", "300"))
 SEARCH_VOLUME_RANDOM_FALLBACK_MAX = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MAX", "5000"))
 
 
 def _random_search_volume_fallback() -> int:
-    """UNTOUCHED from v9.11.1."""
+    """Generates one random placeholder search_volume in the configured
+    range. Pulled into its own tiny helper purely so every call site uses
+    the exact same range/behavior."""
     return random.randint(SEARCH_VOLUME_RANDOM_FALLBACK_MIN, SEARCH_VOLUME_RANDOM_FALLBACK_MAX)
 
 
-# ── REDDIT ENGAGEMENT (upvotes/comments) RANDOM FALLBACK CONFIG — UNTOUCHED.
+# ── REDDIT ENGAGEMENT (upvotes/comments) RANDOM FALLBACK CONFIG ────────────
+# Reddit's public RSS feed (used for the per-post fetch — see module
+# docstring) does NOT expose numeric upvote or comment counts — this is a
+# genuine schema limitation of the RSS format itself, not a parsing bug.
+# Since Component 3 (Engagement Signal) of the Claude scoring model needs
+# a numeric value to score against, every Reddit post confirmed via RSS
+# gets a random placeholder upvotes/comments value in this range instead
+# of None/0, using the exact same "random fallback, always logged, never
+# silently indistinguishable from a real value" pattern already used for
+# search_volume above.
 REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN", "100"))
 REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX", "3000"))
 
 
 def _random_engagement_fallback() -> int:
-    """UNTOUCHED from v9.11.1."""
+    """Generates one random placeholder upvotes/comments value in the
+    configured range. Separate helper (own range) from the search-volume
+    one above, even though the pattern is identical, so the two ranges
+    can be tuned independently."""
     return random.randint(REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN, REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX)
 
 
-# ── SERP DISCOVERY CONFIG (still the only source of NEW keywords) ───────────
-# UNTOUCHED — this Python list's ONLY job is still to seed brand-new
-# keyword documents into flintel_keywords (via sync_keywords_to_db(),
-# $setOnInsert, insert-only). Nothing about how this list is consumed
-# has changed.
+# ── SERP DISCOVERY CONFIG (Reddit's ONLY discovery mechanism now) ───────────
+# Keywords now live DIRECTLY in this Python list — no .env / os.getenv
+# involved. To add a new keyword, just add a new string to this list and
+# restart (or, if hot-reload is set up, it gets picked up on the next
+# sync pass). Everything downstream is unchanged:
+#   - sync_keywords_to_db() inserts any keyword NOT already in
+#     flintel_keywords with fetched=False, search_volume=None.
+#   - get_keywords_missing_volume() + seed_search_volume_batch() fill in
+#     search_volume for any keyword that doesn't have one yet, IN BATCHES
+#     of up to 500 keywords per DataForSEO request (never one-by-one).
+#     This looks at ALL of flintel_keywords, not just whatever happens to
+#     still be in this python list right now.
+#   - get_due_keywords() picks up only fetched=False keywords — looks at
+#     ALL of flintel_keywords, not just this python list.
+#   - mark_keyword_fetched() flips a keyword to fetched=True PERMANENTLY
+#     right after its SERP results are all saved to flintel_google_posts
+#     — it will never be re-fetched.
 REDDIT_SEARCH_KEYWORDS = [
      "best ai agent for startups",
     "best ai agent for small business",
@@ -3143,27 +3245,68 @@ REDDIT_SEARCH_KEYWORDS = [
     "comparison ai lead generation agent for startups 2026",
     "comparison ai lead generation agent in 2026",
     "comparison ai lead generation agent for remote teams"
-    
+
 ]
 
-# ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG — UNTOUCHED from v9.11.1. ──
+# ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG ─────────────────────────────
+# A keyword is fetched from DataForSEO exactly ONE time, ever. Once marked
+# fetched=True, it is PERMANENTLY skipped — no 12h/24h/whatever re-fetch,
+# no TTL expiry, nothing. This guarantees Claude/signals data is never
+# disturbed by the same keyword being re-searched and re-processed later.
+# The ONLY way a keyword gets processed again is if it is removed from
+# flintel_keywords manually (or the collection is reset).
+#
+# KEYWORD_CHECK_INTERVAL_SECONDS -> how often the loop wakes up to ask
+#                        "are there any NEW (never-fetched) keywords, or
+#                        any keyword still missing a search_volume?"
+#                        This is a cheap DB query, NOT a DataForSEO call
+#                        by itself — the (batched) DataForSEO call only
+#                        fires when there is actually something missing.
+#
+# "due" and "missing volume" are determined PURELY from flintel_keywords
+# itself (fetched=False / search_volume=None on the stored document) —
+# NOT from whether the keyword still happens to be present in the
+# REDDIT_SEARCH_KEYWORDS python list above. The python list's only job is
+# to tell sync_keywords_to_db() which brand-new keywords to INSERT
+# (insert-only, via $setOnInsert — never overwrites an existing doc).
 KEYWORD_CHECK_INTERVAL_SECONDS  = int(os.getenv("KEYWORD_CHECK_INTERVAL_SECONDS", "60"))
 
-# ── KEYWORD RETRY COOLDOWN — UNTOUCHED. Kept purely so flintel_keywords'
-# schema/behavior stays byte-for-byte identical to v9.11.1, even though
-# this specific cooldown path is no longer exercised by the SERP loop
-# now that Reddit fetching has moved out of process_one_keyword() (SERP
-# discovery no longer performs any Reddit HTTP fetch that could fail).
+# ── KEYWORD RETRY COOLDOWN (kept, unchanged from v9.11.2) ───────────────────
+# NOTE: as of v9.12, process_one_keyword() no longer fetches Reddit posts
+# itself (that now happens in the fully separate
+# run_google_posts_rss_matching_loop() below, driven off flintel_google_posts,
+# not off a per-keyword failure). This cooldown mechanism and
+# set_keyword_retry_cooldown() are kept 100% as-is for API compatibility
+# and in case of future SERP-call-level failures, but process_one_keyword()
+# no longer produces had_fetch_failure=True from a Reddit RSS failure —
+# see process_one_keyword() below for what "had_fetch_failure" means now.
 REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS = int(os.getenv("REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS", "1800"))
 
 SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "20"))
 SERP_MONTHS_BACK         = int(os.getenv("SERP_MONTHS_BACK", "6"))
 SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
 
-# ── SEARCH-VOLUME BATCH SEEDING CONFIG — UNTOUCHED. ─────────────────────────
+# ── SEARCH-VOLUME BATCH SEEDING CONFIG ──────────────────────────────────────
+# search_volume/live bills PER REQUEST, not per keyword, and accepts up to
+# 1000 keywords in a single call. We use 500 as a safe default chunk size.
 SEARCH_VOLUME_BATCH_SIZE = int(os.getenv("SEARCH_VOLUME_BATCH_SIZE", "12"))
 
-# ── TWITTER SEARCH KEYWORDS — independent from Reddit's list, unchanged ────
+# ── FLINTEL_GOOGLE_POSTS / RSS-MATCHING CONFIG (NEW in v9.12) ───────────────
+# GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS -> how often the independent
+#   Reddit-RSS-matching loop wakes up to re-read flintel_google_posts for
+#   distinct subreddits that still have fetched=False documents. This is a
+#   cheap DB query — the actual per-subreddit RSS HTTP call only fires for
+#   subreddits that genuinely have pending (fetched=False) documents.
+#
+# FUZZY_KEYWORDS_PER_POST -> how many auto-generated fuzzy keyword variants
+#   generate_fuzzy_keywords() produces per discovered Google-SERP post
+#   (6-7 by default, smart word-combination based off the matched Google
+#   search keyword — see generate_fuzzy_keywords()).
+GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS = int(os.getenv("GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS", "45"))
+FUZZY_KEYWORDS_PER_POST = int(os.getenv("FUZZY_KEYWORDS_PER_POST", "7"))
+GOOGLE_POSTS_RSS_ENTRY_LIMIT = int(os.getenv("GOOGLE_POSTS_RSS_ENTRY_LIMIT", "40"))
+
+# ── TWITTER SEARCH KEYWORDS — independent from Reddit's list, can differ ──
 TWITTER_SEARCH_KEYWORDS = [
     kw.strip() for kw in os.getenv(
         "TWITTER_SEARCH_KEYWORDS",
@@ -3174,37 +3317,21 @@ TWITTER_SEARCH_KEYWORDS = [
     ).split(",") if kw.strip()
 ]
 
-# ── REDDIT "SMART FETCH" CONFIG — v9.6 retry logic, UNCHANGED. Still used
-# by fetch_reddit_post_by_url() / _reddit_get_with_retry(), now called
-# from run_reddit_fetch_loop() instead of from the SERP loop — the retry
-# behavior itself is identical either way.
+# ── REDDIT "SMART FETCH" CONFIG — v9.6 retry logic, unchanged ──────────────
+# Governs the retry/backoff/User-Agent behaviour of _reddit_get_with_retry()
+# — used both for the per-subreddit RSS fetch (v9.12) — public,
+# credential-free, no OAuth/PRAW. Does NOT change what data is extracted or
+# where it goes — only how reliably we get a 200 instead of a 403 from
+# Reddit's public RSS feeds.
 REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
 REDDIT_FETCH_BACKOFF_BASE    = float(os.getenv("REDDIT_FETCH_BACKOFF_BASE", "2.0"))
 REDDIT_FETCH_JITTER_MIN      = float(os.getenv("REDDIT_FETCH_JITTER_MIN", "0.4"))
 REDDIT_FETCH_JITTER_MAX      = float(os.getenv("REDDIT_FETCH_JITTER_MAX", "1.6"))
+# Reddit recommends: "<platform>:<app id>:<version> (by /u/<username>)"
 REDDIT_USER_AGENT = os.getenv(
     "REDDIT_USER_AGENT",
     "python:flintel-signal-bot:v9.12 (by /u/flintel_signals)",
 )
-
-# ── flintel_google_posts CONFIG ─────────────────────────────────────────────
-# REDDIT_FETCH_CHECK_INTERVAL_SECONDS -> how often run_reddit_fetch_loop()
-#                        wakes up to ask "are there any flintel_google_posts
-#                        documents still reddit_fetched=False?" Cheap DB
-#                        query — the actual Reddit RSS HTTP fetch only fires
-#                        for posts genuinely due.
-#
-# REDDIT_POST_RETRY_COOLDOWN_SECONDS -> when a specific post_url's Reddit
-#                        RSS fetch genuinely fails (network/HTTP, retries
-#                        exhausted), it is left reddit_fetched=False so it
-#                        gets retried, but not on the very next pass —
-#                        next_retry_at spaces retries out exactly like
-#                        v9.11.2's per-keyword cooldown did, just scoped to
-#                        one post_url instead of one keyword now.
-REDDIT_FETCH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDDIT_FETCH_CHECK_INTERVAL_SECONDS", "30"))
-REDDIT_POST_RETRY_COOLDOWN_SECONDS  = int(os.getenv("REDDIT_POST_RETRY_COOLDOWN_SECONDS", "1800"))
-
-SERP_RESULTS_PER_KEYWORD = SERP_RESULTS_PER_KEYWORD  # unchanged reference kept for clarity
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API KEY AUTH (unchanged)
@@ -3243,12 +3370,24 @@ def _working(flag: bool) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC JSON FIELD-EXTRACTION HELPERS — UNTOUCHED from v9.11.1. Used ONLY
-# by the Google-rank / search-volume RapidAPI code below, which this build
-# does not modify in any way.
+# GENERIC JSON FIELD-EXTRACTION HELPERS — unchanged from v9.6.
+#
+# These exist because RapidAPI marketplace providers do NOT guarantee a
+# fixed response schema the way DataForSEO's own API does. The old code
+# assumed exact key names ("rank_absolute", "search_volume", "results")
+# and silently returned None forever when the provider used a different
+# name. _dig_value()/_dig_list() search across a list of candidate key
+# names, at the top level and one level of nesting, so a provider's real
+# field naming is found instead of guessed-and-missed.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _dig_value(obj, candidate_keys: list):
+    """
+    Searches `obj` (a dict, or a list of dicts) for the first present key
+    from `candidate_keys`, checking the top level first, then one level
+    of nested dict/list values. Returns the first match's value, or None
+    if nothing matches. Purely additive/defensive — never raises.
+    """
     if obj is None:
         return None
 
@@ -3260,10 +3399,12 @@ def _dig_value(obj, candidate_keys: list):
                 return d[key]
         return None
 
+    # top-level dict
     if isinstance(obj, dict):
         val = _try_dict(obj)
         if val is not None:
             return val
+        # one level of nesting inside any dict/list value
         for v in obj.values():
             if isinstance(v, dict):
                 val = _try_dict(v)
@@ -3276,6 +3417,7 @@ def _dig_value(obj, candidate_keys: list):
                     if val is not None:
                         return val
 
+    # top-level list of dicts (take the first element)
     elif isinstance(obj, list) and obj:
         first = obj[0]
         if isinstance(first, dict):
@@ -3287,6 +3429,14 @@ def _dig_value(obj, candidate_keys: list):
 
 
 def _dig_list(obj, candidate_list_keys: list) -> list:
+    """
+    Searches a RapidAPI JSON response for the results/organic-results
+    list, trying several common key names used across different
+    providers ("results", "organic_results", "items", "data", "items",
+    "organic", "response"). Falls back to: if `obj` itself is already a
+    list, return it as-is. Returns [] if nothing usable is found —
+    never raises.
+    """
     if isinstance(obj, list):
         return obj
     if not isinstance(obj, dict):
@@ -3296,6 +3446,7 @@ def _dig_list(obj, candidate_list_keys: list) -> list:
         if isinstance(val, list):
             return val
         if isinstance(val, dict):
+            # some providers nest one level deeper, e.g. {"data": {"results": [...]}}
             for inner_key in candidate_list_keys:
                 inner_val = val.get(inner_key)
                 if isinstance(inner_val, list):
@@ -3303,15 +3454,18 @@ def _dig_list(obj, candidate_list_keys: list) -> list:
     return []
 
 
+# Candidate field names for a per-result Google rank/position.
 RANK_FIELD_CANDIDATES = [
     "rank_absolute", "rank", "position", "google_rank",
     "serp_position", "rank_group", "index", "pos",
 ]
 
+# Candidate field names for the result-list container.
 RESULT_LIST_KEY_CANDIDATES = [
     "results", "organic_results", "organic", "items", "data", "response", "hits",
 ]
 
+# Candidate field names for monthly search volume.
 VOLUME_FIELD_CANDIDATES = [
     "search_volume", "searchVolume", "volume", "monthly_searches",
     "avg_monthly_searches", "monthlySearchVolume", "search_volume_monthly",
@@ -3328,12 +3482,8 @@ twitter_queue: queue.Queue = queue.Queue()
 
 
 def passes_keyword_filter(text: str, keywords: list) -> bool:
-    """Generic keyword gate — UNCHANGED in implementation. Still used as
-    a second-layer safety filter inside run_batch_processor() before a
-    batch is sent to Claude — but as of v9.12.1 it is only actually
-    invoked for Twitter items (see run_batch_processor() below). Reddit
-    items are pre-filtered upstream by passes_fuzzy_filter(), which is
-    the authoritative relevance check for that platform."""
+    """Generic keyword gate — takes an explicit keyword list so Reddit
+    and Twitter can be filtered against their own independent lists."""
     t = text.lower()
     for kw in keywords:
         if kw.lower() in t:
@@ -3342,102 +3492,100 @@ def passes_keyword_filter(text: str, keywords: list) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PYTHON AUTO-FUZZY-KEYWORD GENERATION + MATCHING
+# FUZZY KEYWORD GENERATION (NEW in v9.12)
 #
-# These two functions are the entire "fuzzy keyword" system requested:
-# generate_fuzzy_keywords() runs ONCE per SERP result, at save time, and
-# the resulting list is stored directly on that post's flintel_google_posts
-# document (see save_google_post() below) — nothing is regenerated later,
-# nothing is kept in a separate python list. passes_fuzzy_filter() is the
-# matcher used by run_reddit_fetch_loop() against the ACTUAL fetched RSS
-# content, using exactly the fuzzy_keywords + search_keyword already
-# stored on that one document.
+# Given the exact Google search keyword that produced a SERP result,
+# deterministically generates 6-7 "fuzzy" keyword variants using smart
+# word-combination logic — contiguous n-grams (bigrams/trigrams),
+# stopword-stripped phrases, partial (head/tail-trimmed) phrases, and
+# individually significant single words. No external NLP library is
+# needed — this is a pure, dependency-free, reproducible heuristic.
+#
+# These fuzzy keywords are stored alongside each flintel_google_posts
+# document purely for traceability / secondary text confirmation when
+# run_google_posts_rss_matching_loop() later polls that post's subreddit
+# via RSS — the AUTHORITATIVE match signal is always the exact post_url,
+# never the fuzzy keywords alone (see that function for details).
 # ─────────────────────────────────────────────────────────────────────────────
 
 _FUZZY_STOPWORDS = {
-    "a", "an", "the", "to", "for", "of", "in", "on", "my", "our", "is",
-    "are", "and", "or", "with", "from", "at", "by", "your", "their",
+    "a", "an", "the", "my", "our", "your", "their", "his", "her",
+    "to", "for", "is", "are", "was", "were", "of", "on", "in", "it",
+    "this", "that", "and", "or", "with", "at", "by", "from", "as",
+    "be", "been", "has", "have", "had", "do", "does", "did", "not",
 }
 
 
-def generate_fuzzy_keywords(search_keyword: str) -> list:
+def generate_fuzzy_keywords(keyword: str, max_variants: int = FUZZY_KEYWORDS_PER_POST) -> list:
     """
-    Python auto-generates a small set of fuzzy variants for one Google
-    search_keyword, so Reddit-fetch-time filtering isn't limited to an
-    exact-substring match against the full original phrase. This is
-    intentionally simple/deterministic (no external NLP dependency):
+    Deterministically generates up to `max_variants` fuzzy keyword
+    strings from `keyword` (the exact Google search keyword that produced
+    a given SERP result). Smart, dependency-free, word-combination based:
 
-      - the full original phrase, lowercased
-      - the phrase with stopwords stripped
-      - every individual "significant" word (len > 2, not a stopword)
-      - every consecutive significant-word bigram, in original order
-      - a naive singular/plural variant of every value above
+      - the full original phrase (lowercased)
+      - the stopword-stripped content-word phrase
+      - every contiguous bigram
+      - every contiguous trigram (if the phrase has >= 3 words)
+      - head-trimmed and tail-trimmed partial phrases
+      - individually significant single words (len > 3, not a stopword)
 
-    Called exactly once per SERP result, at save_google_post() time —
-    the result is persisted on that post's own flintel_google_posts
-    document and reused from there every time that post is considered
-    for fetching. Never regenerated on the fly, never kept in a
-    standalone python list.
+    Variants are deduplicated, then sorted so longer/more-specific
+    multi-word phrases are prioritized over single words, and finally
+    capped at `max_variants` (default 7). Never raises — falls back to
+    just the original phrase if `keyword` is empty/whitespace.
     """
-    kw = (search_keyword or "").lower().strip()
-    words = re.findall(r"[a-z0-9']+", kw)
+    if not keyword or not keyword.strip():
+        return []
+
+    original = keyword.strip().lower()
+    words = re.findall(r"[a-zA-Z0-9']+", original)
+    if not words:
+        return [original]
+
+    content_words = [w for w in words if w not in _FUZZY_STOPWORDS]
+
     variants = set()
-    if kw:
-        variants.add(kw)
+    variants.add(original)
 
-    sig_words = [w for w in words if w not in _FUZZY_STOPWORDS and len(w) > 2]
+    if content_words:
+        variants.add(" ".join(content_words))
 
-    if sig_words:
-        variants.add(" ".join(sig_words))
+    # contiguous bigrams
+    for i in range(len(words) - 1):
+        variants.add(" ".join(words[i:i + 2]))
 
-    for w in sig_words:
-        variants.add(w)
+    # contiguous trigrams
+    for i in range(len(words) - 2):
+        variants.add(" ".join(words[i:i + 3]))
 
-    for i in range(len(sig_words) - 1):
-        variants.add(f"{sig_words[i]} {sig_words[i + 1]}")
+    # head/tail-trimmed partial phrases
+    if len(words) > 1:
+        variants.add(" ".join(words[:-1]))
+        variants.add(" ".join(words[1:]))
 
-    plural_variants = set()
-    for v in variants:
-        if v.endswith("s") and len(v) > 3:
-            plural_variants.add(v[:-1])
-        else:
-            plural_variants.add(v + "s")
-    variants |= plural_variants
+    # individually significant single words
+    for w in content_words:
+        if len(w) > 3:
+            variants.add(w)
 
     variants.discard("")
-    return sorted(variants)
 
+    result = list(variants)
+    # prioritize longer, multi-word, more-specific phrases first
+    result.sort(key=lambda v: (-len(v.split()), -len(v)))
 
-def passes_fuzzy_filter(text: str, search_keyword: str, fuzzy_keywords: list) -> bool:
-    """
-    Checks fetched Reddit post text (title + summary, as produced by
-    fetch_reddit_post_by_url()) against the ORIGINAL search_keyword and
-    that post's own stored fuzzy_keywords list — both read straight off
-    the flintel_google_posts document, nothing recomputed here. Simple
-    substring containment, same style as the existing
-    passes_keyword_filter() used downstream in the batch processor.
-    """
-    if not text:
-        return False
-    t = text.lower()
-    if search_keyword and search_keyword.lower() in t:
-        return True
-    for kw in (fuzzy_keywords or []):
-        if kw and kw in t:
-            return True
-    return False
+    return result[:max_variants]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TWITTER SEARCH QUERY — built directly from TWITTER_SEARCH_KEYWORDS
-# (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_twitter_search_query() -> str:
     if not TWITTER_SEARCH_KEYWORDS:
         return (
-            "(\"international transfer\" OR \"bank blocked\" OR \"CRM is a nightmare\")"
-            " -is:retweet lang:en"
+            "(\"international transfer\" OR \"bank blocked\" OR \"we got hacked\""
+            " OR \"CRM is a nightmare\") -is:retweet lang:en"
         )
     parts = [f'"{kw}"' if " " in kw else kw for kw in TWITTER_SEARCH_KEYWORDS]
     query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
@@ -3634,7 +3782,8 @@ omit an item. Never add commentary outside the JSON array.
 # ─────────────────────────────────────────────────────────────────────────────
 # MONGODB — signals collection + persistent batch-state collections +
 # per-keyword fetch-once-forever cache collection (flintel_keywords) +
-# flintel_google_posts.
+# NEW: flintel_google_posts (SERP-discovered post_url cache, decoupled
+# from Reddit RSS fetching).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_database():
@@ -3659,35 +3808,39 @@ def get_database():
             [("platform", ASCENDING)], unique=True, name="batch_seconds_platform_unique"
         )
 
-        # ── flintel_keywords — FETCH-ONCE-FOREVER cache. UNTOUCHED
-        # collection/index definitions from v9.11.1 — this build does not
-        # modify this collection's schema, indexes, or logic in any way.
+        # ── flintel_keywords — FETCH-ONCE-FOREVER cache. UNTOUCHED in v9.12.
+        # This collection, its indexes, and every function that reads/writes
+        # it (sync_keywords_to_db, get_due_keywords, get_keywords_missing_volume,
+        # mark_keyword_fetched, set_keyword_retry_cooldown,
+        # seed_search_volume_batch) are byte-for-byte identical to v9.11.1.
         db.flintel_keywords.create_index([("keyword", ASCENDING)], unique=True, name="keyword_unique")
         db.flintel_keywords.create_index([("fetched", ASCENDING)], name="keyword_fetched_idx")
         db.flintel_keywords.create_index([("search_volume", ASCENDING)], name="keyword_volume_idx")
         db.flintel_keywords.create_index([("next_retry_at", ASCENDING)], name="keyword_retry_cooldown_idx")
 
-        # ── flintel_google_posts. One document per Reddit
-        # post_url ever surfaced by SERP discovery. Stores everything
-        # Reddit-fetch needs (post_url, google_rank, the exact
-        # search_keyword used to find it, its subreddit, and its
-        # Python-generated fuzzy_keywords) so run_reddit_fetch_loop()
-        # never has to keep its own parallel python list of any of this
-        # — it reads it straight off these documents.
+        # ── flintel_google_posts — NEW in v9.12. Stores every Google-SERP-
+        # discovered Reddit post_url the instant SERP discovery finds it —
+        # completely independent of whether/when that post's actual Reddit
+        # RSS fetch happens. One document per discovered post_url:
+        #   post_url        : the exact Reddit post URL Google SERP returned
+        #   google_rank      : the real per-post rank from that SERP call
+        #   matched_keyword  : the exact Google search keyword that produced it
+        #   fuzzy_keywords   : 6-7 auto-generated fuzzy variants of matched_keyword
+        #                      (see generate_fuzzy_keywords()) — used for extra
+        #                      text-level traceability when RSS-matching runs
+        #   subreddit        : subreddit name extracted from post_url
+        #   fetched          : False until run_google_posts_rss_matching_loop()
+        #                      confirms this exact post_url via subreddit RSS —
+        #                      then True, PERMANENTLY (fetch-once-forever, same
+        #                      spirit as flintel_keywords)
+        #   created_at       : when this document was first saved
         db.flintel_google_posts.create_index(
             [("post_url", ASCENDING)], unique=True, name="google_post_url_unique"
         )
+        db.flintel_google_posts.create_index([("fetched", ASCENDING)], name="google_post_fetched_idx")
+        db.flintel_google_posts.create_index([("subreddit", ASCENDING)], name="google_post_subreddit_idx")
         db.flintel_google_posts.create_index(
-            [("reddit_fetched", ASCENDING)], name="google_post_fetched_idx"
-        )
-        db.flintel_google_posts.create_index(
-            [("next_retry_at", ASCENDING)], name="google_post_retry_cooldown_idx"
-        )
-        db.flintel_google_posts.create_index(
-            [("subreddit", ASCENDING)], name="google_post_subreddit_idx"
-        )
-        db.flintel_google_posts.create_index(
-            [("search_keyword", ASCENDING)], name="google_post_search_keyword_idx"
+            [("subreddit", ASCENDING), ("fetched", ASCENDING)], name="google_post_subreddit_fetched_idx"
         )
 
         log.info("MongoDB connected.")
@@ -3700,7 +3853,7 @@ def get_database():
 db = get_database()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANTHROPIC CLIENT — used for batch scoring (Claude Haiku 4.5).
+# ANTHROPIC CLIENT — streaming
 # ─────────────────────────────────────────────────────────────────────────────
 
 anthropic_client = anthropic.Anthropic(
@@ -3734,7 +3887,8 @@ def log_operator_alert(title: str, detail: str, level: str = "ERROR"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PERSISTENT BATCH STATE HELPERS — UNCHANGED from v9.11.1.
+# PERSISTENT BATCH STATE HELPERS — survives process restarts, so a
+# half-filled batch never disappears.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_pending_batch(platform: str) -> tuple:
@@ -3867,13 +4021,33 @@ def clear_batch_seconds(platform: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD CACHE — flintel_keywords collection. 100% UNTOUCHED from v9.11.1
-# — every function below is byte-for-byte identical to v9.11.1. Still the
-# ONLY thing search_volume is ever sourced from (looked up by keyword from
-# run_reddit_fetch_loop() now, instead of from process_one_keyword()).
+# KEYWORD CACHE — flintel_keywords collection. 100% UNCHANGED FROM v9.11.1.
+# FETCH-ONCE-FOREVER design: each keyword gets fetched from DataForSEO
+# exactly ONE time, ever. Once fetched=True, it is PERMANENTLY skipped by
+# get_due_keywords() — no TTL, no re-due date, no 12h/24h re-fetch.
+#
+# NOTE (v9.12): "fetched=True" here now means "this keyword's Google SERP
+# results have all been saved to flintel_google_posts" — it no longer
+# means "Reddit RSS was fetched for every result" (that dependency has
+# been removed — see process_one_keyword() below). Nothing about the
+# flintel_keywords collection itself, its schema, or any function in this
+# section changed to make that true; it's a natural consequence of
+# process_one_keyword() no longer calling into Reddit's RSS at all.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sync_keywords_to_db(keywords: list):
+    """
+    Ensures every keyword currently in REDDIT_SEARCH_KEYWORDS exists in
+    flintel_keywords. Brand-new keywords are inserted with fetched=False
+    and search_volume=None (both due immediately, real-time). Keywords
+    that already exist are left completely untouched — $setOnInsert only
+    writes on first-ever insert. Safe to call every loop pass and on
+    every restart.
+
+    This is INSERT-ONLY and additive — it never deletes or hides a
+    keyword's existing document just because that keyword is no longer
+    present in `keywords`.
+    """
     now = datetime.now(timezone.utc)
     for kw in keywords:
         try:
@@ -3895,6 +4069,12 @@ def sync_keywords_to_db(keywords: list):
 
 
 def get_keywords_missing_volume(keywords: list = None) -> list:
+    """
+    Returns keyword strings whose flintel_keywords document has no
+    search_volume stored yet (missing field or explicit None both match
+    this query). Taken DIRECTLY against the full flintel_keywords
+    collection — NOT restricted to "{'keyword': {'$in': keywords}}".
+    """
     try:
         cursor = db.flintel_keywords.find(
             {"search_volume": None},
@@ -3907,6 +4087,18 @@ def get_keywords_missing_volume(keywords: list = None) -> list:
 
 
 def get_due_keywords() -> list:
+    """
+    Returns keyword docs that have NEVER been fetched yet (fetched=False).
+    Once a keyword is marked fetched=True, it is PERMANENTLY excluded from
+    this query. Taken DIRECTLY against the full flintel_keywords
+    collection — NOT restricted to the current python list.
+
+    A keyword whose Reddit RSS fetch failed also needs its "next_retry_at"
+    cooldown to have passed before it's returned here — see
+    REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS and set_keyword_retry_cooldown()
+    below. A keyword with next_retry_at unset/None (brand new, never
+    attempted) or already in the past is still due immediately.
+    """
     try:
         now = datetime.now(timezone.utc)
         cursor = db.flintel_keywords.find({
@@ -3924,6 +4116,16 @@ def get_due_keywords() -> list:
 
 
 def set_keyword_retry_cooldown(keyword: str, cooldown_seconds: int = REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS):
+    """
+    Kept 100% as-is from v9.11.2 for API compatibility. As of v9.12,
+    process_one_keyword() no longer produces a Reddit-RSS-driven
+    had_fetch_failure (that logic moved to the fully separate
+    run_google_posts_rss_matching_loop(), which operates on
+    flintel_google_posts, not on a per-keyword failure flag) — so this
+    function is not currently invoked by the SERP discovery loop, but is
+    left untouched in case any future SERP-call-level failure needs the
+    same cooldown mechanism.
+    """
     now = datetime.now(timezone.utc)
     next_retry = now + timedelta(seconds=cooldown_seconds)
     try:
@@ -3940,6 +4142,13 @@ def set_keyword_retry_cooldown(keyword: str, cooldown_seconds: int = REDDIT_KEYW
 
 
 def mark_keyword_fetched(keyword: str):
+    """
+    Flips a keyword to fetched=True — PERMANENTLY. There is no TTL and no
+    next_due_at anymore: once true, this keyword will never be picked up
+    by get_due_keywords() again, even after restarts, even after 12h,
+    24h, or any amount of time. The only way to re-process a keyword is
+    to manually reset/delete its document in flintel_keywords.
+    """
     now = datetime.now(timezone.utc)
     try:
         db.flintel_keywords.update_one(
@@ -3954,12 +4163,132 @@ def mark_keyword_fetched(keyword: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SEARCH-VOLUME BATCH SEEDING — 100% UNTOUCHED from v9.11.1. Still uses the
-# original RAPIDAPI_KEY (seo-keyword-research.p.rapidapi.com host) — NOT the
-# GOOGLE_RAPIDAPI_KEY, which is only for the google-search116 SERP host.
+# flintel_google_posts HELPERS (NEW in v9.12)
+#
+# This collection is the sole source of truth for "which Google-SERP-
+# discovered Reddit post_urls are still waiting to be confirmed via
+# subreddit RSS?" — completely independent of flintel_keywords, which
+# only tracks keyword-level SERP-discovery state.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_google_post(post_url: str, google_rank, matched_keyword: str, subreddit: str) -> bool:
+    """
+    Saves ONE newly-discovered Google-SERP result into flintel_google_posts,
+    auto-generating its fuzzy_keywords from matched_keyword. Insert-only
+    per unique post_url (unique index on post_url) — if this exact
+    post_url was already saved in a previous pass, this is a silent no-op
+    (duplicate discovery of the same URL, e.g. from a different keyword's
+    SERP results overlapping). Does NOT touch flintel_keywords. Does NOT
+    wait on or call into any Reddit endpoint — this save is immediate and
+    fully independent of Reddit's RSS reliability.
+    """
+    fuzzy = generate_fuzzy_keywords(matched_keyword, max_variants=FUZZY_KEYWORDS_PER_POST)
+    doc = {
+        "post_url":        post_url,
+        "google_rank":     google_rank,
+        "matched_keyword": matched_keyword,
+        "fuzzy_keywords":  fuzzy,
+        "subreddit":       subreddit,
+        "fetched":         False,
+        "created_at":      datetime.now(timezone.utc),
+    }
+    try:
+        db.flintel_google_posts.insert_one(doc)
+        log.info(
+            f"[GOOGLE-POSTS] SAVED | post_url:{post_url} | rank:{google_rank} | "
+            f"subreddit:r/{subreddit or '?'} | matched_keyword:{matched_keyword!r} | "
+            f"fuzzy_keywords:{fuzzy}"
+        )
+        return True
+    except DuplicateKeyError:
+        log.debug(f"[GOOGLE-POSTS] Duplicate post_url skipped (already cached): {post_url}")
+        return False
+    except Exception as exc:
+        log.error(f"[GOOGLE-POSTS] save_google_post error for {post_url}: {exc}")
+        return False
+
+
+def get_pending_google_post_subreddits() -> list:
+    """
+    Returns the list of DISTINCT subreddit names that currently have at
+    least one fetched=False document in flintel_google_posts. This is
+    read DIRECTLY off the collection every single pass — no python list
+    of subreddits is ever maintained separately.
+    """
+    try:
+        subs = db.flintel_google_posts.distinct("subreddit", {"fetched": False})
+        return [s for s in subs if s]
+    except Exception as exc:
+        log.error(f"[GOOGLE-POSTS] get_pending_google_post_subreddits error: {exc}")
+        return []
+
+
+def get_pending_google_posts_for_subreddit(subreddit: str) -> list:
+    """
+    Returns every fetched=False flintel_google_posts document for one
+    subreddit — the exact set of post_urls run_google_posts_rss_matching_loop()
+    is currently trying to confirm via that subreddit's RSS feed.
+    """
+    try:
+        return list(db.flintel_google_posts.find({"subreddit": subreddit, "fetched": False}))
+    except Exception as exc:
+        log.error(f"[GOOGLE-POSTS] get_pending_google_posts_for_subreddit error for r/{subreddit}: {exc}")
+        return []
+
+
+def mark_google_post_fetched(post_url: str):
+    """
+    Flips a flintel_google_posts document to fetched=True — PERMANENTLY,
+    same fetch-once-forever spirit as mark_keyword_fetched() above. Once
+    true, this post_url will never be returned by
+    get_pending_google_posts_for_subreddit() again.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        db.flintel_google_posts.update_one(
+            {"post_url": post_url},
+            {"$set": {"fetched": True, "fetched_at": now}},
+        )
+    except Exception as exc:
+        log.error(f"[GOOGLE-POSTS] mark_google_post_fetched error for {post_url}: {exc}")
+
+
+def get_cached_search_volume_for_keyword(keyword: str) -> tuple:
+    """
+    Read-only lookup straight off flintel_keywords for a single keyword's
+    already-seeded search_volume + search_volume_is_random flag. NEVER
+    triggers a new API call, NEVER writes to flintel_keywords — this is
+    purely a cache read used by run_google_posts_rss_matching_loop() so
+    that stage never re-queries the search-volume API itself.
+    Returns (search_volume_or_None, is_random_bool).
+    """
+    try:
+        doc = db.flintel_keywords.find_one(
+            {"keyword": keyword}, {"search_volume": 1, "search_volume_is_random": 1}
+        )
+        if not doc:
+            return None, False
+        return doc.get("search_volume"), bool(doc.get("search_volume_is_random", False))
+    except Exception as exc:
+        log.error(f"[GOOGLE-POSTS] get_cached_search_volume_for_keyword error for {keyword!r}: {exc}")
+        return None, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH-VOLUME BATCH SEEDING — 100% UNCHANGED FROM v9.11.1. chunks
+# keywords, fetches volume for each one (single.php only accepts one
+# keyword per call), writes results back onto each keyword's own
+# flintel_keywords document.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SEARCH_VOLUME_BATCH_SIZE):
+    """
+    ONE-TIME (per keyword) BATCH search-volume seeding. Splits
+    `keywords_needing_volume` into chunks of up to `batch_size` and
+    fetches volume for every keyword in the chunk. Results are written
+    back onto each keyword's own flintel_keywords document
+    (search_volume field, plus search_volume_is_random).
+    """
     if not keywords_needing_volume:
         return
     if not RAPIDAPI_KEY:
@@ -4070,15 +4399,16 @@ def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENRICHMENT.
-#
-# fetch_search_volume() (seo-keyword-research host) is UNTOUCHED and still
-# uses RAPIDAPI_KEY. fetch_google_rank() (google-search116 host) uses the
-# dedicated GOOGLE_RAPIDAPI_KEY instead. Nothing else in either function
-# changed.
+# ENRICHMENT — RapidAPI is the SOLE provider for Google rank + volume.
+# 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_search_volume(search_keyword: str) -> int | None:
+    """
+    Monthly search volume — a SINGLE keyword, single request. Kept for
+    the Twitter fallback path (fetch_google_stats(), used only when
+    SEARCH_KEYWORD is configured for Twitter items).
+    """
     if not search_keyword:
         return None
 
@@ -4145,8 +4475,11 @@ def fetch_search_volume(search_keyword: str) -> int | None:
 
 
 def fetch_google_rank(search_keyword: str) -> int | None:
-    # Uses GOOGLE_RAPIDAPI_KEY (dedicated key), not RAPIDAPI_KEY.
-    if not GOOGLE_RAPIDAPI_KEY or not search_keyword:
+    """
+    GENERIC (non-post-specific) Google rank fallback — used ONLY for
+    Twitter items. 100% UNCHANGED FROM v9.11.1.
+    """
+    if not RAPIDAPI_KEY or not search_keyword:
         return None
     try:
         url = "https://google-search116.p.rapidapi.com/"
@@ -4154,7 +4487,7 @@ def fetch_google_rank(search_keyword: str) -> int | None:
         querystring = {"query": search_keyword}
 
         headers = {
-            "x-rapidapi-key": GOOGLE_RAPIDAPI_KEY, # .env — dedicated Google SERP key
+            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
             "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
             "Content-Type": "application/json"
         }
@@ -4185,16 +4518,24 @@ def fetch_google_stats(search_keyword: str) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT — SOLE discovery mechanism: RapidAPI SERP search
-# (site:reddit.com) -> real per-post rank + URL.
-#
-# This function authenticates with the dedicated GOOGLE_RAPIDAPI_KEY. What
-# process_one_keyword() does with its results (saving into
-# flintel_google_posts instead of fetching Reddit RSS in-line) is unchanged.
+# (site:reddit.com) -> real per-post rank + URL -> flintel_google_posts
+# cache (v9.12). search_google_for_keyword() itself is 100% UNCHANGED
+# FROM v9.11.1 — it still runs unconditionally whenever a keyword is due,
+# on its own dedicated RapidAPI host, completely independent of the
+# search-volume host/call, and completely independent of Reddit's RSS
+# reliability (which now lives entirely in
+# run_google_posts_rss_matching_loop() below).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK) -> list:
-    if not GOOGLE_RAPIDAPI_KEY:
-        log.warning("[SERP] Google RapidAPI key not set — skipping SERP search.")
+    """
+    RapidAPI Google search restricted to site:reddit.com, rolling
+    last-N-months date window. Returns real per-result rank + URL. Only
+    called for keywords that get_due_keywords() has flagged as due.
+    100% UNCHANGED FROM v9.11.1.
+    """
+    if not RAPIDAPI_KEY:
+        log.warning("[SERP] RapidAPI key not set — skipping SERP search.")
         return []
 
     today = datetime.now(timezone.utc)
@@ -4209,7 +4550,7 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
         querystring = {"query": query}
 
         headers = {
-            "x-rapidapi-key": GOOGLE_RAPIDAPI_KEY, # .env — dedicated Google SERP key
+            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
             "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
             "Content-Type": "application/json"
         }
@@ -4259,9 +4600,10 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
 
 
 def is_post_already_signaled(post_url: str) -> bool:
-    """UNCHANGED — checks `signals` directly by post_url before any
-    Reddit fetch or Claude scoring happens, now consulted from
-    run_reddit_fetch_loop() instead of process_one_keyword()."""
+    """
+    Checks the `signals` collection DIRECTLY by post_url — BEFORE any
+    Reddit fetch or Claude scoring happens. 100% UNCHANGED FROM v9.11.1.
+    """
     if not post_url:
         return False
     try:
@@ -4269,342 +4611,99 @@ def is_post_already_signaled(post_url: str) -> bool:
         return existing is not None
     except Exception as exc:
         log.error(f"[DEDUP] is_post_already_signaled error for {post_url}: {exc}")
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# flintel_google_posts HELPERS
-#
-# This collection is the single source of truth for "which Reddit post_url
-# has SERP discovery found, and has it actually been Reddit-fetched yet?"
-# It is populated ONLY by save_google_post() (called from
-# process_one_keyword(), right after search_google_for_keyword() returns),
-# and consumed ONLY by run_reddit_fetch_loop() below. Neither side keeps its
-# own separate python list of subreddits/keywords/fuzzy-keywords — everything
-# lives on these documents.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit: str, fuzzy_keywords: list) -> bool:
-    """
-    Insert-only upsert (mirrors the exact same $setOnInsert pattern
-    flintel_keywords already uses) — a post_url already tracked here is
-    NEVER overwritten, so re-discovering the same URL under a different
-    keyword search later does not reset its reddit_fetched state or
-    swap out its original search_keyword/fuzzy_keywords. Returns True
-    only when this call genuinely inserted a brand-new document (used
-    purely for the "X new posts saved" log line in process_one_keyword).
-    """
-    now = datetime.now(timezone.utc)
-    try:
-        result = db.flintel_google_posts.update_one(
-            {"post_url": post_url},
-            {"$setOnInsert": {
-                "post_url":        post_url,
-                "google_rank":     google_rank,
-                "search_keyword":  search_keyword,
-                "subreddit":       subreddit,
-                "fuzzy_keywords":  fuzzy_keywords,
-                "reddit_fetched":  False,
-                "fuzzy_matched":   None,
-                "next_retry_at":   None,
-                "discovered_at":   now,
-                "fetched_at":      None,
-            }},
-            upsert=True,
-        )
-        return result.upserted_id is not None
-    except Exception as exc:
-        log.error(f"[GOOGLE-POSTS] save_google_post error for {post_url}: {exc}")
-        return False
-
-
-def get_due_google_posts() -> list:
-    """
-    Returns every flintel_google_posts document that is still
-    reddit_fetched=False AND not currently in a retry cooldown. This is
-    read DIRECTLY from Mongo every pass — run_reddit_fetch_loop() never
-    caches or mirrors this into a python list of its own; each returned
-    document already carries its own post_url, google_rank,
-    search_keyword, subreddit, and fuzzy_keywords, which is everything
-    the fetch step needs.
-    """
-    try:
-        now = datetime.now(timezone.utc)
-        cursor = db.flintel_google_posts.find({
-            "reddit_fetched": False,
-            "$or": [
-                {"next_retry_at": None},
-                {"next_retry_at": {"$exists": False}},
-                {"next_retry_at": {"$lte": now}},
-            ],
-        })
-        return list(cursor)
-    except Exception as exc:
-        log.error(f"[GOOGLE-POSTS] get_due_google_posts error: {exc}")
-        return []
-
-
-def mark_google_post_fetched(post_url: str, fuzzy_matched):
-    """
-    Flips reddit_fetched=True PERMANENTLY for this post_url — it will
-    never be re-fetched again, whether or not its content actually
-    matched the fuzzy keywords (fuzzy_matched is stored either way, for
-    later inspection via GET /google-posts). This is only called after
-    a genuinely COMPLETED fetch attempt (the RSS request itself
-    succeeded) — a real HTTP/network failure instead calls
-    set_google_post_retry_cooldown() and leaves reddit_fetched=False so
-    it is retried later.
-    """
-    now = datetime.now(timezone.utc)
-    try:
-        db.flintel_google_posts.update_one(
-            {"post_url": post_url},
-            {"$set": {
-                "reddit_fetched": True,
-                "fetched_at":     now,
-                "fuzzy_matched":  fuzzy_matched,
-            }},
-        )
-    except Exception as exc:
-        log.error(f"[GOOGLE-POSTS] mark_google_post_fetched error for {post_url}: {exc}")
-
-
-def set_google_post_retry_cooldown(post_url: str, cooldown_seconds: int = REDDIT_POST_RETRY_COOLDOWN_SECONDS):
-    """
-    Called when a specific post_url's Reddit RSS fetch genuinely failed
-    (fetch_reddit_post_by_url() returned None — retries exhausted).
-    Keeps reddit_fetched=False (it WILL be retried) but stamps
-    next_retry_at so get_due_google_posts() skips it until the cooldown
-    passes, instead of hammering the same URL on the very next
-    REDDIT_FETCH_CHECK_INTERVAL_SECONDS pass — same pacing principle as
-    v9.11.2's per-keyword cooldown, scoped to one post_url here.
-    """
-    now = datetime.now(timezone.utc)
-    next_retry = now + timedelta(seconds=cooldown_seconds)
-    try:
-        db.flintel_google_posts.update_one(
-            {"post_url": post_url},
-            {"$set": {"next_retry_at": next_retry}},
-        )
-        log.info(
-            f"[GOOGLE-POSTS] '{post_url}' cooldown set | next_retry_at:{next_retry.isoformat()} "
-            f"({cooldown_seconds}s from now) — will not be re-attempted before then"
-        )
-    except Exception as exc:
-        log.error(f"[GOOGLE-POSTS] set_google_post_retry_cooldown error for {post_url}: {exc}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# REDDIT POST FETCH — public, credential-free per-post RSS feed ONLY.
-# UNCHANGED from v9.11 in terms of retry/backoff/parsing behavior — only
-# the CALLER changed (run_reddit_fetch_loop() instead of
-# process_one_keyword()). No .json endpoint anywhere in this file.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _reddit_get_with_retry(url: str) -> requests.Response | None:
-    headers = {
-        "User-Agent": REDDIT_USER_AGENT,
-        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
-    }
-
-    last_status = None
-    for attempt in range(1, REDDIT_FETCH_MAX_RETRIES + 1):
-        time.sleep(random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX))
-        try:
-            r = requests.get(url, headers=headers, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
-            last_status = r.status_code
-            if r.status_code == 200:
-                return r
-            if r.status_code == 404:
-                log.debug(f"[REDDIT-FETCH] 404 (gone) for {url} — not retrying.")
-                return None
-            if r.status_code in (403, 429) or r.status_code >= 500:
-                wait = (REDDIT_FETCH_BACKOFF_BASE ** attempt) + random.uniform(0, 1.0)
-                log.warning(
-                    f"[REDDIT-FETCH] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
-                    f"got {r.status_code} for {url} — backing off {wait:.1f}s..."
-                )
-                time.sleep(wait)
-                continue
-            log.error(f"[REDDIT-FETCH] Unexpected status {r.status_code} for {url}")
-            return None
-        except requests.RequestException as exc:
-            log.warning(
-                f"[REDDIT-FETCH] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
-                f"network error for {url}: {exc}"
-            )
-            time.sleep((REDDIT_FETCH_BACKOFF_BASE ** attempt))
-
-    log.error(f"[REDDIT-FETCH] Reddit fetch exhausted {REDDIT_FETCH_MAX_RETRIES} attempts for {url} "
-              f"(last_status:{last_status})")
-    return None
-
-
-def _extract_reddit_submission_id(post_url: str) -> str | None:
-    match = re.search(r"/comments/([a-zA-Z0-9]+)", post_url)
-    return match.group(1) if match else None
+        return False   # fail-open: if the check itself fails, don't block discovery
 
 
 def _extract_reddit_subreddit_from_url(post_url: str) -> str:
+    """Pulls the subreddit name out of a standard reddit.com post URL
+    (e.g. reddit.com/r/<subreddit>/comments/...). Returns "" if it
+    can't be found — never raises."""
     match = re.search(r"reddit\.com/r/([^/]+)/", post_url)
     return match.group(1) if match else ""
 
 
-def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | None:
-    """
-    UNCHANGED from v9.11 — public, credential-free per-post RSS feed
-    (post_url + ".rss"), same smart-retry + old.reddit.com fallback host.
-    Engagement (upvotes/comments) is still a clearly-logged random
-    fallback (RSS exposes no real counts). Now called from
-    run_reddit_fetch_loop() instead of process_one_keyword() — the
-    function body itself is untouched.
-    """
-    if not post_url:
-        return None
-
-    primary_url = post_url.rstrip("/") + ".rss"
-    r = _reddit_get_with_retry(primary_url)
-
-    if r is None and "old.reddit.com" not in post_url:
-        fallback_url = (
-            post_url.rstrip("/")
-            .replace("https://www.reddit.com", "https://old.reddit.com")
-            .replace("https://reddit.com", "https://old.reddit.com")
-            + ".rss"
-        )
-        if fallback_url != primary_url:
-            log.info(f"[REDDIT-FETCH] Retrying via old.reddit.com fallback: {fallback_url}")
-            r = _reddit_get_with_retry(fallback_url)
-
-    if r is None:
-        log.error(f"[REDDIT-FETCH] fetch_reddit_post_by_url gave up for {post_url}")
-        return None
-
-    try:
-        feed = feedparser.parse(r.content)
-        if not feed.entries:
-            log.error(f"[REDDIT-FETCH] fetch_reddit_post_by_url: RSS feed had no entries for {post_url}")
-            return None
-
-        entry = feed.entries[0]
-
-        title = (entry.get("title", "") or "").strip()
-        raw_summary = entry.get("summary", "") or ""
-        if not raw_summary and entry.get("content"):
-            raw_summary = entry["content"][0].get("value", "") or ""
-        summary_plain = re.sub(r"<[^>]+>", " ", html.unescape(raw_summary)).strip()
-
-        text = title
-        if summary_plain and summary_plain.lower() != title.lower():
-            text = f"{title}\n\n{summary_plain}"
-
-        author = (entry.get("author", "") or "unknown").lstrip("u/").lstrip("/u/").strip() or "unknown"
-        subreddit = _extract_reddit_subreddit_from_url(post_url)
-
-        posted_at = None
-        published = entry.get("published") or entry.get("updated")
-        if published:
-            try:
-                posted_at = datetime(*entry.get("published_parsed", entry.get("updated_parsed"))[:6],
-                                      tzinfo=timezone.utc).isoformat()
-            except (TypeError, ValueError):
-                posted_at = published
-
-        submission_id = _extract_reddit_submission_id(post_url)
-        message_id = f"reddit_serp_{submission_id}" if submission_id else (
-            f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', post_url)[-40:]}"
-        )
-
-        upvotes = _random_engagement_fallback()
-        comments = _random_engagement_fallback()
-        log.warning(
-            f"[REDDIT-FETCH] RANDOM FALLBACK applied for engagement on {post_url} | "
-            f"upvotes={upvotes} comments={comments} "
-            f"(range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX}) | "
-            f"reason: Reddit's public RSS feed does not expose numeric engagement counts | "
-            f"this is NOT real, provider-returned engagement data."
-        )
-
-        return {
-            "message_id":           message_id,
-            "platform":             "reddit",
-            "text":                 text,
-            "username":             author,
-            "subreddit_or_channel": subreddit,
-            "post_url":             post_url,
-            "posted_at":            posted_at,
-            "search_keyword":       keyword,
-            "upvotes":              upvotes,
-            "comments":             comments,
-            "engagement_is_random": True,
-            "google_rank":          rank,
-            "search_volume":        None,   # filled in by run_reddit_fetch_loop() below
-        }
-    except Exception as exc:
-        log.error(f"[REDDIT-FETCH] fetch_reddit_post_by_url parse error for {post_url}: {exc}")
-        return None
+def _extract_reddit_submission_id(post_url: str) -> str | None:
+    """Pulls the submission id out of a standard reddit.com post URL
+    (e.g. .../comments/<id>/...). Used to build a stable message_id."""
+    match = re.search(r"/comments/([a-zA-Z0-9]+)", post_url)
+    return match.group(1) if match else None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# process_one_keyword() does NOT fetch Reddit at all.
-# It ONLY runs search_google_for_keyword() and immediately persists every
-# result into flintel_google_posts. Google SERP data is saved and that
-# keyword is marked done WITHOUT waiting on any Reddit HTTP call whatsoever.
-# ─────────────────────────────────────────────────────────────────────────────
+def _normalize_reddit_url(url: str) -> str:
+    """Normalizes a Reddit post URL for exact-match comparison between a
+    SERP-discovered post_url and an RSS entry's link: strips query
+    string/fragment, trailing slash, and the www./old. host prefixes."""
+    if not url:
+        return ""
+    url = url.split("?")[0].split("#")[0].rstrip("/")
+    url = url.replace("https://old.reddit.com", "https://www.reddit.com")
+    url = url.replace("https://reddit.com", "https://www.reddit.com")
+    return url.lower()
+
 
 def process_one_keyword(keyword: str) -> tuple:
     """
-    Full SERP-discovery work for ONE keyword that get_due_keywords() has
-    flagged as due right now:
-      1. RapidAPI SERP search (site:reddit.com, last N months) — same
-         search_google_for_keyword() call as before (authenticated with
-         GOOGLE_RAPIDAPI_KEY — see that function).
-      2. For every result: generate that result's fuzzy keywords
-         (generate_fuzzy_keywords(), run once here) and save it into
-         flintel_google_posts via save_google_post() — insert-only, so
-         a post_url already tracked (e.g. from a previous keyword whose
-         SERP results happened to overlap) is left completely alone.
+    v9.12: SERP-DISCOVERY-ONLY. Full discovery work for ONE keyword that
+    get_due_keywords() has flagged as due right now:
+      1. RapidAPI SERP search (site:reddit.com, last N months) — 100%
+         unchanged call (search_google_for_keyword()).
+      2. Per-result post_url dedup check -> skip posts already scored
+         (in `signals`) or already cached (in flintel_google_posts).
+      3. For every genuinely new result: extract the subreddit, and save
+         {post_url, google_rank, matched_keyword, fuzzy_keywords,
+         subreddit, fetched:False} into flintel_google_posts via
+         save_google_post(). This save is immediate — it never calls
+         into Reddit's RSS/JSON endpoints and never waits on them.
 
-    Reddit is NEVER fetched here. This keyword's SERP job is considered
-    complete the moment this function returns — Google SERP storage
-    never waits on Reddit RSS fetching, which now happens entirely on
-    its own schedule in run_reddit_fetch_loop().
-
-    Returns (results_count, new_posts_saved_count) for logging.
+    Returns (new_items_count, skipped_dupes_count, had_fetch_failure) for
+    logging AND for run_serp_discovery_loop()'s fetched=True decision.
+    had_fetch_failure is now ALWAYS False here — v9.12 fully decouples
+    Reddit RSS fetching from SERP discovery, so a keyword's SERP results
+    being saved to flintel_google_posts can never fail due to Reddit's
+    RSS reliability. (The tuple shape is kept unchanged so
+    run_serp_discovery_loop()'s existing branching logic below doesn't
+    need restructuring.)
     """
+    new_items, skipped_dupes = 0, 0
+    had_fetch_failure = False  # v9.12: Reddit RSS fetch failures can no longer occur at this stage
+
     results = search_google_for_keyword(keyword, months_back=SERP_MONTHS_BACK)
 
-    new_posts_saved = 0
     for result in results:
         post_url = result["url"]
-        subreddit = _extract_reddit_subreddit_from_url(post_url)
-        fuzzy_keywords = generate_fuzzy_keywords(keyword)
 
-        was_new = save_google_post(
+        if is_post_already_signaled(post_url):
+            skipped_dupes += 1
+            log.debug(f"[SERP] Skipping already-signaled post_url: {post_url}")
+            continue
+
+        subreddit = _extract_reddit_subreddit_from_url(post_url)
+        saved = save_google_post(
             post_url=post_url,
             google_rank=result["rank"],
-            search_keyword=keyword,
+            matched_keyword=keyword,
             subreddit=subreddit,
-            fuzzy_keywords=fuzzy_keywords,
         )
-        if was_new:
-            new_posts_saved += 1
+        if saved:
+            new_items += 1
+        else:
+            skipped_dupes += 1
+        time.sleep(0.05)  # tiny pacing between DB writes only — no external call here
 
-    return len(results), new_posts_saved
+    return new_items, skipped_dupes, had_fetch_failure
 
 
 def run_serp_discovery_loop():
     """
     Continuously polls flintel_keywords every KEYWORD_CHECK_INTERVAL_SECONDS
     for keywords that have NEVER been fetched (fetched=False), and for any
-    keyword still missing a cached search_volume (batch-seeds it) —
-    UNCHANGED behavior from v9.11.1 in every respect except one: each due
-    keyword's SERP results are now saved into flintel_google_posts by
-    process_one_keyword() instead of being fetched from Reddit in-line, so
-    there is no more had_fetch_failure concept at the keyword level —
-    mark_keyword_fetched() is now called unconditionally once
-    process_one_keyword() returns, since nothing about Reddit's
-    availability can cause this SERP step itself to "fail" anymore.
+    keyword still missing a cached search_volume (batch-seeds it). 100%
+    UNCHANGED FROM v9.11.1 in its keyword-cache behavior — the only
+    difference is what process_one_keyword() does per due keyword (see
+    that function's docstring): it now saves discovered post_urls into
+    flintel_google_posts instead of fetching each one's Reddit RSS
+    directly, so a keyword's fetched=True marking here depends only on
+    SERP discovery finishing, never on Reddit's RSS reliability.
     """
     sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
 
@@ -4620,11 +4719,13 @@ def run_serp_discovery_loop():
         f"[SERP] Discovery loop started | {len(REDDIT_SEARCH_KEYWORDS)} keyword(s) in python list | "
         f"check_interval:{KEYWORD_CHECK_INTERVAL_SECONDS}s | "
         f"months_back:{SERP_MONTHS_BACK} | depth:{SERP_RESULTS_PER_KEYWORD} | "
-        f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever (UNTOUCHED) | "
-        f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}), random fallback range "
-        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} on failure "
-        f"(UNTOUCHED) | REDDIT FETCH: fully decoupled — SERP results are only SAVED into "
-        f"flintel_google_posts here, the actual Reddit RSS fetch happens in a separate loop"
+        f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever, "
+        f"due/missing-volume read from flintel_keywords directly (not filtered by python list) | "
+        f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}) | "
+        f"random fallback range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} "
+        f"on failure/no-credits (always logged) | "
+        f"v9.12: SERP results now saved into flintel_google_posts immediately — "
+        f"Reddit RSS fetching is fully decoupled (see run_google_posts_rss_matching_loop)"
     )
 
     while True:
@@ -4640,29 +4741,30 @@ def run_serp_discovery_loop():
                 time.sleep(KEYWORD_CHECK_INTERVAL_SECONDS)
                 continue
 
-            total_results, total_new_posts = 0, 0
+            total_new, total_dupes = 0, 0
             for doc in due:
                 keyword = doc["keyword"]
-                results_count, new_posts_saved = process_one_keyword(keyword)
-                total_results += results_count
-                total_new_posts += new_posts_saved
+                new_items, dupes, had_fetch_failure = process_one_keyword(keyword)
+                total_new += new_items
+                total_dupes += dupes
 
-                # No Reddit fetch happens in this loop anymore, so there is
-                # no failure mode here to leave this keyword pending for —
-                # mark it done unconditionally, exactly as soon as its SERP
-                # results are saved into flintel_google_posts.
+                # v9.12: had_fetch_failure is always False now (see
+                # process_one_keyword docstring) — a keyword is always
+                # marked fetched=True once its SERP results are saved to
+                # flintel_google_posts, since that save no longer depends
+                # on Reddit's RSS reliability at all.
                 mark_keyword_fetched(keyword)
                 log.info(
-                    f"[SERP] '{keyword}' DONE | serp_results:{results_count} | "
-                    f"new_google_posts_saved:{new_posts_saved} | "
-                    f"marked fetched=True PERMANENTLY (Reddit fetch happens separately, "
-                    f"asynchronously, from flintel_google_posts — not waited on here)"
+                    f"[SERP] '{keyword}' DONE | new_google_posts:{new_items} skipped_dupes:{dupes} | "
+                    f"marked fetched=True PERMANENTLY — will never be re-fetched | "
+                    f"Reddit RSS confirmation for these post_urls will happen independently "
+                    f"via run_google_posts_rss_matching_loop()"
                 )
                 time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
             log.info(
                 f"[SERP] Pass complete | keywords_processed:{len(due)} | "
-                f"total_serp_results:{total_results} | new_google_posts_saved:{total_new_posts}"
+                f"new_google_posts:{total_new} | skipped_dupes:{total_dupes}"
             )
 
         except Exception as exc:
@@ -4671,119 +4773,294 @@ def run_serp_discovery_loop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# run_reddit_fetch_loop(): the entire Reddit-fetch side of
-# the pipeline, fully independent of run_serp_discovery_loop(). Reads
-# EVERYTHING it needs (post_url, google_rank, search_keyword, subreddit,
-# fuzzy_keywords) straight off flintel_google_posts documents — no
-# separate python list of subreddits/keywords/fuzzy-keywords is kept
-# anywhere in this loop.
+# REDDIT SUBREDDIT-RSS FETCH — public, credential-free /r/<subreddit>/new.rss
+# feed. Smart-retry logic (v9.6) unchanged in spirit — same User-Agent,
+# jittered backoff, old.reddit.com fallback host — just applied to a
+# subreddit's feed URL instead of a single post's .rss URL, since v9.12
+# no longer fetches one post_url at a time.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_reddit_fetch_loop():
+def _reddit_get_with_retry(url: str) -> requests.Response | None:
+    """
+    "Smart" GET wrapper for Reddit's public endpoints — retry/backoff/
+    jitter behavior kept exactly as prior versions:
+      - Reddit-recommended User-Agent format (REDDIT_USER_AGENT).
+      - Small randomized jitter delay before each attempt.
+      - Exponential backoff retry, up to REDDIT_FETCH_MAX_RETRIES times,
+        specifically for 403 / 429 / 5xx responses.
+    Returns the Response on success (status 200), or None if every
+    attempt failed.
+    """
+    headers = {
+        "User-Agent": REDDIT_USER_AGENT,
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    }
+
+    last_status = None
+    for attempt in range(1, REDDIT_FETCH_MAX_RETRIES + 1):
+        time.sleep(random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX))
+        try:
+            r = requests.get(url, headers=headers, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
+            last_status = r.status_code
+            if r.status_code == 200:
+                return r
+            if r.status_code == 404:
+                log.debug(f"[REDDIT-RSS] 404 (gone) for {url} — not retrying.")
+                return None
+            if r.status_code in (403, 429) or r.status_code >= 500:
+                wait = (REDDIT_FETCH_BACKOFF_BASE ** attempt) + random.uniform(0, 1.0)
+                log.warning(
+                    f"[REDDIT-RSS] fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
+                    f"got {r.status_code} for {url} — backing off {wait:.1f}s..."
+                )
+                time.sleep(wait)
+                continue
+            log.error(f"[REDDIT-RSS] Unexpected status {r.status_code} for {url}")
+            return None
+        except requests.RequestException as exc:
+            log.warning(
+                f"[REDDIT-RSS] fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
+                f"network error for {url}: {exc}"
+            )
+            time.sleep((REDDIT_FETCH_BACKOFF_BASE ** attempt))
+
+    log.error(f"[REDDIT-RSS] fetch exhausted {REDDIT_FETCH_MAX_RETRIES} attempts for {url} "
+              f"(last_status:{last_status})")
+    return None
+
+
+def _fetch_subreddit_rss(subreddit: str) -> list:
+    """
+    Fetches r/<subreddit>/new.rss (public, credential-free), with
+    old.reddit.com fallback host on failure — same smart-retry as the
+    prior per-post fetch, just pointed at a subreddit feed instead.
+    Returns a list of parsed feedparser entries (possibly empty).
+    """
+    primary_url = f"https://www.reddit.com/r/{subreddit}/new.rss"
+    r = _reddit_get_with_retry(primary_url)
+
+    if r is None:
+        fallback_url = f"https://old.reddit.com/r/{subreddit}/new.rss"
+        log.info(f"[REDDIT-RSS] Retrying r/{subreddit} via old.reddit.com fallback...")
+        r = _reddit_get_with_retry(fallback_url)
+
+    if r is None:
+        log.error(f"[REDDIT-RSS] Giving up on r/{subreddit} this pass — will retry next cycle.")
+        return []
+
+    try:
+        feed = feedparser.parse(r.content)
+        return feed.entries[:GOOGLE_POSTS_RSS_ENTRY_LIMIT]
+    except Exception as exc:
+        log.error(f"[REDDIT-RSS] parse error for r/{subreddit}: {exc}")
+        return []
+
+
+def _entry_to_text_and_meta(entry) -> dict:
+    """
+    Extracts text/username/posted_at from one feedparser RSS entry —
+    same extraction logic used by the prior per-post RSS fetch.
+    """
+    title = (entry.get("title", "") or "").strip()
+    raw_summary = entry.get("summary", "") or ""
+    if not raw_summary and entry.get("content"):
+        raw_summary = entry["content"][0].get("value", "") or ""
+    summary_plain = re.sub(r"<[^>]+>", " ", html.unescape(raw_summary)).strip()
+
+    text = title
+    if summary_plain and summary_plain.lower() != title.lower():
+        text = f"{title}\n\n{summary_plain}"
+
+    author = (entry.get("author", "") or "unknown").lstrip("u/").lstrip("/u/").strip() or "unknown"
+
+    posted_at = None
+    published = entry.get("published") or entry.get("updated")
+    if published:
+        try:
+            posted_at = datetime(*entry.get("published_parsed", entry.get("updated_parsed"))[:6],
+                                  tzinfo=timezone.utc).isoformat()
+        except (TypeError, ValueError):
+            posted_at = published
+
+    link = entry.get("link", "") or ""
+
+    return {"text": text, "author": author, "posted_at": posted_at, "link": link}
+
+
+def run_google_posts_rss_matching_loop():
+    """
+    NEW in v9.12 — the ONLY place in this system that talks to Reddit's
+    RSS feeds now. Fully independent of, and never blocks or is blocked
+    by, run_serp_discovery_loop() / process_one_keyword() / flintel_keywords.
+
+    Every GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS:
+      1. Reads flintel_google_posts DIRECTLY for the distinct list of
+         subreddits that still have at least one fetched=False document
+         (get_pending_google_post_subreddits()) — no python list of
+         subreddits/keywords/fuzzy-keywords is ever maintained separately;
+         this collection is the sole source of truth, read fresh every
+         pass, exactly like flintel_keywords is for SERP discovery.
+      2. For each such subreddit, fetches that subreddit's public,
+         credential-free /new.rss feed (smart-retry + old.reddit.com
+         fallback — same logic as before, just pointed at the subreddit
+         instead of a single post).
+      3. Builds a lookup of this subreddit's still-pending
+         flintel_google_posts documents keyed by NORMALIZED post_url.
+      4. For every RSS entry returned, normalizes its link and checks it
+         against that lookup. A match on post_url is the AUTHORITATIVE
+         signal — this is the exact post Google's SERP already told us
+         about, at a known rank, for a known keyword. The document's
+         stored fuzzy_keywords are cross-checked against the entry's text
+         PURELY for extra traceability in the log line below (never
+         blocking — an exact post_url match is already fully sufficient
+         confirmation).
+      5. On a match:
+           - pulls that keyword's already-seeded search_volume straight
+             off flintel_keywords via get_cached_search_volume_for_keyword()
+             (read-only — NEVER calls the search-volume API itself)
+           - generates the random engagement fallback (RSS has no real
+             upvotes/comments, same as before)
+           - builds the exact same item schema as the old per-post fetch
+             produced, pushes it into reddit_queue + save_queue_message()
+           - marks that flintel_google_posts document fetched=True,
+             permanently (mark_google_post_fetched())
+      6. Any RSS entry that does NOT match a pending post_url for that
+         subreddit is simply ignored here (it wasn't a Google-SERP-
+         discovered post we're tracking) — no separate keyword filtering
+         against a python list happens at this stage; the authoritative
+         gate is always "is this post_url one flintel_google_posts is
+         waiting to confirm?".
+    """
     log.info(
-        f"[REDDIT-FETCH] Loop started | reads directly from flintel_google_posts, "
-        f"NOT from any python list | check_interval:{REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | "
-        f"retry_cooldown:{REDDIT_POST_RETRY_COOLDOWN_SECONDS}s | "
-        f"fetch method: public per-post RSS only, credential-free "
-        f"({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback, no OAuth/PRAW) | "
-        f"search_volume for every queued item is read from the UNTOUCHED flintel_keywords cache"
+        f"[GOOGLE-POSTS-RSS] Matching loop started | check_interval:"
+        f"{GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS}s | rss_entry_limit:"
+        f"{GOOGLE_POSTS_RSS_ENTRY_LIMIT} | reads flintel_google_posts directly, "
+        f"no python list of subreddits ever maintained"
     )
 
     while True:
         try:
-            due_posts = get_due_google_posts()
-            if not due_posts:
-                time.sleep(REDDIT_FETCH_CHECK_INTERVAL_SECONDS)
+            subreddits = get_pending_google_post_subreddits()
+            if not subreddits:
+                log.debug("[GOOGLE-POSTS-RSS] No pending subreddits this pass — sleeping.")
+                time.sleep(GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS)
                 continue
 
-            log.info(f"[REDDIT-FETCH] {len(due_posts)} post(s) due for Reddit RSS fetch this pass")
+            log.info(
+                f"[GOOGLE-POSTS-RSS] Pass starting | {len(subreddits)} subreddit(s) "
+                f"with pending (fetched=False) post_url(s): {subreddits}"
+            )
 
-            queued_count, no_match_count, dupe_count, fail_count = 0, 0, 0, 0
+            total_confirmed, total_subreddits_processed = 0, 0
 
-            for doc in due_posts:
-                post_url       = doc["post_url"]
-                search_keyword = doc.get("search_keyword", "")
-                fuzzy_keywords = doc.get("fuzzy_keywords", [])
-                subreddit      = doc.get("subreddit", "")
-                google_rank    = doc.get("google_rank")
-
-                if is_post_already_signaled(post_url):
-                    mark_google_post_fetched(post_url, fuzzy_matched=None)
-                    dupe_count += 1
-                    log.info(f"[REDDIT-FETCH] SKIP (already in signals) | {post_url}")
+            for subreddit in subreddits:
+                pending_docs = get_pending_google_posts_for_subreddit(subreddit)
+                if not pending_docs:
                     continue
 
-                item = fetch_reddit_post_by_url(post_url, search_keyword, google_rank)
-                if not item:
-                    set_google_post_retry_cooldown(post_url)
-                    fail_count += 1
-                    log.warning(
-                        f"[REDDIT-FETCH] fetch FAILED (retries exhausted) | {post_url} | "
-                        f"left reddit_fetched=False — will retry after cooldown"
-                    )
-                    time.sleep(SERP_FETCH_SLEEP_SECONDS)
-                    continue
+                pending_by_url = {_normalize_reddit_url(d["post_url"]): d for d in pending_docs}
 
-                matched = passes_fuzzy_filter(item.get("text", ""), search_keyword, fuzzy_keywords)
-                if not matched:
-                    mark_google_post_fetched(post_url, fuzzy_matched=False)
-                    no_match_count += 1
-                    log.info(
-                        f"[REDDIT-FETCH] fetched OK but NO fuzzy-keyword match | {post_url} | "
-                        f"keyword:{search_keyword!r} | fuzzy_keywords_tried:{len(fuzzy_keywords)} | "
-                        f"marked reddit_fetched=True (not queued — settled 'no', won't be retried)"
-                    )
-                    time.sleep(SERP_FETCH_SLEEP_SECONDS)
-                    continue
-
-                # ── MATCH — pull search_volume from the UNTOUCHED
-                # flintel_keywords cache (already seeded by
-                # seed_search_volume_batch(), completely unmodified),
-                # stamp everything onto the item in the exact same
-                # schema as before, and queue it exactly as always.
-                kw_doc = db.flintel_keywords.find_one({"keyword": search_keyword})
-                volume = kw_doc.get("search_volume") if kw_doc else None
-                volume_is_random = kw_doc.get("search_volume_is_random", False) if kw_doc else False
-
-                item["search_volume"] = volume
-                item["search_volume_is_random"] = volume_is_random
-                item["subreddit_or_channel"] = subreddit or item.get("subreddit_or_channel", "")
-
-                reddit_queue.put(item)
-                save_queue_message("reddit", item)
-                mark_google_post_fetched(post_url, fuzzy_matched=True)
-                queued_count += 1
-
-                sv_tag = "RANDOM-FALLBACK" if volume_is_random else "real"
                 log.info(
-                    f"[REDDIT-FETCH] QUEUED | {post_url} | keyword:{search_keyword!r} | "
-                    f"subreddit:{subreddit!r} | google_rank:{google_rank} | "
-                    f"search_volume:{volume} ({sv_tag}, from flintel_keywords cache) | "
-                    f"marked reddit_fetched=True PERMANENTLY"
+                    f"[GOOGLE-POSTS-RSS] r/{subreddit} | polling RSS | "
+                    f"{len(pending_by_url)} pending post_url(s) to confirm"
                 )
+
+                entries = _fetch_subreddit_rss(subreddit)
+                total_subreddits_processed += 1
+
+                if not entries:
+                    log.warning(f"[GOOGLE-POSTS-RSS] r/{subreddit} | RSS returned no entries this pass.")
+                    time.sleep(SERP_FETCH_SLEEP_SECONDS)
+                    continue
+
+                confirmed_this_subreddit = 0
+
+                for entry in entries:
+                    meta = _entry_to_text_and_meta(entry)
+                    normalized_link = _normalize_reddit_url(meta["link"])
+                    if not normalized_link or normalized_link not in pending_by_url:
+                        continue
+
+                    doc = pending_by_url[normalized_link]
+                    post_url = doc["post_url"]
+                    matched_keyword = doc.get("matched_keyword", SEARCH_KEYWORD)
+                    fuzzy_keywords = doc.get("fuzzy_keywords", [])
+                    google_rank = doc.get("google_rank")
+
+                    fuzzy_hit = any(fk.lower() in meta["text"].lower() for fk in fuzzy_keywords) if fuzzy_keywords else False
+
+                    search_volume, sv_is_random = get_cached_search_volume_for_keyword(matched_keyword)
+
+                    upvotes = _random_engagement_fallback()
+                    comments = _random_engagement_fallback()
+
+                    submission_id = _extract_reddit_submission_id(post_url)
+                    message_id = f"reddit_serp_{submission_id}" if submission_id else (
+                        f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', post_url)[-40:]}"
+                    )
+
+                    item = {
+                        "message_id":              message_id,
+                        "platform":                "reddit",
+                        "text":                    meta["text"],
+                        "username":                meta["author"],
+                        "subreddit_or_channel":    subreddit,
+                        "post_url":                post_url,
+                        "posted_at":               meta["posted_at"],
+                        "search_keyword":          matched_keyword,
+                        "upvotes":                 upvotes,
+                        "comments":                comments,
+                        "engagement_is_random":    True,
+                        "google_rank":             google_rank,
+                        "search_volume":           search_volume,
+                        "search_volume_is_random": sv_is_random,
+                    }
+
+                    reddit_queue.put(item)
+                    save_queue_message("reddit", item)
+                    mark_google_post_fetched(post_url)
+
+                    confirmed_this_subreddit += 1
+                    total_confirmed += 1
+
+                    sv_tag = "RANDOM-FALLBACK" if sv_is_random else "real"
+                    log.info(
+                        f"[GOOGLE-POSTS-RSS] CONFIRMED via URL match | r/{subreddit} | "
+                        f"post_url:{post_url} | google_rank:{google_rank} | "
+                        f"matched_keyword:{matched_keyword!r} | fuzzy_keyword_text_hit:{fuzzy_hit} | "
+                        f"search_volume:{search_volume} ({sv_tag}, from flintel_keywords cache) | "
+                        f"upvotes:{upvotes} comments:{comments} (RANDOM-FALLBACK, RSS has no real counts) | "
+                        f"queued for Claude scoring | marked fetched=True PERMANENTLY in flintel_google_posts"
+                    )
+
+                if confirmed_this_subreddit == 0:
+                    log.info(
+                        f"[GOOGLE-POSTS-RSS] r/{subreddit} | {len(entries)} RSS entr(y/ies) checked | "
+                        f"0 matched a pending post_url this pass — will retry next cycle"
+                    )
+                else:
+                    log.info(
+                        f"[GOOGLE-POSTS-RSS] r/{subreddit} | {confirmed_this_subreddit} post_url(s) "
+                        f"confirmed and queued this pass"
+                    )
+
                 time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
             log.info(
-                f"[REDDIT-FETCH] Pass complete | due:{len(due_posts)} | queued:{queued_count} | "
-                f"no_fuzzy_match:{no_match_count} | already_signaled:{dupe_count} | "
-                f"failed_will_retry:{fail_count}"
+                f"[GOOGLE-POSTS-RSS] Pass complete | subreddits_processed:{total_subreddits_processed} | "
+                f"total_confirmed_and_queued:{total_confirmed}"
             )
 
         except Exception as exc:
-            log.error(f"[REDDIT-FETCH] loop error: {exc}")
+            log.error(f"[GOOGLE-POSTS-RSS] matching loop error: {exc}")
             time.sleep(10)
+
+        time.sleep(GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM BATCH SCORER — streaming transport + partial-JSON recovery.
-#
-# _call_claude_batch() calls the Anthropic Claude API directly, using the
-# Claude Haiku 4.5 model (CLAUDE_MODEL). The function's public contract is
-# unchanged (batch list in -> parsed list of score dicts out), so
-# score_batch_with_claude(), run_batch_processor(), and
-# run_rescore_processor() below needed ZERO changes — they still just call
-# score_batch_with_claude(). Prompt-building, code-fence stripping, partial-
-# JSON salvage, truncation handling, and score clamping are all UNCHANGED.
+# CLAUDE BATCH SCORER — streaming transport + partial-JSON recovery.
+# 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_batch_prompt(batch: list) -> str:
@@ -4822,6 +5099,7 @@ def _strip_code_fences(raw: str) -> str:
 
 
 def _salvage_partial_json_array(raw: str) -> list:
+    """Brace-depth-tracking salvage of a truncated JSON array."""
     start = raw.find("[")
     if start == -1:
         return []
@@ -4853,7 +5131,7 @@ def _salvage_partial_json_array(raw: str) -> list:
                 try:
                     objects.append(json.loads(candidate))
                 except (json.JSONDecodeError, ValueError):
-                    log.warning("[LLM-Batch] Skipped one malformed salvaged object.")
+                    log.warning("[Claude-Batch] Skipped one malformed salvaged object.")
                 obj_start = None
         i += 1
     return objects
@@ -4864,59 +5142,32 @@ def _parse_claude_json(raw: str) -> tuple:
     try:
         parsed = json.loads(cleaned)
         if not isinstance(parsed, list):
-            raise ValueError("LLM returned non-list.")
+            raise ValueError("Claude returned non-list.")
         return parsed, False
     except (json.JSONDecodeError, ValueError) as exc:
-        log.warning(f"[LLM-Batch] Full parse failed ({exc}) — attempting partial recovery.")
+        log.warning(f"[Claude-Batch] Full parse failed ({exc}) — attempting partial recovery.")
         return _salvage_partial_json_array(cleaned), True
 
 
 def _call_claude_batch(batch: list) -> list:
-    """
-    Calls the Anthropic Claude API (model: CLAUDE_MODEL, default Claude
-    Haiku 4.5) via streaming, using CLAUDE_SYSTEM_PROMPT as the system
-    prompt and the batch payload as the user message. Streams the full
-    response, then hands the raw text to the same
-    _parse_claude_json()/_salvage_partial_json_array() recovery path as
-    before.
-    """
     prompt = _build_batch_prompt(batch)
-
-    raw_chunks = []
     with anthropic_client.messages.stream(
-        model=CLAUDE_MODEL,
+        model="claude-haiku-4-5-20251001",
         max_tokens=MAX_TOKENS,
         system=CLAUDE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"Score this batch:\n\n{prompt}"}],
     ) as stream:
-        for text_chunk in stream.text_stream:
-            raw_chunks.append(text_chunk)
-        final_message = stream.get_final_message()
-
-    raw = "".join(raw_chunks).strip()
-
-    log.info(
-        f"[LLM-Batch] Claude ({CLAUDE_MODEL}) response | "
-        f"stop_reason:{getattr(final_message, 'stop_reason', None)} | "
-        f"body_len:{len(raw)} | body_preview:{raw[:500]!r}"
-    )
-
-    if not raw:
-        log.error(
-            "[LLM-Batch] Claude returned no usable text at all — treating this as a "
-            "hard failure for this batch (will retry via retry_with_backoff)."
-        )
-        raise ValueError("Claude returned empty/unusable response text.")
+        raw = stream.get_final_text().strip()
 
     results, was_truncated = _parse_claude_json(raw)
 
     if was_truncated:
         recovered = {int(r["index"]) for r in results if isinstance(r, dict) and "index" in r}
         missing = sorted(set(range(1, len(batch) + 1)) - recovered)
-        log.warning(f"[LLM-Batch] PARTIAL RECOVERY | batch_size:{len(batch)} | "
+        log.warning(f"[Claude-Batch] PARTIAL RECOVERY | batch_size:{len(batch)} | "
                     f"recovered:{len(recovered)} | missing:{len(missing)}")
         log_operator_alert(
-            title="LLM Response Truncated/Unparseable — Partial Recovery",
+            title="Claude Response Truncated (max_tokens) — Partial Recovery",
             detail=f"batch_size:{len(batch)} recovered:{len(recovered)} missing:{missing[:30]}",
             level="ERROR",
         )
@@ -4924,7 +5175,7 @@ def _call_claude_batch(batch: list) -> list:
             results.append(_fallback_score(idx, "Truncated — not recovered."))
 
     if not isinstance(results, list):
-        raise ValueError("LLM returned non-list after parsing.")
+        raise ValueError("Claude returned non-list after parsing.")
 
     for r in results:
         r.setdefault("is_relevant", False)
@@ -4939,19 +5190,19 @@ def _call_claude_batch(batch: list) -> list:
 
 
 def score_batch_with_claude(batch: list) -> list:
-    result = retry_with_backoff(_call_claude_batch, batch, retries=3, delay=5, label="LLM-Batch")
+    result = retry_with_backoff(_call_claude_batch, batch, retries=3, delay=5, label="Claude-Batch")
     if result is None:
         log_operator_alert(
-            title="LLM API Unavailable",
+            title="Claude API Unavailable",
             detail=f"All 3 retry attempts failed for a batch of {len(batch)} items.",
             level="CRITICAL",
         )
-        return [_fallback_score(i + 1, "LLM API unavailable after 3 retries.") for i in range(len(batch))]
+        return [_fallback_score(i + 1, "Claude API unavailable after 3 retries.") for i in range(len(batch))]
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE — UNCHANGED from v9.11.1.
+# MONGODB STORAGE — 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_new_signal(item: dict, score_result: dict, force_pending: bool = False) -> bool:
@@ -5030,16 +5281,7 @@ def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: di
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GENERIC BATCH PROCESSOR — one instance per platform queue.
-#
-# remove_queue_message() is called ONLY after an item's fate is fully
-# decided AND persisted (either appended to current_batch + save_pending_
-# batch() succeeded, or genuinely dropped for a logged reason). The
-# too-short-text drop path is logged and counted in total_dropped.
-# Batching logic, timeout/gap handling, enrichment, and the LLM call are
-# otherwise 100% unchanged, including the fix that skips
-# passes_keyword_filter() for Reddit items. score_batch_with_claude()'s
-# contract is unchanged, so nothing here needed to change for the scoring
-# provider swap.
+# 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch_processor(
@@ -5078,50 +5320,16 @@ def run_batch_processor(
 
             if got_item:
                 total_received += 1
-                # NOTE: remove_queue_message() is intentionally NOT called
-                # here anymore. It is now called further below, only once
-                # this item's fate (added to a persisted batch, or
-                # genuinely dropped) has been decided AND written to Mongo
-                # — so the item always exists in at least one of
-                # flintel_queue_messages / flintel_pending_batch until it
-                # is fully accounted for. This closes the item-loss window
-                # that previously existed between q.get() and
-                # save_pending_batch()/drop.
-                message_id = item.get("message_id")
+                remove_queue_message(platform_key, item.get("message_id"))
 
                 text = (item.get("text") or "").strip()
 
                 if not text or len(text) < 10:
-                    total_dropped += 1
-                    log.warning(
-                        f"[{platform_label}] DROPPED (text too short: {len(text)} char(s), "
-                        f"min 10 required) | message_id:{message_id} | "
-                        f"post_url:{item.get('post_url', '')!r}"
-                    )
-                    remove_queue_message(platform_key, message_id)
                     q.task_done()
                     continue
 
-                # Reddit items only ever reach this queue after already
-                # passing passes_fuzzy_filter() in run_reddit_fetch_loop()
-                # (matched against that post's own stored fuzzy_keywords +
-                # original search_keyword — the authoritative relevance
-                # decision for Reddit). Re-checking here against the FULL
-                # REDDIT_SEARCH_KEYWORDS phrase list (exact full-phrase
-                # substring only) was silently dropping items that had
-                # matched via a fuzzy variant rather than the complete
-                # original phrase — they never reached
-                # current_batch/save_pending_batch(), so they never showed
-                # up in flintel_pending_batch and never got scored. Twitter
-                # items are never pre-filtered upstream, so this filter
-                # still applies to them exactly as before.
-                if platform_key != "reddit" and not passes_keyword_filter(text, keyword_filter_list):
+                if not passes_keyword_filter(text, keyword_filter_list):
                     total_dropped += 1
-                    log.info(
-                        f"[{platform_label}] DROPPED (failed keyword filter) | "
-                        f"message_id:{message_id}"
-                    )
-                    remove_queue_message(platform_key, message_id)
                     q.task_done()
                     continue
 
@@ -5132,12 +5340,6 @@ def run_batch_processor(
                 current_batch.append(item)
                 save_pending_batch(platform_key, current_batch, batch_start_time)
                 save_batch_seconds(platform_key, batch_start_time)
-
-                # Only remove the item from its persistent queue-store
-                # backup AFTER save_pending_batch() has successfully
-                # written it into flintel_pending_batch — at no point in
-                # time is the item absent from both collections.
-                remove_queue_message(platform_key, message_id)
 
                 log.info(f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | u/{item.get('username')}")
                 q.task_done()
@@ -5203,8 +5405,7 @@ def run_batch_processor(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR — UNCHANGED from v9.11.1 (still calls
-# score_batch_with_claude(), whose contract is unchanged).
+# RESCORE PROCESSOR — 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_rescore_processor():
@@ -5259,7 +5460,7 @@ def run_rescore_processor():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER — UNCHANGED from v9.11.1.
+# TWITTER / X POLLER — 100% UNCHANGED FROM v9.11.1.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_twitter_client() -> tweepy.Client | None:
@@ -5354,23 +5555,23 @@ def poll_twitter(client: tweepy.Client):
 
 async def start_reddit_listener():
     """
-    Reddit runs on THREE independent threads:
-      1. SERP discovery (run_serp_discovery_loop) — Google call (via
-         GOOGLE_RAPIDAPI_KEY), saves results into flintel_google_posts,
-         never waits on Reddit.
-      2. Reddit fetch (run_reddit_fetch_loop) — reads flintel_google_posts
-         directly, fetches RSS, fuzzy-filters, queues.
-      3. Batch processor (run_batch_processor) — consumes reddit_queue
-         exactly as before, scoring via Claude Haiku 4.5.
-    Governed entirely by REDDIT_ENABLED + GOOGLE_RAPIDAPI_KEY (required for
-    SERP discovery; the per-post RSS fetch step itself needs no
-    credentials at all).
+    v9.12: Reddit now runs THREE independent threads instead of two:
+      1. SERP discovery thread (run_serp_discovery_loop) — unchanged
+         keyword-cache behavior, now saves into flintel_google_posts
+         instead of fetching Reddit RSS directly.
+      2. flintel_google_posts RSS-matching thread
+         (run_google_posts_rss_matching_loop) — NEW — the only thread
+         that talks to Reddit's RSS feeds; fully independent of #1.
+      3. Its dedicated batch processor thread (unchanged).
+    Governed entirely by REDDIT_ENABLED + RapidAPI credentials (RapidAPI
+    is required for SERP discovery; the subreddit RSS fetch step needs no
+    credentials at all — no OAuth/PRAW).
     """
     if not REDDIT_ENABLED:
         log.warning("Reddit platform DISABLED — skipping.")
         return
-    if not GOOGLE_RAPIDAPI_KEY:
-        log.warning("Reddit not started — GOOGLE_RAPIDAPI_KEY not set (required for SERP discovery).")
+    if not RAPIDAPI_KEY:
+        log.warning("Reddit not started — RAPIDAPI_KEY not set (required for SERP discovery).")
         return
 
     resumed = load_queue_messages("reddit")
@@ -5380,7 +5581,9 @@ async def start_reddit_listener():
         log.info(f"[REDDIT] Resumed {len(resumed)} queue message(s) from MongoDB after restart.")
 
     serp_thread = threading.Thread(target=run_serp_discovery_loop, daemon=True, name="Reddit-SERP")
-    fetch_thread = threading.Thread(target=run_reddit_fetch_loop, daemon=True, name="Reddit-Fetch")
+    google_posts_thread = threading.Thread(
+        target=run_google_posts_rss_matching_loop, daemon=True, name="Reddit-GooglePosts-RSS"
+    )
     btch_thread = threading.Thread(
         target=run_batch_processor,
         args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS,
@@ -5388,10 +5591,12 @@ async def start_reddit_listener():
         daemon=True, name="Reddit-Batch",
     )
     serp_thread.start()
-    fetch_thread.start()
+    google_posts_thread.start()
     btch_thread.start()
-    log.info(f"Reddit threads running: SERP-Discovery ✅ | Reddit-Fetch ✅ | Batch ✅ | "
-             f"gap:{REDDIT_BATCH_GAP_SECONDS}s | timeout:{REDDIT_BATCH_TIMEOUT_SECONDS}s")
+    log.info(
+        f"Reddit threads running: SERP-Discovery ✅ | GooglePosts-RSS-Matching ✅ | Batch ✅ | "
+        f"gap:{REDDIT_BATCH_GAP_SECONDS}s | timeout:{REDDIT_BATCH_TIMEOUT_SECONDS}s"
+    )
 
     while True:
         await asyncio.sleep(60)
@@ -5399,10 +5604,12 @@ async def start_reddit_listener():
             log.error("Reddit SERP thread died — restarting...")
             serp_thread = threading.Thread(target=run_serp_discovery_loop, daemon=True, name="Reddit-SERP")
             serp_thread.start()
-        if not fetch_thread.is_alive():
-            log.error("Reddit Fetch thread died — restarting...")
-            fetch_thread = threading.Thread(target=run_reddit_fetch_loop, daemon=True, name="Reddit-Fetch")
-            fetch_thread.start()
+        if not google_posts_thread.is_alive():
+            log.error("Reddit GooglePosts-RSS-Matching thread died — restarting...")
+            google_posts_thread = threading.Thread(
+                target=run_google_posts_rss_matching_loop, daemon=True, name="Reddit-GooglePosts-RSS"
+            )
+            google_posts_thread.start()
         if not btch_thread.is_alive():
             log.error("Reddit batch thread died — restarting...")
             btch_thread = threading.Thread(
@@ -5475,25 +5682,28 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v9.13 — Reddit (SERP discovery decoupled from Reddit fetch via flintel_google_posts + Python auto-fuzzy keyword filtering) + Twitter Signal Scorer",
+    title="Flintel v9.12 — Reddit (SERP + fetch-once-forever keyword cache + flintel_google_posts cache + fuzzy-keyword/URL-match subreddit RSS confirmation + random-fallback volume/engagement) + Twitter Signal Scorer",
     description=(
-        "Reddit SERP discovery saves every result into a flintel_google_posts "
-        "collection (post_url + google_rank + the exact search_keyword used + "
-        "subreddit + Python auto-generated fuzzy_keywords) the instant it's "
-        "found — Google SERP storage never waits on Reddit. A fully separate "
-        "Reddit-fetch loop reads that same collection directly (no parallel "
-        "python list of subreddits/keywords anywhere), fetches each due "
-        "post's public per-post RSS feed (credential-free, smart-retry + "
-        "old.reddit.com fallback, no OAuth/PRAW, no .json endpoint anywhere), "
-        "filters the fetched content against that post's own stored fuzzy "
-        "keywords, and — on a match — reads search_volume from the "
-        "flintel_keywords cache, builds the exact same item schema as "
-        "before, and queues it for LLM scoring exactly as always. Scoring "
-        "goes through the Anthropic Claude API (Claude Haiku 4.5), and "
-        "Google SERP/rank calls use a dedicated GOOGLE_RAPIDAPI_KEY separate "
-        "from the search-volume RAPIDAPI_KEY."
+        "Reddit (RapidAPI SERP discovery, fetch-once-forever keyword cache — "
+        "no re-fetch, ever, once a keyword's SERP results are cached) + "
+        "Twitter signals: monitor, score (generic 1-100 relevance/visibility/"
+        "engagement model), store. v9.12: Reddit's per-post RSS fetch is fully "
+        "decoupled from SERP discovery via a new flintel_google_posts "
+        "collection — every SERP-discovered post_url + google_rank + matched "
+        "keyword + 6-7 auto-generated fuzzy keyword variants + subreddit is "
+        "cached immediately (no wait on Reddit at all), and a fully separate "
+        "background thread reads that collection directly (never a python "
+        "list) to poll each pending subreddit's public /new.rss feed, "
+        "confirming posts by exact post_url match and pulling the matched "
+        "keyword's search_volume straight from the flintel_keywords cache "
+        "(read-only, never a new API call). flintel_keywords, the SERP call, "
+        "and the search-volume seeding logic are all 100% unchanged from "
+        "v9.11.1. Persistent batch state + queue + dedup — no in-flight item "
+        "is ever lost on restart. Streaming Claude with partial-JSON "
+        "recovery. Claude failures route to status='pending' for automatic "
+        "rescore."
     ),
-    version="9.13.0",
+    version="9.12.0",
 )
 
 
@@ -5514,47 +5724,38 @@ def root():
     random_volume_count = db.flintel_keywords.count_documents({"search_volume_is_random": True})
 
     total_google_posts = db.flintel_google_posts.count_documents({})
-    pending_reddit_fetch = db.flintel_google_posts.count_documents({"reddit_fetched": False})
-    fetched_reddit_posts = db.flintel_google_posts.count_documents({"reddit_fetched": True})
-    fuzzy_matched_posts  = db.flintel_google_posts.count_documents({"fuzzy_matched": True})
-    fuzzy_no_match_posts = db.flintel_google_posts.count_documents({"fuzzy_matched": False})
+    pending_google_posts = db.flintel_google_posts.count_documents({"fetched": False})
+    confirmed_google_posts = db.flintel_google_posts.count_documents({"fetched": True})
+    pending_subreddits = db.flintel_google_posts.distinct("subreddit", {"fetched": False})
 
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.13 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter; scoring via Claude Haiku 4.5; Google SERP calls on a dedicated RapidAPI key)",
+        "system":                  "FLINTEL v9.12.0 (Reddit SERP + fetch-once-forever keyword cache + flintel_google_posts cache + fuzzy-keyword/URL-match RSS confirmation + random-fallback volume/engagement + Twitter)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit", "twitter"],
         "reddit_enabled":          REDDIT_ENABLED,
-        "reddit_status":           _working(REDDIT_ENABLED and bool(GOOGLE_RAPIDAPI_KEY)),
-        "reddit_fetch_method":     "public per-post RSS (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW, no .json endpoint anywhere",
+        "reddit_status":           _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
+        "reddit_fetch_method":     "SERP discovery (RapidAPI) -> flintel_google_posts cache -> subreddit RSS confirmation (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW",
         "twitter_enabled":         TWITTER_ENABLED,
         "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
         "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
         "twitter_search_keywords": len(TWITTER_SEARCH_KEYWORDS),
         "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
-        "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords) — UNTOUCHED from v9.11.1",
-        "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE}) — UNTOUCHED, uses RAPIDAPI_KEY",
-        "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} — UNTOUCHED",
-        "google_serp_rank_key":            "GOOGLE_RAPIDAPI_KEY (dedicated) — separate from search-volume RAPIDAPI_KEY",
-        "scoring_provider":                "Anthropic Claude API",
-        "scoring_model":                   CLAUDE_MODEL,
-        "reddit_serp_reddit_fetch_decoupled": True,
-        "reddit_batch_redundant_filter_fixed": True,
-        "batch_processor_item_loss_window_fixed": True,
-        "batch_processor_short_text_drop_logged": True,
-        "google_posts_collection":        "flintel_google_posts",
-        "google_posts_tracked":           total_google_posts,
-        "google_posts_pending_reddit_fetch": pending_reddit_fetch,
-        "google_posts_reddit_fetched":    fetched_reddit_posts,
-        "google_posts_fuzzy_matched":     fuzzy_matched_posts,
-        "google_posts_fuzzy_no_match":    fuzzy_no_match_posts,
-        "reddit_fetch_check_interval_seconds": REDDIT_FETCH_CHECK_INTERVAL_SECONDS,
-        "reddit_post_retry_cooldown_seconds":  REDDIT_POST_RETRY_COOLDOWN_SECONDS,
+        "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords), UNCHANGED from v9.11.1, no longer tied to Reddit RSS reliability",
+        "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE}) — UNCHANGED",
+        "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}, always logged, never overrides a real value",
+        "google_posts_cache":              "ENABLED (NEW) — flintel_google_posts, fetch-once-forever per post_url, read directly (no python list)",
+        "google_posts_rss_check_interval_seconds": GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS,
+        "fuzzy_keywords_per_post":         FUZZY_KEYWORDS_PER_POST,
         "reddit_engagement_random_fallback": f"ENABLED — range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (RSS has no real upvotes/comments), always logged",
         "keywords_tracked":               total_keywords_tracked,
         "keywords_due_now":               due_now_count,
         "keywords_missing_search_volume": missing_volume_count,
         "keywords_with_random_search_volume": random_volume_count,
+        "google_posts_total":             total_google_posts,
+        "google_posts_pending_rss_confirmation": pending_google_posts,
+        "google_posts_confirmed":          confirmed_google_posts,
+        "google_posts_pending_subreddits": pending_subreddits,
         "serp_months_back":        SERP_MONTHS_BACK,
         "serp_results_per_kw":     SERP_RESULTS_PER_KEYWORD,
         "reddit_batch_size":       REDDIT_BATCH_SIZE,
@@ -5565,22 +5766,20 @@ def root():
         "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
         "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
         "rescore_batch_gap_s":     RESCORE_BATCH_GAP_SECONDS,
-        "rapidapi_search_volume_configured": bool(RAPIDAPI_KEY),
-        "rapidapi_google_serp_configured":   bool(GOOGLE_RAPIDAPI_KEY),
-        "anthropic_configured":              bool(ANTHROPIC_API_KEY),
+        "rapidapi_configured":    bool(RAPIDAPI_KEY),
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
         "rescore_pending":         db.signals.count_documents({"status": "pending"}),
         "auth_required":           bool(API_KEY),
         "telegram_removed":        True,
-        "reddit_json_endpoint_removed": True,
+        "reddit_per_post_json_removed": True,
         "reddit_oauth_praw_removed": True,
         "fixed_full_cycle_sleep_removed": True,
         "post_url_dedup_before_scoring": True,
         "claude_failure_routes_to_pending": True,
         "keyword_due_state_independent_of_python_list": True,
-        "flintel_keywords_untouched": True,
-        "google_rank_serp_logic_untouched_except_key": True,
+        "google_posts_state_independent_of_python_list": True,
+        "reddit_serp_never_waits_on_reddit_rss": True,
         "output_schema":           "intent_score (1-100) / is_relevant / reply_draft",
     }
 
@@ -5596,18 +5795,14 @@ def health():
     return {
         "status":                  "ok",
         "mongodb":                 mongo,
-        "reddit_working":          REDDIT_ENABLED and bool(GOOGLE_RAPIDAPI_KEY),
-        "reddit_indicator":        _working(REDDIT_ENABLED and bool(GOOGLE_RAPIDAPI_KEY)),
-        "reddit_fetch_method":     "public per-post RSS (credential-free) — no OAuth/PRAW",
-        "reddit_serp_reddit_fetch_decoupled": True,
+        "reddit_working":          REDDIT_ENABLED and bool(RAPIDAPI_KEY),
+        "reddit_indicator":        _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
+        "reddit_fetch_method":     "SERP -> flintel_google_posts -> subreddit RSS confirmation (credential-free) — no OAuth/PRAW",
         "twitter_working":         TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN),
         "twitter_indicator":       _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
-        "scoring_provider":        "Anthropic Claude API",
-        "scoring_model":           CLAUDE_MODEL,
-        "scoring_configured":      bool(ANTHROPIC_API_KEY),
         "reddit_queue_size":       reddit_queue.qsize(),
         "twitter_queue_size":      twitter_queue.qsize(),
-        "google_posts_pending_reddit_fetch": db.flintel_google_posts.count_documents({"reddit_fetched": False}),
+        "google_posts_pending":    db.flintel_google_posts.count_documents({"fetched": False}),
         "rescore_pending":         db.signals.count_documents({"status": "pending"}),
         "client_id":               CLIENT_ID,
         "timestamp":               datetime.now(timezone.utc).isoformat(),
@@ -5616,8 +5811,13 @@ def health():
 
 @app.get("/keywords", dependencies=[Depends(verify_api_key)])
 def get_keywords_status():
-    """UNCHANGED from v9.11.1 — inspects the untouched flintel_keywords
-    fetch-once-forever cache directly."""
+    """
+    Inspect the fetch-once-forever keyword cache directly — UNCHANGED
+    FROM v9.11.1. Note: "fetched=True" here now means "this keyword's
+    SERP results are all cached in flintel_google_posts" (see
+    process_one_keyword() docstring) — actual Reddit RSS confirmation
+    status lives in /google-posts below.
+    """
     raw_docs = list(db.flintel_keywords.find({}, {"_id": 0}).sort("keyword", 1))
     due_count = 0
     missing_volume_count = 0
@@ -5646,41 +5846,39 @@ def get_keywords_status():
 
 
 @app.get("/google-posts", dependencies=[Depends(verify_api_key)])
-def get_google_posts_status(reddit_fetched: bool = None, fuzzy_matched: bool = None, limit: int = 200):
+def get_google_posts_status(subreddit: str = None, pending_only: bool = False, limit: int = 200):
     """
-    Inspect the flintel_google_posts collection directly: every Reddit
-    post_url SERP discovery has ever found, its google_rank, the
-    search_keyword + auto-generated fuzzy_keywords it was discovered
-    under, its subreddit, whether it's been Reddit-fetched yet
-    (reddit_fetched), and — once fetched — whether its content actually
-    matched the fuzzy keywords (fuzzy_matched: true/false/null).
+    NEW in v9.12 — inspect the flintel_google_posts cache directly. Shows
+    every SERP-discovered post_url, its google_rank, matched_keyword,
+    auto-generated fuzzy_keywords, subreddit, and whether it has been
+    confirmed yet (fetched=True) via run_google_posts_rss_matching_loop().
     """
     q: dict = {}
-    if reddit_fetched is not None:
-        q["reddit_fetched"] = reddit_fetched
-    if fuzzy_matched is not None:
-        q["fuzzy_matched"] = fuzzy_matched
+    if subreddit:
+        q["subreddit"] = subreddit
+    if pending_only:
+        q["fetched"] = False
 
-    docs = list(db.flintel_google_posts.find(q, {"_id": 0}).sort("discovered_at", -1).limit(limit))
-    for d in docs:
-        for f in ["discovered_at", "fetched_at", "next_retry_at"]:
+    raw_docs = list(db.flintel_google_posts.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
+    docs = []
+    for d in raw_docs:
+        for f in ["created_at", "fetched_at"]:
             if d.get(f):
                 d[f] = d[f].isoformat()
+        docs.append(d)
 
     total = db.flintel_google_posts.count_documents({})
-    pending = db.flintel_google_posts.count_documents({"reddit_fetched": False})
-    fetched = db.flintel_google_posts.count_documents({"reddit_fetched": True})
-    matched = db.flintel_google_posts.count_documents({"fuzzy_matched": True})
-    no_match = db.flintel_google_posts.count_documents({"fuzzy_matched": False})
+    pending = db.flintel_google_posts.count_documents({"fetched": False})
+    confirmed = db.flintel_google_posts.count_documents({"fetched": True})
+    pending_subreddits = db.flintel_google_posts.distinct("subreddit", {"fetched": False})
 
     return {
         "total": total,
-        "pending_reddit_fetch": pending,
-        "reddit_fetched": fetched,
-        "fuzzy_matched": matched,
-        "fuzzy_no_match": no_match,
-        "returned": len(docs),
-        "posts": docs,
+        "pending": pending,
+        "confirmed": confirmed,
+        "pending_subreddits": pending_subreddits,
+        "count_returned": len(docs),
+        "google_posts": docs,
     }
 
 
@@ -5739,43 +5937,44 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.13 — REDDIT SERP-DISCOVERY / REDDIT-FETCH DECOUPLED")
-    log.info("                   VIA flintel_google_posts COLLECTION +")
-    log.info("                   PYTHON AUTO-FUZZY KEYWORD GENERATION/FILTERING")
-    log.info("                   + TWITTER SIGNAL SCORER")
-    log.info("                   (scoring provider: Anthropic Claude API — Claude Haiku 4.5)")
-    log.info("                   (+ Google SERP/rank calls on a dedicated RapidAPI key)")
+    log.info("  FLINTEL v9.12.0 — REDDIT (SERP + FETCH-ONCE-FOREVER KEYWORD CACHE")
+    log.info("                   + FLINTEL_GOOGLE_POSTS CACHE + FUZZY-KEYWORD/URL-MATCH")
+    log.info("                   SUBREDDIT RSS CONFIRMATION + RANDOM-FALLBACK VOLUME/")
+    log.info("                   ENGAGEMENT) + TWITTER SIGNAL SCORER")
     log.info("=" * 70)
-    log.info(f"  Client                : {CLIENT_ID}")
-    log.info(f"  Platforms             : Reddit (SERP discovery + separate fetch loop) + Twitter/X")
-    log.info(f"  Reddit                : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(GOOGLE_RAPIDAPI_KEY))}")
-    log.info(f"  Reddit fetch method   : public per-post RSS only — credential-free, no OAuth/PRAW, no .json anywhere")
-    log.info(f"  Reddit engagement     : RANDOM placeholder {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (upvotes/comments) — RSS has no real counts, always logged")
-    log.info(f"  Twitter               : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
-    log.info(f"  Reddit keywords       : {len(REDDIT_SEARCH_KEYWORDS)} (used ONLY to seed brand-new flintel_keywords docs)")
-    log.info(f"  Twitter keywords      : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
-    log.info(f"  Keyword cache         : flintel_keywords — fetch-once-forever, UNTOUCHED from v9.11.1")
-    log.info(f"  Google SERP / rank    : search_google_for_keyword() / fetch_google_rank() — UNCHANGED logic, authenticate with dedicated GOOGLE_RAPIDAPI_KEY")
-    log.info(f"  Search-volume         : fetch_search_volume() / seed_search_volume_batch() — UNTOUCHED, still on RAPIDAPI_KEY")
-    log.info(f"  Google-posts coll.    : flintel_google_posts — stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched")
-    log.info(f"  SERP -> Google-posts  : every SERP result saved immediately, does NOT wait on Reddit fetch to complete")
-    log.info(f"  Reddit fetch loop     : fully separate thread, reads flintel_google_posts directly (no python list of subreddits/keywords/fuzzy-keywords kept anywhere)")
-    log.info(f"  Reddit fetch interval : check every {REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | retry cooldown {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s on genuine fetch failure")
-    log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time (generate_fuzzy_keywords()) — stored on the post's own document, used to filter fetched RSS content (passes_fuzzy_filter())")
-    log.info(f"  Scoring provider      : Anthropic Claude API, model {CLAUDE_MODEL} | configured:{bool(ANTHROPIC_API_KEY)}")
-    log.info(f"  Batch processor fix   : Reddit items no longer re-filtered by passes_keyword_filter() against the full keyword-phrase list — fuzzy match upstream is the sole gate for Reddit; Twitter unaffected")
-    log.info(f"  Batch processor fix 2 : remove_queue_message() moved to AFTER an item's fate is persisted (batch save or logged drop) — closes item-loss window between dequeue and persist; short-text drops now logged + counted")
-    log.info(f"  Reddit batch          : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
-    log.info(f"  Twitter batch         : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
-    log.info(f"  Rescore batch         : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
-    log.info(f"  RapidAPI search-volume key : {bool(RAPIDAPI_KEY)} (seo-keyword-research host, UNTOUCHED)")
-    log.info(f"  RapidAPI Google SERP key   : {bool(GOOGLE_RAPIDAPI_KEY)} (google-search116 host, DEDICATED key)")
-    log.info(f"  Anthropic API key          : {bool(ANTHROPIC_API_KEY)} (Claude API, scoring, model {CLAUDE_MODEL})")
-    log.info(f"  Telegram              : REMOVED")
-    log.info(f"  Reddit .json endpoint : REMOVED (never used — RSS only)")
-    log.info(f"  Reddit OAuth/PRAW     : REMOVED")
-    log.info(f"  MongoDB DB            : {MONGODB_DB}")
-    log.info(f"  API auth              : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
+    log.info(f"  Client               : {CLIENT_ID}")
+    log.info(f"  Platforms            : Reddit (SERP discovery, fetch-once-forever) + Twitter/X")
+    log.info(f"  Reddit               : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
+    log.info(f"  Reddit fetch method  : SERP (RapidAPI) -> flintel_google_posts cache -> subreddit RSS "
+             f"confirmation — credential-free, no OAuth/PRAW, nothing to configure")
+    log.info(f"  Reddit engagement    : RANDOM placeholder {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (upvotes/comments) — RSS has no real counts, always logged")
+    log.info(f"  Twitter              : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
+    log.info(f"  Reddit keywords      : {len(REDDIT_SEARCH_KEYWORDS)} (used for SERP discovery + to seed brand-new flintel_keywords docs)")
+    log.info(f"  Twitter keywords     : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
+    log.info(f"  Keyword cache        : fetch-once-forever (no re-fetch, ever) | check every {KEYWORD_CHECK_INTERVAL_SECONDS}s | "
+             f"last {SERP_MONTHS_BACK} months | depth {SERP_RESULTS_PER_KEYWORD} | UNCHANGED from v9.11.1")
+    log.info(f"  Keyword due state    : read directly from flintel_keywords — NOT filtered by the current "
+             f"REDDIT_SEARCH_KEYWORDS python list")
+    log.info(f"  Search-volume seeding: batched loop, chunks of {SEARCH_VOLUME_BATCH_SIZE} keywords | UNCHANGED from v9.11.1")
+    log.info(f"  Search-volume fallback: RANDOM placeholder {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
+             f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} on any failure/no-credits — always clearly logged")
+    log.info(f"  flintel_google_posts : NEW — every SERP-discovered post_url + google_rank + matched_keyword "
+             f"+ {FUZZY_KEYWORDS_PER_POST} auto fuzzy keywords + subreddit cached immediately, no wait on Reddit")
+    log.info(f"  Google-posts RSS     : independent thread | check every {GOOGLE_POSTS_RSS_CHECK_INTERVAL_SECONDS}s | "
+             f"reads flintel_google_posts directly (no python list) | confirms by exact post_url match | "
+             f"{REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback")
+    log.info(f"  Reddit batch         : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
+    log.info(f"  Twitter batch        : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
+    log.info(f"  Rescore batch        : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
+    log.info(f"  Rescore source       : signals collection, status='pending' — never re-fetches, only re-scores")
+    log.info(f"  Claude streaming     : True | prompt: generic 1-100 relevance/visibility/engagement")
+    log.info(f"  RapidAPI config      : {bool(RAPIDAPI_KEY)} (SOLE provider — google_rank + search_volume)")
+    log.info(f"  Telegram             : REMOVED")
+    log.info(f"  Reddit per-post JSON/RSS-in-discovery : REMOVED (moved to flintel_google_posts + subreddit RSS)")
+    log.info(f"  Reddit OAuth/PRAW    : REMOVED")
+    log.info(f"  Fixed full-cycle sleep: REMOVED (each keyword + each google_post has its own independent fetch-once-forever state)")
+    log.info(f"  MongoDB DB           : {MONGODB_DB}")
+    log.info(f"  API auth             : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
     log.info("=" * 70)
 
     asyncio.run(main())
