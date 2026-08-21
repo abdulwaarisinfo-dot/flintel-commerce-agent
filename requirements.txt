@@ -3,6 +3,7 @@ anthropic>=0.25.0
 pymongo>=4.6.0
 python-dotenv>=1.0.0
 requests>=2.31.0
+httpx>=0.27.0
 
 # Social Platforms
 feedparser>=6.0.11
@@ -16,4 +17,3 @@ uvicorn>=0.29.0
 # Scheduling & Async
 asyncio-throttle>=1.0.2
 praw>=7.7.0
-
