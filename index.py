@@ -1,194 +1,67 @@
 """
-FLINTEL v9.12 — Reddit (SERP Discovery decoupled from Reddit fetch via a
-                NEW flintel_google_posts collection + Python auto-fuzzy
-                keyword generation/filtering)
-                + Twitter/X Signal Scorer
-================================================================================= 
-Platforms : Reddit — RapidAPI SERP discovery (Google search, site:reddit.com,
-            real per-post rank) -> NEW flintel_google_posts collection ->
-            SEPARATE Reddit-fetch loop (public per-post RSS feed, smart-retry,
-            no credentials required, fuzzy-keyword content filter)
-          + Twitter (tweepy v2)
+FLINTEL — main.py  (STRIPPED-DOWN SIGNAL PIPELINE, based on v9.12)
+=====================================================================
+WHAT THIS FILE IS:
+  A simplified version of the v9.12 service. The SERP-discovery ->
+  flintel_google_posts -> Reddit-RSS-fetch pipeline is kept 100% AS-IS
+  (same Google RapidAPI SERP call, same flintel_keywords fetch-once
+  cache, same flintel_google_posts collection/schema, same fuzzy-keyword
+  generation/matching, same Reddit RSS smart-retry fetch). Everything
+  else has been REMOVED per request:
 
-=================================================================================
-WHAT CHANGED IN THIS BUILD (v9.12) — REDDIT FETCHING IS NOW FULLY DECOUPLED
-FROM GOOGLE SERP DISCOVERY VIA A NEW COLLECTION. flintel_keywords AND ALL
-GOOGLE-RANK / SERP CODE (search_google_for_keyword, fetch_google_rank,
-fetch_search_volume, fetch_google_stats, _dig_value, _dig_list,
-sync_keywords_to_db, get_due_keywords, get_keywords_missing_volume,
-mark_keyword_fetched, set_keyword_retry_cooldown, seed_search_volume_batch)
-ARE 100% UNTOUCHED — BYTE-FOR-BYTE IDENTICAL TO v9.11.1.
-=================================================================================
+  REMOVED:
+    - Claude / Anthropic scoring layer entirely (no intent_score,
+      is_relevant, reply_draft, no system prompt, no batch scorer, no
+      rescore processor).
+    - search_volume (RapidAPI keyword-volume lookups + random fallback +
+      flintel_keywords volume fields/seeding).
+    - upvotes / comments (and their random-fallback generation) — Reddit
+      RSS doesn't expose real engagement counts, so this build simply
+      doesn't fabricate or store them anymore.
+    - Twitter/X entirely (tweepy poller, Twitter queue, Twitter keyword
+      list) — this build is Reddit-only.
+    - The whole batching/queue system (reddit_queue, flintel_pending_batch,
+      flintel_queue_messages, flintel_batch_seconds, flintel_seen_ids) —
+      no longer needed since there's no Claude call to batch for.
 
-  PROBLEM BEING FIXED — in v9.11.1, one keyword's SERP discovery
-    (search_google_for_keyword) and that SAME keyword's Reddit RSS
-    fetching (fetch_reddit_post_by_url, for every result) happened
-    back-to-back inside process_one_keyword(), in the same pass, on the
-    same thread. That meant: a keyword was only marked fetched=True
-    (finished) once EVERY one of its Reddit posts had also been fetched
-    — so a slow/flaky Reddit fetch for one keyword's posts could stall
-    or distort that keyword's whole discovery cycle, and Google SERP
-    data effectively "waited" on Reddit.
+  KEPT AS-IS:
+    1. SERP DISCOVERY (run_serp_discovery_loop / process_one_keyword) —
+       reads REDDIT_SEARCH_KEYWORDS (python list) + flintel_keywords
+       fetch-once-forever cache, calls search_google_for_keyword() (the
+       same single RapidAPI SERP call, site:reddit.com, unchanged), and
+       for every result saves it into `flintel_google_posts`
+       (post_url + google_rank + search_keyword + subreddit +
+       Python-generated fuzzy_keywords) via save_google_post() —
+       insert-only, so an already-tracked post_url is never overwritten.
+       depth (SERP_RESULTS_PER_KEYWORD) and lookback (SERP_MONTHS_BACK)
+       are still read from .env exactly as before.
 
-  FIX — Reddit fetching is now a COMPLETELY SEPARATE loop/thread reading
-    from a NEW collection, `flintel_google_posts`, instead of being
-    called inline from the SERP-discovery loop:
+    2. REDDIT FETCH (run_reddit_fetch_loop) — a fully separate thread
+       that reads `flintel_google_posts` directly (reddit_fetched ==
+       False), fetches each due post_url's public per-post RSS feed
+       (fetch_reddit_post_by_url — same smart-retry + old.reddit.com
+       fallback, credential-free, no .json endpoint anywhere), and
+       checks the fetched text against that post's own stored
+       fuzzy_keywords + original search_keyword via
+       passes_fuzzy_filter().
 
-      1. SERP DISCOVERY (run_serp_discovery_loop / process_one_keyword)
-         — UNCHANGED in terms of the actual Google-rank call itself
-         (search_google_for_keyword() is untouched, still the sole,
-         independent RapidAPI SERP call). The ONLY change here: instead
-         of immediately fetching each result's Reddit RSS content
-         in-line, every SERP result is saved into flintel_google_posts
-         (post_url + google_rank + the exact search_keyword used +
-         subreddit, extracted from the URL, + a set of Python
-         auto-generated "fuzzy keywords" derived from that
-         search_keyword) via save_google_post() — an insert-only
-         $setOnInsert upsert, so a URL already tracked is never
-         overwritten. The keyword is marked fetched=True (done, in
-         flintel_keywords, exactly as before) as soon as this save step
-         finishes — Google SERP storage NEVER waits on Reddit fetching
-         to complete. This is the literal meaning of "decoupled": the
-         SERP/rank side of the pipeline runs at its own pace regardless
-         of how fast or slow Reddit is being fetched.
+    3. SIGNAL STORAGE — the ONLY behavioral change in this step: instead
+       of pushing a match onto a queue for Claude to batch-score later,
+       a match is saved DIRECTLY into `flintel_signals` right there in
+       the fetch loop, tagged with its search_keyword, platform="reddit",
+       post_url, text, username, subreddit, posted_at — no score, no
+       queue, no batch, no Claude call anywhere in this file.
 
-      2. REDDIT FETCH (run_reddit_fetch_loop) — a brand-new, fully
-         independent background thread. It does NOT keep its own Python
-         list of subreddits, keywords, or fuzzy keywords anywhere — it
-         reads get_due_google_posts() straight off flintel_google_posts
-         every pass (reddit_fetched == False), and every subreddit /
-         search_keyword / fuzzy_keywords value it needs is already
-         sitting on that same document (stored there by SERP discovery
-         in step 1). For each due post:
-           - fetch_reddit_post_by_url() is called — UNCHANGED (same
-             smart-retry, jittered backoff, old.reddit.com fallback,
-             RSS-only, credential-free fetch as v9.11).
-           - If the HTTP fetch itself genuinely fails (retries
-             exhausted), the post is left reddit_fetched=False and a
-             cooldown (next_retry_at) is set via
-             set_google_post_retry_cooldown() so it's retried later
-             without hammering Reddit every single pass — same pacing
-             philosophy as v9.11.2's keyword-level cooldown, just
-             applied per-post now instead of per-keyword.
-           - If the fetch succeeds, the fetched post's text (title +
-             summary) is checked against that post's own stored
-             fuzzy_keywords (+ its original search_keyword) via
-             passes_fuzzy_filter(). This is the ONLY filtering that
-             decides whether a fetched Reddit post is genuinely "about"
-             the keyword it was discovered under — a Python
-             auto-generated fuzzy keyword set (see
-             generate_fuzzy_keywords() below), NOT a second manual
-             keyword list.
-           - If it matches: search_volume is read from the EXISTING,
-             untouched flintel_keywords cache (looked up by
-             search_keyword — same cache v9.11.1 already seeds via
-             seed_search_volume_batch(), completely unchanged), stamped
-             onto the item alongside google_rank / subreddit / post
-             text / everything else in the EXACT same item schema as
-             before, and the item is pushed into reddit_queue exactly
-             as it always was — downstream batching, Claude scoring,
-             and Mongo `signals` storage need ZERO changes.
-           - If it does NOT match: the post is still marked
-             reddit_fetched=True (the URL genuinely WAS fetched — we
-             just don't want it queued), so it is never re-fetched
-             again either. Only a genuine fetch FAILURE (network/HTTP)
-             is retried — a successful fetch that simply isn't a topical
-             match is a settled "no" and fetching it again would just
-             waste requests against Reddit's IP-level rate limiting for
-             no benefit.
-           - reddit_fetched effectively means "False until this
-             specific post URL has actually been fetched" — exactly as
-             requested: a post starts as reddit_fetched=False the
-             instant SERP discovery saves it, and only flips to True
-             once its own fetch attempt has actually completed (success
-             — matched or not — or is deliberately being retried after
-             a real failure).
-
-  Every other piece of this build — the fetch-once-forever keyword
-  cache (flintel_keywords, completely untouched), the batched
-  search-volume pre-seeding, the Reddit RSS smart-retry fetcher itself,
-  the Claude batch scorer, the rescore processor, persistent
-  batch/queue state, the FastAPI endpoints (plus one new endpoint,
-  GET /google-posts, to inspect the new collection) — is kept 100%
-  as-is or purely additive. No .json Reddit endpoint anywhere in this
-  file — RSS (.rss) only, exactly as v9.11 established. No OAuth/PRAW.
-
-=================================================================================
-v9.12.1 PATCH NOTE (bug fix on top of v9.12, applied per user request) —
-run_batch_processor() had a SECOND, redundant relevance filter
-(passes_keyword_filter(text, keyword_filter_list)) that ran AFTER an item
-was pulled off reddit_queue. Reddit items only ever reach reddit_queue
-after ALREADY passing passes_fuzzy_filter() inside run_reddit_fetch_loop()
-— that fuzzy check (against the post's own stored fuzzy_keywords + its
-original search_keyword) is the single authoritative relevance decision
-for Reddit. The second filter checked the fetched text against the FULL
-REDDIT_SEARCH_KEYWORDS phrase list (exact full-phrase substring only) —
-so any item that had matched via a fuzzy variant (a single significant
-word, a bigram, or a singular/plural variant) rather than the complete
-original phrase was silently dropped here: total_dropped incremented,
-q.task_done() called, item discarded, current_batch.append()/
-save_pending_batch() never reached. That is why items could be seen
-being logged as "[REDDIT-FETCH] QUEUED" yet never appear in
-flintel_pending_batch and never reach Claude scoring.
-
-FIX — this second filter is now skipped entirely for Reddit items (the
-"reddit" platform_key), since fuzzy-filtering already happened upstream
-and re-checking against the full phrase list only produces false
-negatives. Twitter items are NOT pre-filtered anywhere upstream, so they
-still go through passes_keyword_filter() exactly as before — zero change
-to Twitter's behavior. This is the ONLY functional change in this file
-relative to v9.12; everything else is preserved 100% as-is.
-=================================================================================
-v9.12.2 PATCH NOTE (bug fix on top of v9.12.1, applied per user request) —
-TWO issues in run_batch_processor(), both invisible in logs before this fix:
-
-  BUG A — ITEM-LOSS WINDOW BETWEEN DEQUEUE AND PERSIST.
-    Previously, remove_queue_message(platform_key, item.get("message_id"))
-    was called IMMEDIATELY after q.get() succeeded — i.e. the instant an
-    item was pulled off the in-memory reddit_queue/twitter_queue, its
-    Mongo-persisted backup row in flintel_queue_messages was deleted right
-    away, BEFORE it was known whether that item would be added to
-    current_batch/flintel_pending_batch or dropped. If the process crashed
-    or was killed in the gap between q.get() and save_pending_batch()
-    (e.g. during a Mongo hiccup, an unhandled exception, a container
-    restart), that item existed in NEITHER flintel_queue_messages NOR
-    flintel_pending_batch — it was silently and permanently lost, and
-    would not be recovered on restart (load_queue_messages() would never
-    see it again, since it had already been deleted).
-
-    FIX — remove_queue_message() is now called ONLY after the item's fate
-    is fully decided AND persisted: either (a) it has been appended to
-    current_batch and save_pending_batch() has successfully written that
-    batch to flintel_pending_batch, or (b) it has been genuinely dropped
-    for a documented, logged reason (too-short text, or — for Twitter only
-    — failing passes_keyword_filter()). This closes the gap: at every
-    point in time, an in-flight item exists in at least one of
-    flintel_queue_messages or flintel_pending_batch, never in neither.
-
-  BUG B — SILENT, UNTRACEABLE SHORT-TEXT DROP.
-    The `if not text or len(text) < 10: q.task_done(); continue` branch
-    dropped items with no log line and no counter increment
-    (total_dropped was never touched here) — making it impossible to
-    distinguish "item never arrived" from "item silently dropped for
-    being too short" purely from the logs.
-
-    FIX — this branch now logs a WARNING with message_id/post_url/text
-    length, and increments total_dropped, exactly like the redundant-
-    keyword-filter drop path already did for Twitter.
-
-Everything else in this file — SERP discovery, Reddit fetch loop, fuzzy
-keyword generation/matching, Claude batch scorer, rescore processor,
-FastAPI endpoints, Mongo schemas/indexes — is preserved 100% as-is,
-byte-for-byte identical to v9.12.1. Only run_batch_processor() changed.
-=================================================================================
+Run:
+    pip install fastapi uvicorn pymongo python-dotenv httpx requests \
+                feedparser
+    python main.py
 """
 
 import asyncio
 import logging
 import os
-import json
 import time
-import queue
 import random
 import re
 import html
@@ -196,9 +69,6 @@ import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-import anthropic
-import httpx
-import tweepy
 import requests
 import feedparser
 from pymongo import MongoClient, ASCENDING
@@ -222,1143 +92,55 @@ logging.basicConfig(
 log = logging.getLogger("flintel")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION
+# CONFIGURATION — UNCHANGED shape from v9.12 for everything kept.
 # ─────────────────────────────────────────────────────────────────────────────
-
-TWITTER_API_KEY      = os.getenv("TWITTER_API_KEY")
-TWITTER_API_SECRET   = os.getenv("TWITTER_API_SECRET")
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
 
-# Optional generic label/context — used ONLY as a fallback google_rank
-# lookup for Twitter items (Twitter has no per-post SERP discovery in
-# this design, so there is no "real" per-post rank for a tweet). If left
-# empty, Twitter items simply get google_rank=None / search_volume=None.
-SEARCH_KEYWORD = os.getenv("SEARCH_KEYWORD", "")
-
-# ── RapidAPI — SOLE provider for both Google rank AND search volume.
-# UNTOUCHED from v9.11.1.
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")  # .env boht used same key
-RAPIDAPI_KEYWORD_HOST = "seo-keyword-research.p.rapidapi.com"
+# ── RapidAPI — SOLE provider for Google SERP rank/discovery. UNCHANGED.
+RAPIDAPI_KEY          = os.getenv("RAPIDAPI_KEY", "")
 RAPIDAPI_SEARCH_HOST  = "google-search116.p.rapidapi.com"
 
-# ── RapidAPI call timeouts — UNTOUCHED from v9.11.1.
-DATAFORSEO_SERP_TIMEOUT_SECONDS   = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
-DATAFORSEO_VOLUME_TIMEOUT_SECONDS = int(os.getenv("DATAFORSEO_VOLUME_TIMEOUT_SECONDS", "60"))
-REDDIT_JSON_TIMEOUT_SECONDS       = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))  # used for the RSS fetch
+DATAFORSEO_SERP_TIMEOUT_SECONDS = int(os.getenv("DATAFORSEO_SERP_TIMEOUT_SECONDS", "120"))
+REDDIT_JSON_TIMEOUT_SECONDS     = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "15"))  # used for the RSS fetch
 
-REDDIT_BATCH_SIZE   = int(os.getenv("REDDIT_BATCH_SIZE",   "10"))
-TWITTER_BATCH_SIZE  = int(os.getenv("TWITTER_BATCH_SIZE",  "50"))
-RESCORE_BATCH_SIZE  = int(os.getenv("RESCORE_BATCH_SIZE",  REDDIT_BATCH_SIZE))
-
-REDDIT_BATCH_GAP_SECONDS      = int(os.getenv("REDDIT_BATCH_GAP_SECONDS",      "30"))
-REDDIT_BATCH_TIMEOUT_SECONDS  = int(os.getenv("REDDIT_BATCH_TIMEOUT_SECONDS",  "120"))
-
-TWITTER_BATCH_GAP_SECONDS     = int(os.getenv("TWITTER_BATCH_GAP_SECONDS",     "30"))
-TWITTER_BATCH_TIMEOUT_SECONDS = int(os.getenv("TWITTER_BATCH_TIMEOUT_SECONDS", "120"))
-
-RESCORE_BATCH_GAP_SECONDS = int(os.getenv("RESCORE_BATCH_GAP_SECONDS", "30"))
-RESCORE_POLL_INTERVAL     = int(os.getenv("RESCORE_POLL_INTERVAL", "10"))
-
-TWITTER_POLL_INTERVAL = int(os.getenv("TWITTER_POLL_INTERVAL", "60"))
-
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
-
-# ── SEARCH-VOLUME RANDOM FALLBACK CONFIG — UNTOUCHED from v9.11.1. ─────────
-SEARCH_VOLUME_RANDOM_FALLBACK_MIN = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MIN", "300"))
-SEARCH_VOLUME_RANDOM_FALLBACK_MAX = int(os.getenv("SEARCH_VOLUME_RANDOM_FALLBACK_MAX", "5000"))
-
-
-def _random_search_volume_fallback() -> int:
-    """UNTOUCHED from v9.11.1."""
-    return random.randint(SEARCH_VOLUME_RANDOM_FALLBACK_MIN, SEARCH_VOLUME_RANDOM_FALLBACK_MAX)
-
-
-# ── REDDIT ENGAGEMENT (upvotes/comments) RANDOM FALLBACK CONFIG — UNTOUCHED.
-REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN", "100"))
-REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX = int(os.getenv("REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX", "3000"))
-
-
-def _random_engagement_fallback() -> int:
-    """UNTOUCHED from v9.11.1."""
-    return random.randint(REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN, REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX)
-
-
-# ── SERP DISCOVERY CONFIG (still the only source of NEW keywords) ───────────
-# UNTOUCHED — this Python list's ONLY job is still to seed brand-new
-# keyword documents into flintel_keywords (via sync_keywords_to_db(),
-# $setOnInsert, insert-only). Nothing about how this list is consumed
-# has changed.
+# ── SERP DISCOVERY CONFIG — UNCHANGED. This Python list's ONLY job is to
+# seed brand-new keyword documents into flintel_keywords (insert-only).
 REDDIT_SEARCH_KEYWORDS = [
-        "a community software for our users for networking between members",
-    "a community platform with mobile app for my business with groups and channels",
-    "a simple community platform for our SaaS customers with organized discussions",
-    "looking for a branded community platform for a global community that helps build stronger member relationships",
-    "a community management platform for a brand community that is easy for members to use",
-    "best community platform for product users with events and community management",
-    "we are looking for a community platform for my business that helps build stronger member relationships",
-    "looking to switch to an affordable community platform for creators without using Discord",
-    "an affordable community platform for an event community without using Discord",
-    "an affordable community platform for an agency that is easy for members to use",
-    "a simple community platform for my business with private spaces",
-    "does anyone know a a customer community platform for our customers that is easy for members to use",
-    "best community platform for my business with member profiles",
-    "we are looking for a community platform for my startup that works on web and mobile",
-    "any recommendations for an affordable community platform for a nonprofit for meaningful discussions",
-    "a place to host my community for a creator community that supports paid memberships",
-    "best community platform for an e-commerce brand that has good moderation tools",
-    "we are looking for a community platform for creators that supports paid memberships",
-    "recommendations for a community platform for product users",
-    "we are looking for a community platform for a creator community without using Discord",
-    "a community solution for an online course without relying on Facebook",
-    "we are looking for a community platform for founders that is easy for members to use",
-    "best community platform for a coaching business with real-time chat",
-    "a community platform for conversations for product users that gives us ownership of our community",
-    "a modern community app for product users that works on web and mobile",
-    "we are looking for a community platform for a gaming community that has good moderation tools",
-    "need help finding a branded community platform for a gaming community with events and community management",
-    "searching for a community platform with chat for an e-commerce brand with a clean user experience",
-    "best community platform for our users without using Discord",
-    "we are looking for a community platform for remote teams and members with organized discussions",
-    "best community platform for a nonprofit for meaningful discussions",
-    "a simple community platform for a paid membership with better engagement",
-    "best community platform for my company that has good moderation tools",
-    "want a community solution for an online course where conversations do not get lost",
-    "best community platform for our customers for customer engagement",
-    "a platform for building an online community for a membership business with events and community management",
-    "we are looking for a community platform for a professional network for networking between members",
-    "we are looking for a community platform for alumni without relying on Facebook",
-    "looking to switch to a platform for a paid community for an e-commerce brand for meaningful discussions",
-    "best community platform for a gaming community that has good moderation tools",
-    "best community platform for creators without relying on Facebook",
-    "we are looking for a community platform for a professional network with better engagement",
-    "what is the best an online community platform for a membership business with events and community management",
-    "we are looking for a community platform for an online course with events and community management",
-    "we are looking for a community platform for remote teams and members that helps build stronger member relationships",
-    "a platform for a paid community for a paid membership where conversations do not get lost",
-    "best community platform for a nonprofit that helps build stronger member relationships",
-    "what is the best a branded community platform for a local community with a clean user experience",
-    "trying to find a better alternative to Discord for a paid membership for meaningful discussions",
-    "does anyone know a a better alternative to Slack communities for a paid membership with a clean user experience",
-    "best community platform for our customers that can scale with our community",
-    "a simple community platform for a coaching business with member profiles",
-    "a better alternative to Discord for a paid membership that supports onboarding new members",
-    "best community platform for my startup that gives us ownership of our community",
-    "we are looking for a community platform for my business with member profiles",
-    "any recommendations for a branded community platform for creators with member profiles",
-    "we are looking for a community platform for an agency with private spaces",
-    "a private community platform for remote teams and members with private spaces",
-    "a platform for a free community for entrepreneurs that is easy to set up",
-    "what is the best a community platform for my audience for entrepreneurs that gives us ownership of our community",
-    "best community platform for our users that is easy to set up",
-    "a better alternative to Slack communities for a B2B community that is easy to set up",
-    "we are looking for a community platform for my business where conversations do not get lost",
-    "a community platform with chat for our SaaS customers with private spaces",
-    "best community platform for an online course with member profiles",
-    "we are looking for a community platform for a local community with a clean user experience",
-    "best community platform for developers that gives us ownership of our community",
-    "best community platform for a coaching business that has good moderation tools",
-    "need a modern community app for a professional network that helps build stronger member relationships",
-    "a place to host my community for an e-commerce brand with groups and channels",
-    "a white label community platform for developers that does not feel like a social media feed",
-    "best community platform for a nonprofit without relying on Facebook",
-    "a platform for a paid community for an AI community without relying on Facebook",
-    "a community platform with mobile app for a local community with organized discussions",
-    "a place to host my community for product users with a clean user experience",
-    "an online community platform for an event community that has good moderation tools",
-    "a better alternative to Discord for a coaching business that works on web and mobile",
-    "want a community platform for my audience for a B2B community that helps build stronger member relationships",
-    "a better alternative to Slack communities for a professional network with better engagement",
-    "best community platform for a nonprofit with private spaces",
-    "we are looking for a community platform for an online course with groups and channels",
-    "searching for a platform for building an online community for a professional network with better engagement",
-    "can anyone suggest a a community platform with mobile app for my company with a clean user experience",
-    "best community platform for investors and founders for customer engagement",
-    "a community platform with chat for creators that helps build stronger member relationships",
-    "does anyone know a a better alternative to Facebook Groups for an online course with member profiles",
-    "a community platform with mobile app for our users that is easy to set up",
-    "a better alternative to Facebook Groups for my startup without using Discord",
-    "what is the best a modern community app for founders with real-time chat",
-    "any recommendations for a community platform for conversations for developers that works on web and mobile",
-    "best community platform for investors and founders that supports onboarding new members",
-    "need a customer community platform for our customers that keeps members active",
-    "a platform for a free community for a local community that is more focused than Slack",
-    "a platform to connect members for a local community for meaningful discussions",
-    "trying to find a platform to create a niche community for creators that has good moderation tools",
-    "we are looking for a community platform for creators with member profiles",
-    "an online community platform for a creator community with events and community management",
-    "recommendations for a community platform for my startup",
-    "a community solution for a local community without using Discord",
-    "we are looking for a community platform for our SaaS customers that is easy to set up",
-    "need help finding a community platform for my audience for a global community with groups and channels",
-    "best community platform for investors and founders that works on web and mobile",
-    "best community platform for a coaching business without using Discord",
-    "we are looking for a community platform for a B2B community with events and community management",
-    "searching for a community software for a local community that supports onboarding new members",
-    "a better alternative to Slack communities for product users without relying on Facebook",
-    "a community platform with AI for my startup with better community analytics",
-    "best community platform for an AI community without using Discord",
-    "a platform for a paid community for creators that has good moderation tools",
-    "a platform to connect members for a membership business with better community analytics",
-    "recommend a a community platform for my audience for creators that gives us ownership of our community",
-    "a community platform with AI for alumni that supports paid memberships",
-    "trying to find a community software for a nonprofit without relying on Facebook",
-    "we are looking for a community platform for my startup with better engagement",
-    "a private community platform for a nonprofit that does not feel like a social media feed",
-    "best community platform for a coaching business that does not feel like a social media feed",
-    "a community platform for an agency without using Discord",
-    "best community platform for creators that supports paid memberships",
-    "a community platform for conversations for founders with a clean user experience",
-    "a branded community platform for my company that is easy for members to use",
-    "a community platform for a professional network that helps build stronger member relationships",
-    "we are looking for a community platform for a professional network with groups and channels",
-    "we are looking for a community platform for a nonprofit without using Discord",
-    "a platform to create a niche community for students with better engagement",
-    "searching for a simple community platform for our users where conversations do not get lost",
-    "a community platform for my audience for a paid membership with better engagement",
-    "a place to host my community for my startup with events and community management",
-    "we are looking for a community platform for students that is more focused than Slack",
-    "we are looking for a community platform for a B2B community with a clean user experience",
-    "we are looking for a community platform for a membership business that keeps members active",
-    "looking for a community management platform for remote teams and members with events and community management",
-    "searching for a community platform with mobile app for a nonprofit with better engagement",
-    "a place to host my community for entrepreneurs that can scale with our community",
-    "thinking about building a community for a coaching business",
-    "a branded community platform for our customers with member profiles",
-    "we are looking for a community platform for a gaming community that supports onboarding new members",
-    "does anyone know a a better alternative to Slack communities for entrepreneurs that keeps members active",
-    "we are looking for a community platform for an AI community that has good moderation tools",
-    "best community platform for a professional network that keeps members active",
-    "best community platform for an AI community without relying on Facebook",
-    "want a branded community platform for a gaming community that is more focused than Slack",
-    "looking to switch to a platform to create a niche community for an agency that is easy to set up",
-    "best community platform for developers that supports onboarding new members",
-    "best community platform for developers without using Discord",
-    "a place to host my community for a membership business that is more focused than Slack",
-    "we are looking for a community platform for a creator community for customer engagement",
-    "we are looking for a community platform for creators with private spaces",
-    "a customer community platform for alumni without relying on Facebook",
-    "a community platform with chat for founders with organized discussions",
-    "a community platform with mobile app for remote teams and members for customer engagement",
-    "best community platform for my business that keeps members active",
-    "a community platform with AI for alumni that is more focused than Slack",
-    "we are looking for a community platform for product users that is easy for members to use",
-    "a branded community platform for a coaching business with real-time chat",
-    "need a simple community platform for a gaming community with better community analytics",
-    "anyone using a community platform for remote teams and members",
-    "need help finding a platform to create a niche community for entrepreneurs with real-time chat",
-    "a community platform for a creator community that is easy for members to use",
-    "a community software for a coaching business with member profiles",
-    "best community platform for entrepreneurs for customer engagement",
-    "a community management platform for my business without using Discord",
-    "a community software for a membership business that has good moderation tools",
-    "we are looking for a community platform for a creator community that is more focused than Slack",
-    "any recommendations for a white label community platform for a coaching business that supports onboarding new members",
-    "a platform to connect members for creators with a clean user experience",
-    "a platform for a free community for an event community with organized discussions",
-    "we are looking for a community platform for a paid membership with a clean user experience",
-    "searching for a better alternative to Slack communities for an agency where conversations do not get lost",
-    "a community platform for conversations for a brand community for meaningful discussions",
-    "can anyone suggest a a community platform for students that does not feel like a social media feed",
-    "we are looking for a community platform for an online course that is more focused than Slack",
-    "best community platform for my startup with better community analytics",
-    "can anyone suggest a a platform to connect members for a nonprofit that gives us ownership of our community",
-    "trying to find a community platform with mobile app for entrepreneurs that does not feel like a social media feed",
-    "a place to host my community for a local community with events and community management",
-    "looking to switch to a simple community platform for a brand community that supports onboarding new members",
-    "can anyone suggest a a community platform with mobile app for an online course that keeps members active",
-    "need help finding a community solution for my startup with better community analytics",
-    "thinking about building a community for a paid membership",
-    "best community platform for founders with events and community management",
-    "a place to host my community for an online course without relying on Facebook",
-    "a community platform with mobile app for a brand community with a clean user experience",
-    "best community platform for a brand community that supports paid memberships",
-    "we are looking for a community platform for a membership business with a clean user experience",
-    "a platform where members can talk and connect for students that supports paid memberships",
-    "a modern community app for students with better community analytics",
-    "a better alternative to Slack communities for an e-commerce brand that does not feel like a social media feed",
-    "does anyone know a a community software for founders that is easy for members to use",
-    "how do I build an online community for our SaaS customers",
-    "a modern community app for creators that is easy to set up",
-    "we are looking for a community platform for remote teams and members for networking between members",
-    "we are looking for a community platform for an AI community that can scale with our community",
-    "looking to switch to a community platform with AI for a professional network that supports onboarding new members",
-    "a community platform for conversations for an e-commerce brand without using Discord",
-    "a platform for a free community for a coaching business with a clean user experience",
-    "we are looking for a community platform for a gaming community that gives us ownership of our community",
-    "we are looking for a community platform for remote teams and members that works on web and mobile",
-    "recommend a a community platform for my audience for a creator community that gives us ownership of our community",
-    "a platform for a free community for a coaching business for meaningful discussions",
-    "need help finding a better alternative to Discord for an event community that does not feel like a social media feed",
-    "we are looking for a community platform for a nonprofit with better community analytics",
-    "we are looking for a community platform for investors and founders where conversations do not get lost",
-    "a modern community app for a gaming community that can scale with our community",
-    "recommendations for a community platform for students",
-    "we are looking for a community platform for investors and founders with private spaces",
-    "we are looking for a community platform for an e-commerce brand that does not feel like a social media feed",
-    "we are looking for a community platform for a membership business that supports onboarding new members",
-    "a better alternative to Discord for a creator community without using Discord",
-    "need a private community platform for our users that gives us ownership of our community",
-    "an online community platform for our users where conversations do not get lost",
-    "best community platform for an e-commerce brand with organized discussions",
-    "need help finding a better alternative to Slack communities for a membership business that is easy to set up",
-    "looking for a simple community platform for an online course that can scale with our community",
-    "a platform for a paid community for our SaaS customers for networking between members",
-    "a modern community app for an online course that does not feel like a social media feed",
-    "we are looking for a community platform for entrepreneurs without using Discord",
-    "a platform where members can talk and connect for a local community that is more focused than Slack",
-    "best community platform for our users without relying on Facebook",
-    "considering a platform where members can talk and connect for a brand community that gives us ownership of our community",
-    "a community software for product users that supports onboarding new members",
-    "we are looking for a community platform for a coaching business that can scale with our community",
-    "we are looking for a community platform for a coaching business that is easy for members to use",
-    "how do I build an online community for entrepreneurs",
-    "trying to find a better alternative to Slack communities for creators with events and community management",
-    "we are looking for a community platform for an e-commerce brand where conversations do not get lost",
-    "we are looking for a community platform for our customers that helps build stronger member relationships",
-    "a community platform with AI for a nonprofit that keeps members active",
-    "a private community platform for alumni that is more focused than Slack",
-    "an online community platform for founders with events and community management",
-    "a community platform for my audience for a paid membership with better community analytics",
-    "best community platform for an AI community with member profiles",
-    "a community software for an AI community that works on web and mobile",
-    "we are looking for a community platform for a professional network that gives us ownership of our community",
-    "best community platform for an online course with a clean user experience",
-    "a simple community platform for developers that is more focused than Slack",
-    "where can I find a a community management platform for a coaching business with organized discussions",
-    "any recommendations for a simple community platform for an online course without using Discord",
-    "best community platform for product users with better community analytics",
-    "best community platform for a global community that is easy to set up",
-    "looking to switch to a modern community app for my business that gives us ownership of our community",
-    "a place to host my community for a paid membership with better engagement",
-    "we are looking for a community platform for my startup that supports paid memberships",
-    "best community platform for a nonprofit that keeps members active",
-    "a platform for a free community for a local community that is easy for members to use",
-    "we are looking for a community platform for an e-commerce brand for meaningful discussions",
-    "thinking about building a community for an event community",
-    "best community platform for students with groups and channels",
-    "a platform to connect members for product users that can scale with our community",
-    "looking for a community platform for my audience for my startup that is easy for members to use",
-    "does anyone know a a better alternative to Discord for investors and founders that gives us ownership of our community",
-    "want a modern community app for my business for customer engagement",
-    "we are looking for a community platform for alumni with better community analytics",
-    "how do I build an online community for investors and founders",
-    "we are looking for a community platform for my company that works on web and mobile",
-    "anyone using a community platform for a global community",
-    "what is the best a platform where members can talk and connect for a coaching business with groups and channels",
-    "want a white label community platform for my company that helps build stronger member relationships",
-    "where can I find a a community platform for my audience for our users that is easy for members to use",
-    "we are looking for a community platform for entrepreneurs that does not feel like a social media feed",
-    "recommendations for a community platform for investors and founders",
-    "what is the best a private community platform for students that supports onboarding new members",
-    "best community platform for an AI community that is more focused than Slack",
-    "anyone using a community platform for creators",
-    "a platform to connect members for a paid membership that helps build stronger member relationships",
-    "we are looking for a community platform for a nonprofit with groups and channels",
-    "looking for a modern community app for my company with private spaces",
-    "we are looking for a community platform for a professional network with private spaces",
-    "we are looking for a community platform for a paid membership for meaningful discussions",
-    "we are looking for a community platform for an e-commerce brand that is easy to set up",
-    "we are looking for a community platform for a B2B community with member profiles",
-    "trying to find a platform where members can talk and connect for an online course with better community analytics",
-    "considering a community platform for my audience for a nonprofit that helps build stronger member relationships",
-    "we are looking for a community platform for a coaching business that is easy to set up",
-    "a modern community app for my business that is more focused than Slack",
-    "a better alternative to Facebook Groups for an agency with events and community management",
-    "looking to switch to a community platform for my business with real-time chat",
-    "best community platform for an event community where conversations do not get lost",
-    "best community platform for my startup that supports onboarding new members",
-    "best community platform for a B2B community for customer engagement",
-    "best community platform for our SaaS customers that is easy to set up",
-    "searching for a community platform for my audience for an AI community with private spaces",
-    "a community platform with AI for a local community that supports paid memberships",
-    "best community platform for our customers that supports paid memberships",
-    "best community platform for an event community for networking between members",
-    "a platform for a paid community for an e-commerce brand with private spaces",
-    "a community platform with AI for an e-commerce brand that does not feel like a social media feed",
-    "searching for a community solution for an e-commerce brand with member profiles",
-    "what is the best a community platform with chat for product users with better community analytics",
-    "best community platform for a creator community with better community analytics",
-    "where can I find a a modern community app for alumni with better engagement",
-    "need help finding a community platform for conversations for a coaching business where conversations do not get lost",
-    "want a platform for a free community for remote teams and members with better community analytics",
-    "we are looking for a community platform for remote teams and members for customer engagement",
-    "thinking about building a community for my business",
-    "a platform for a free community for creators where conversations do not get lost",
-    "best community platform for a brand community that does not feel like a social media feed",
-    "a platform to connect members for a gaming community that keeps members active",
-    "looking for a place to host my community for a global community that supports paid memberships",
-    "best community platform for our customers with events and community management",
-    "where can I find a a platform for a free community for an agency that keeps members active",
-    "can anyone suggest a a community platform for my audience for product users that is easy to set up",
-    "best community platform for a professional network that works on web and mobile",
-    "a community solution for an event community without relying on Facebook",
-    "searching for a platform where members can talk and connect for creators with real-time chat",
-    "a platform to create a niche community for product users with better engagement",
-    "a community platform for my audience for my business that does not feel like a social media feed",
-    "best community platform for remote teams and members with events and community management",
-    "looking to switch to a platform for a paid community for a coaching business for networking between members",
-    "does anyone know a a community platform with AI for developers for networking between members",
-    "trying to find a better alternative to Slack communities for an AI community that is easy to set up",
-    "does anyone know a a platform for a paid community for investors and founders for meaningful discussions",
-    "best community platform for an agency with a clean user experience",
-    "considering a customer community platform for our customers that works on web and mobile",
-    "best community platform for a global community that is easy for members to use",
-    "searching for a white label community platform for a membership business that supports paid memberships",
-    "a community platform for conversations for students with a clean user experience",
-    "what is the best a community platform with AI for founders with private spaces",
-    "want a platform for a paid community for an AI community that can scale with our community",
-    "a customer community platform for my company that supports paid memberships",
-    "best community platform for my startup that supports paid memberships",
-    "an online community platform for my business that is easy for members to use",
-    "a branded community platform for investors and founders with better engagement",
-    "considering a community platform for my audience for my company that does not feel like a social media feed",
-    "a better alternative to Facebook Groups for creators where conversations do not get lost",
-    "a platform to create a niche community for an AI community that supports onboarding new members",
-    "we are looking for a community platform for a paid membership with organized discussions",
-    "best community platform for product users that has good moderation tools",
-    "where can I find a a community platform with AI for developers for networking between members",
-    "we are looking for a community platform for developers with groups and channels",
-    "best community platform for remote teams and members that does not feel like a social media feed",
-    "where can I find a a better alternative to Facebook Groups for a creator community that has good moderation tools",
-    "trying to find a platform to connect members for founders for meaningful discussions",
-    "best community platform for creators that is easy for members to use",
-    "best community platform for an e-commerce brand for networking between members",
-    "a private community platform for a gaming community with real-time chat",
-    "trying to find a better alternative to Slack communities for an AI community for meaningful discussions",
-    "a better alternative to Discord for students with real-time chat",
-    "a platform to create a niche community for product users that supports onboarding new members",
-    "best community platform for our SaaS customers for networking between members",
-    "a modern community app for an online course that can scale with our community",
-    "we are looking for a community platform for founders that supports paid memberships",
-    "we are looking for a community platform for students that supports onboarding new members",
-    "best community platform for a paid membership for networking between members",
-    "looking for a community management platform for my company with better community analytics",
-    "a community platform for my audience for entrepreneurs with groups and channels",
-    "recommendations for a community platform for a global community",
-    "we are looking for a community platform for an agency that is easy for members to use",
-    "does anyone know a a platform to connect members for my startup that is easy for members to use",
-    "can anyone suggest a a white label community platform for a local community that gives us ownership of our community",
-    "best community platform for a nonprofit that does not feel like a social media feed",
-    "a community platform with chat for a paid membership that is easy to set up",
-    "best community platform for developers that has good moderation tools",
-    "best community platform for students that does not feel like a social media feed",
-    "want a platform where members can talk and connect for product users where conversations do not get lost",
-    "where can I find a a customer community platform for a creator community without using Discord",
-    "we are looking for a community platform for our customers with private spaces",
-    "a community platform with chat for remote teams and members that gives us ownership of our community",
-    "best community platform for entrepreneurs with better engagement",
-    "a community management platform for my company that gives us ownership of our community",
-    "best community platform for a professional network that helps build stronger member relationships",
-    "want a community platform for a membership business for customer engagement",
-    "a place to host my community for a gaming community where conversations do not get lost",
-    "best community platform for a brand community that keeps members active",
-    "a place to host my community for a professional network that gives us ownership of our community",
-    "we are looking for a community platform for product users with groups and channels",
-    "recommend a a white label community platform for a paid membership with private spaces",
-    "we are looking for a community platform for an online course that does not feel like a social media feed",
-    "a customer community platform for founders that has good moderation tools",
-    "searching for a community platform for my audience for product users without using Discord",
-    "we are looking for a community platform for my company with real-time chat",
-    "a community management platform for our customers that is more focused than Slack",
-    "where can I find a a modern community app for a global community that supports onboarding new members",
-    "we are looking for a community platform for an AI community with organized discussions",
-    "best community platform for a B2B community that has good moderation tools",
-    "best community platform for founders for customer engagement",
-    "best community platform for a paid membership with better engagement",
-    "a platform for a free community for our users for customer engagement",
-    "a place to host my community for an e-commerce brand with events and community management",
-    "a platform to connect members for a gaming community with member profiles",
-    "best community platform for investors and founders that is easy to set up",
-    "a platform to connect members for my company that can scale with our community",
-    "need help finding a better alternative to Discord for our users for customer engagement",
-    "we are looking for a community platform for my business that gives us ownership of our community",
-    "best community platform for my startup without relying on Facebook",
-    "best community platform for an event community that is easy to set up",
-    "best community platform for creators that can scale with our community",
-    "recommendations for a community platform for an AI community",
-    "best community platform for remote teams and members that supports onboarding new members",
-    "we are looking for a community platform for an online course with member profiles",
-    "how do I build an online community for a coaching business",
-    "recommend a a community platform with AI for our SaaS customers where conversations do not get lost",
-    "looking to switch to a platform to create a niche community for an agency for customer engagement",
-    "a platform for building an online community for a paid membership that keeps members active",
-    "a community platform for my audience for alumni without relying on Facebook",
-    "best community platform for remote teams and members where conversations do not get lost",
-    "best community platform for a gaming community that supports paid memberships",
-    "looking to switch to a branded community platform for our users where conversations do not get lost",
-    "we are looking for a community platform for investors and founders with events and community management",
-    "can anyone suggest a a community platform for our SaaS customers with groups and channels",
-    "a community platform for my audience for students that is more focused than Slack",
-    "a platform for a free community for a creator community that is more focused than Slack",
-    "a simple community platform for a nonprofit without relying on Facebook",
-    "we are looking for a community platform for a brand community with better engagement",
-    "considering an online community platform for creators without relying on Facebook",
-    "we are looking for a community platform for a global community for networking between members",
-    "recommend a an affordable community platform for our SaaS customers with real-time chat",
-    "best community platform for investors and founders that has good moderation tools",
-    "a community platform for conversations for my business that has good moderation tools",
-    "any recommendations for a community platform for a nonprofit without using Discord",
-    "we are looking for a community platform for an AI community that supports onboarding new members",
-    "a community solution for developers with real-time chat",
-    "an affordable community platform for an agency with real-time chat",
-    "we are looking for a community platform for a gaming community that supports paid memberships",
-    "we are looking for a community platform for an AI community with real-time chat",
-    "we are looking for a community platform for a professional network that helps build stronger member relationships",
-    "a branded community platform for our customers that supports onboarding new members",
-    "a better alternative to Slack communities for remote teams and members with private spaces",
-    "we are looking for a community platform for a local community that works on web and mobile",
-    "best community platform for an online course that supports paid memberships",
-    "a simple community platform for alumni with groups and channels",
-    "trying to find a simple community platform for product users that does not feel like a social media feed",
-    "need a white label community platform for investors and founders that does not feel like a social media feed",
-    "a branded community platform for our users with groups and channels",
-    "best community platform for our customers for meaningful discussions",
-    "a community platform for my audience for a brand community for meaningful discussions",
-    "a branded community platform for product users for meaningful discussions",
-    "a branded community platform for a creator community that is more focused than Slack",
-    "a community software for students for meaningful discussions",
-    "an online community platform for our customers with better community analytics",
-    "we are looking for a community platform for remote teams and members that does not feel like a social media feed",
-    "best community platform for an e-commerce brand that keeps members active",
-    "what is the best a community solution for my business with better engagement",
-    "a community platform with chat for an AI community with organized discussions",
-    "recommend a a platform where members can talk and connect for creators that supports paid memberships",
-    "best community platform for creators with member profiles",
-    "we are looking for a community platform for founders with real-time chat",
-    "need an online community platform for a professional network that helps build stronger member relationships",
-    "a better alternative to Facebook Groups for a professional network that helps build stronger member relationships",
-    "an online community platform for developers with private spaces",
-    "best community platform for entrepreneurs where conversations do not get lost",
-    "considering a community platform for an AI community with better community analytics",
-    "a white label community platform for a coaching business with events and community management",
-    "a platform for a free community for a nonprofit with groups and channels",
-    "does anyone know a a branded community platform for investors and founders with a clean user experience",
-    "we are looking for a community platform for a gaming community that can scale with our community",
-    "a platform to create a niche community for an event community where conversations do not get lost",
-    "can anyone suggest a a community platform for a nonprofit with private spaces",
-    "we are looking for a community platform for a global community with a clean user experience",
-    "we are looking for a community platform for a coaching business that has good moderation tools",
-    "need help finding an affordable community platform for students that works on web and mobile",
-    "want a community platform for my audience for a professional network that does not feel like a social media feed",
-    "a community platform for conversations for a paid membership that can scale with our community",
-    "we are looking for a community platform for a gaming community with a clean user experience",
-    "best community platform for a creator community that supports onboarding new members",
-    "we are looking for a community platform for my startup with private spaces",
-    "can anyone suggest a a customer community platform for a global community that gives us ownership of our community",
-    "we are looking for a community platform for a global community without using Discord",
-    "we are looking for a community platform for founders with private spaces",
-    "what is the best a community solution for product users where conversations do not get lost",
-    "where can I find a a platform for a free community for a nonprofit that gives us ownership of our community",
-    "a place to host my community for a B2B community that is easy for members to use",
-    "we are looking for a community platform for an agency that has good moderation tools",
-    "any recommendations for a simple community platform for our customers with real-time chat",
-    "we are looking for a community platform for my company with better engagement",
-    "looking to switch to a community platform with chat for investors and founders that is more focused than Slack",
-    "an affordable community platform for an online course with groups and channels",
-    "best community platform for developers that is easy to set up",
-    "how do I build an online community for a global community",
-    "thinking about building a community for alumni",
-    "a branded community platform for a global community that supports onboarding new members",
-    "looking for a private community platform for alumni with events and community management",
-    "best community platform for my company that supports paid memberships",
-    "what is the best a platform for a free community for a gaming community that supports paid memberships",
-    "a community management platform for product users that can scale with our community",
-    "best community platform for a coaching business with private spaces",
-    "considering a community solution for my company that keeps members active",
-    "can anyone suggest a a community platform for conversations for entrepreneurs that is easy to set up",
-    "a platform to connect members for my company for customer engagement",
-    "best community platform for developers with events and community management",
-    "a better alternative to Facebook Groups for an AI community with a clean user experience",
-    "a platform for a free community for a B2B community that supports onboarding new members",
-    "best community platform for a creator community that is more focused than Slack",
-    "recommend a a customer community platform for our SaaS customers for networking between members",
-    "a community platform with mobile app for alumni for customer engagement",
-    "a better alternative to Slack communities for an e-commerce brand where conversations do not get lost",
-    "considering a customer community platform for my business without using Discord",
-    "a community solution for an agency that gives us ownership of our community",
-    "searching for a place to host my community for remote teams and members for meaningful discussions",
-    "best community platform for product users with real-time chat",
-    "a simple community platform for alumni without relying on Facebook",
-    "we are looking for a community platform for a paid membership with member profiles",
-    "best community platform for an AI community with organized discussions",
-    "we are looking for a community platform for investors and founders that keeps members active",
-    "we are looking for a community platform for a global community that gives us ownership of our community",
-    "a simple community platform for an agency with a clean user experience",
-    "we are looking for a community platform for developers that does not feel like a social media feed",
-    "can anyone suggest a a community platform with mobile app for a membership business that has good moderation tools",
-    "need a modern community app for a global community with private spaces",
-    "a community platform for founders that keeps members active",
-    "best community platform for a B2B community for networking between members",
-    "a branded community platform for product users that helps build stronger member relationships",
-    "how do I build an online community for a local community",
-    "best community platform for an event community with a clean user experience",
-    "best community platform for our SaaS customers for meaningful discussions",
-    "looking for a community solution for alumni with a clean user experience",
-    "a community platform with AI for alumni for networking between members",
-    "we are looking for a community platform for my company for meaningful discussions",
-    "what is the best a white label community platform for a coaching business with real-time chat",
-    "best community platform for students that gives us ownership of our community",
-    "best community platform for a global community where conversations do not get lost",
-    "we are looking for a community platform for our SaaS customers that works on web and mobile",
-    "best community platform for a gaming community with private spaces",
-    "best community platform for product users with organized discussions",
-    "trying to find an affordable community platform for product users that works on web and mobile",
-    "a simple community platform for a membership business where conversations do not get lost",
-    "an online community platform for my company with better community analytics",
-    "recommend a a community platform for my audience for a global community that is easy to set up",
-    "we are looking for a community platform for our customers with real-time chat",
-    "recommend a a community platform for conversations for investors and founders for meaningful discussions",
-    "a better alternative to Facebook Groups for a creator community with better engagement",
-    "looking to switch to a better alternative to Discord for investors and founders that helps build stronger member relationships",
-    "best community platform for our SaaS customers with a clean user experience",
-    "what is the best a simple community platform for my startup with private spaces",
-    "a community software for an online course for customer engagement",
-    "searching for a platform for a paid community for a nonprofit with better community analytics",
-    "any recommendations for a community platform for conversations for a local community that has good moderation tools",
-    "best community platform for our customers that is easy to set up",
-    "best community platform for developers that is more focused than Slack",
-    "a platform where members can talk and connect for creators that works on web and mobile",
-    "a community platform for conversations for my company where conversations do not get lost",
-    "a modern community app for developers that is easy to set up",
-    "trying to find a community platform with AI for founders without relying on Facebook",
-    "any recommendations for a platform to connect members for our customers with real-time chat",
-    "can anyone suggest a a community platform with AI for entrepreneurs that supports paid memberships",
-    "recommend a an affordable community platform for investors and founders without relying on Facebook",
-    "looking for a private community platform for developers with organized discussions",
-    "we are looking for a community platform for my company that is easy for members to use",
-    "best community platform for entrepreneurs that can scale with our community",
-    "best community platform for an agency without relying on Facebook",
-    "we are looking for a community platform for an online course with better community analytics",
-    "recommendations for a community platform for my company",
-    "best community platform for my business that is easy to set up",
-    "best community platform for a paid membership where conversations do not get lost",
-    "any recommendations for a better alternative to Slack communities for a creator community with groups and channels",
-    "a branded community platform for students that helps build stronger member relationships",
-    "we are looking for a community platform for students that works on web and mobile",
-    "where can I find a a community management platform for a nonprofit that keeps members active",
-    "best community platform for an e-commerce brand that works on web and mobile",
-    "a better alternative to Slack communities for founders that has good moderation tools",
-    "recommend a a customer community platform for remote teams and members that has good moderation tools",
-    "we are looking for a community platform for an agency with member profiles",
-    "a place to host my community for a membership business with better community analytics",
-    "best community platform for a coaching business that can scale with our community",
-    "we are looking for a community platform for our SaaS customers that does not feel like a social media feed",
-    "we are looking for a community platform for our customers that is more focused than Slack",
-    "a community platform with chat for a gaming community that can scale with our community",
-    "an affordable community platform for founders for networking between members",
-    "best community platform for a coaching business that gives us ownership of our community",
-    "we are looking for a community platform for my company with better community analytics",
-    "a white label community platform for my company with member profiles",
-    "we are looking for a community platform for my startup for networking between members",
-    "how do I build an online community for a brand community",
-    "can anyone suggest a a white label community platform for a professional network that supports paid memberships",
-    "best community platform for a global community with member profiles",
-    "a customer community platform for my business that keeps members active",
-    "we are looking for a community platform for an AI community for networking between members",
-    "a white label community platform for remote teams and members for customer engagement",
-    "best community platform for founders that is more focused than Slack",
-    "best community platform for a membership business with organized discussions",
-    "looking to switch to a platform for building an online community for investors and founders with member profiles",
-    "we are looking for a community platform for our customers that keeps members active",
-    "best community platform for our customers with better engagement",
-    "where can I find a a platform to create a niche community for a global community with events and community management",
-    "a community platform for my audience for a local community with private spaces",
-    "best community platform for remote teams and members for customer engagement",
-    "best community platform for an agency without using Discord",
-    "a better alternative to Slack communities for founders with private spaces",
-    "searching for a modern community app for remote teams and members that can scale with our community",
-    "a community platform for my audience for alumni that can scale with our community",
-    "considering a community software for a creator community that helps build stronger member relationships",
-    "recommendations for a community platform for a paid membership",
-    "best community platform for a brand community with organized discussions",
-    "a community software for an e-commerce brand that supports paid memberships",
-    "want a community platform for conversations for a global community without relying on Facebook",
-    "a platform for a free community for my business that works on web and mobile",
-    "a place to host my community for investors and founders that is easy to set up",
-    "best community platform for a gaming community with events and community management",
-    "a platform to create a niche community for a membership business for networking between members",
-    "best community platform for a global community that keeps members active",
-    "searching for a platform for a free community for students that gives us ownership of our community",
-    "we are looking for a community platform for a brand community that is easy for members to use",
-    "where can I find a a platform for a free community for founders that supports paid memberships",
-    "best community platform for a creator community with real-time chat",
-    "we are looking for a community platform for a coaching business for meaningful discussions",
-    "does anyone know a a platform to connect members for students with groups and channels",
-    "considering a community platform with mobile app for remote teams and members with a clean user experience",
-    "does anyone know a a community platform with AI for an event community without using Discord",
-    "does anyone know a a platform where members can talk and connect for a professional network with private spaces",
-    "does anyone know a a community software for founders that is easy to set up",
-    "a platform for a free community for a professional network with events and community management",
-    "does anyone know a a community platform for conversations for my business that does not feel like a social media feed",
-    "a community platform for a professional network that is more focused than Slack",
-    "best community platform for an e-commerce brand that does not feel like a social media feed",
-    "a community platform for conversations for a gaming community with events and community management",
-    "trying to find a platform for a free community for a gaming community where conversations do not get lost",
-    "a platform for a free community for a nonprofit with private spaces",
-    "we are looking for a community platform for a brand community with private spaces",
-    "a platform where members can talk and connect for a professional network that supports onboarding new members",
-    "a private community platform for a global community for networking between members",
-    "looking for a white label community platform for our users with member profiles",
-    "recommend a a community software for alumni without using Discord",
-    "thinking about building a community for a local community",
-    "we are looking for a community platform for a nonprofit with private spaces",
-    "a private community platform for a paid membership for customer engagement",
-    "best community platform for my company with organized discussions",
-    "does anyone know a a modern community app for a global community that is more focused than Slack",
-    "recommendations for a community platform for our customers",
-    "want a platform for building an online community for students that supports onboarding new members",
-    "we are looking for a community platform for investors and founders that supports onboarding new members",
-    "a better alternative to Discord for founders without relying on Facebook",
-    "looking for a modern community app for my startup that supports paid memberships",
-    "best community platform for a paid membership that works on web and mobile",
-    "need a white label community platform for a B2B community that is easy for members to use",
-    "a community platform for conversations for my company that is easy to set up",
-    "how do I build an online community for a paid membership",
-    "a private community platform for an AI community that works on web and mobile",
-    "a platform for a free community for an agency with real-time chat",
-    "best community platform for a gaming community with a clean user experience",
-    "best community platform for a coaching business that supports paid memberships",
-    "considering a platform to connect members for a coaching business that gives us ownership of our community",
-    "we are looking for a community platform for an AI community with better community analytics",
-    "what is the best a community management platform for founders for networking between members",
-    "best community platform for founders that works on web and mobile",
-    "best community platform for students that has good moderation tools",
-    "best community platform for remote teams and members with organized discussions",
-    "we are looking for a community platform for a paid membership with real-time chat",
-    "recommendations for a community platform for a nonprofit",
-    "we are looking for a community platform for students that gives us ownership of our community",
-    "a community software for founders for networking between members",
-    "best community platform for creators that is more focused than Slack",
-    "a community platform for conversations for a paid membership that is easy for members to use",
-    "a community software for developers that does not feel like a social media feed",
-    "best community platform for an agency that has good moderation tools",
-    "a platform to create a niche community for our customers with private spaces",
-    "a customer community platform for alumni that is easy to set up",
-    "does anyone know a a platform to create a niche community for my company that is easy to set up",
-    "we are looking for a community platform for founders with organized discussions",
-    "trying to find a platform for a paid community for a professional network without using Discord",
-    "a simple community platform for a nonprofit with organized discussions",
-    "best community platform for my company that works on web and mobile",
-    "best community platform for an e-commerce brand that supports paid memberships",
-    "want a simple community platform for an event community with a clean user experience",
-    "does anyone know a a community management platform for a gaming community with better engagement",
-    "need a platform to create a niche community for a professional network with a clean user experience",
-    "any recommendations for a community platform with mobile app for a paid membership that supports paid memberships",
-    "best community platform for developers that keeps members active",
-    "an online community platform for our customers that is more focused than Slack",
-    "a platform for a paid community for a coaching business with member profiles",
-    "we are looking for a community platform for a B2B community that works on web and mobile",
-    "a private community platform for my business that is easy for members to use",
-    "recommend a a platform for a free community for a brand community that gives us ownership of our community",
-    "searching for a place to host my community for our SaaS customers that is easy to set up",
-    "a better alternative to Facebook Groups for an agency with member profiles",
-    "a community software for an agency with private spaces",
-    "a white label community platform for entrepreneurs that is easy for members to use",
-    "we are looking for a community platform for my startup with real-time chat",
-    "we are looking for a community platform for our customers that gives us ownership of our community",
-    "how do I build an online community for developers",
-    "anyone using a community platform for an e-commerce brand",
-    "need help finding a platform for a paid community for students that has good moderation tools",
-    "recommend a a community platform with AI for my company with member profiles",
-    "best community platform for an e-commerce brand with private spaces",
-    "any recommendations for an affordable community platform for developers that keeps members active",
-    "best community platform for alumni for networking between members",
-    "we are looking for a community platform for developers that keeps members active",
-    "a better alternative to Slack communities for a coaching business that keeps members active",
-    "searching for a community software for our users that gives us ownership of our community",
-    "we are looking for a community platform for a gaming community for meaningful discussions",
-    "we are looking for a community platform for our customers without using Discord",
-    "we are looking for a community platform for alumni with groups and channels",
-    "we are looking for a community platform for my startup that is easy to set up",
-    "a platform for a paid community for a gaming community that is easy to set up",
-    "looking to switch to a customer community platform for my business with events and community management",
-    "a platform for a free community for a global community for customer engagement",
-    "a community platform with AI for product users that supports onboarding new members",
-    "looking to switch to a community platform with mobile app for our users that keeps members active",
-    "best community platform for a brand community that works on web and mobile",
-    "best community platform for a coaching business that is more focused than Slack",
-    "best community platform for investors and founders where conversations do not get lost",
-    "a platform where members can talk and connect for remote teams and members that is easy to set up",
-    "best community platform for a B2B community that supports onboarding new members",
-    "we are looking for a community platform for a coaching business with private spaces",
-    "an affordable community platform for a paid membership with member profiles",
-    "where can I find a a white label community platform for product users with better community analytics",
-    "a white label community platform for our customers that supports paid memberships",
-    "we are looking for a community platform for a nonprofit that is more focused than Slack",
-    "can anyone suggest a a place to host my community for entrepreneurs with organized discussions",
-    "we are looking for a community platform for my company that is easy to set up",
-    "does anyone know a a customer community platform for entrepreneurs that works on web and mobile",
-    "we are looking for a community platform for students without relying on Facebook",
-    "we are looking for a community platform for our customers that supports paid memberships",
-    "can anyone suggest a a community platform with AI for a global community that is more focused than Slack",
-    "a community platform with AI for our users with private spaces",
-    "best community platform for a professional network for meaningful discussions",
-    "looking for a community solution for our customers with organized discussions",
-    "a community platform with chat for a paid membership that supports paid memberships",
-    "does anyone know a a community software for a paid membership with better community analytics",
-    "trying to find a branded community platform for my startup without using Discord",
-    "recommend a a platform for building an online community for a brand community with better community analytics",
-    "trying to find a community management platform for a professional network for customer engagement",
-    "a white label community platform for an online course that is more focused than Slack",
-    "a modern community app for a creator community without relying on Facebook",
-    "best community platform for a B2B community with organized discussions",
-    "we are looking for a community platform for an AI community with better engagement",
-    "what is the best a platform to connect members for a nonprofit that has good moderation tools",
-    "can anyone suggest a a modern community app for founders that works on web and mobile",
-    "a community management platform for a creator community with a clean user experience",
-    "thinking about building a community for our customers",
-    "need help finding a modern community app for a B2B community that supports paid memberships",
-    "best community platform for students for customer engagement",
-    "a platform to connect members for developers with a clean user experience",
-    "a community platform with mobile app for remote teams and members that works on web and mobile",
-    "best community platform for a B2B community with groups and channels",
-    "anyone using a community platform for a brand community",
-    "a community solution for a membership business that works on web and mobile",
-    "a community platform with AI for a gaming community that gives us ownership of our community",
-    "we are looking for a community platform for a brand community that has good moderation tools",
-    "looking for a private community platform for my startup without using Discord",
-    "a community platform with chat for a gaming community that keeps members active",
-    "best community platform for our customers with organized discussions",
-    "how do I build an online community for students",
-    "what is the best a platform where members can talk and connect for my company that supports paid memberships",
-    "a simple community platform for my startup that is easy for members to use",
-    "searching for a place to host my community for an online course that has good moderation tools",
-    "a community platform for my audience for alumni that is easy to set up",
-    "best community platform for my company that is easy for members to use",
-    "recommend a a customer community platform for an event community that helps build stronger member relationships",
-    "how do I build an online community for our users",
-    "we are looking for a community platform for alumni that gives us ownership of our community",
-    "best community platform for my business without using Discord",
-    "want a platform for building an online community for our SaaS customers where conversations do not get lost",
-    "recommendations for a community platform for a membership business",
-    "looking for a branded community platform for an e-commerce brand for customer engagement",
-    "best community platform for a coaching business with groups and channels",
-    "a community platform for creators with a clean user experience",
-    "best community platform for creators with events and community management",
-    "what is the best a better alternative to Facebook Groups for a nonprofit that does not feel like a social media feed",
-    "a place to host my community for a professional network that is easy for members to use",
-    "we are looking for a community platform for a local community with better community analytics",
-    "need a white label community platform for a local community with private spaces",
-    "want a community platform with chat for a gaming community with member profiles",
-    "what is the best a community platform for conversations for an AI community with groups and channels",
-    "can anyone suggest a a simple community platform for an event community that supports onboarding new members",
-    "best community platform for a gaming community where conversations do not get lost",
-    "we are looking for a community platform for an online course that works on web and mobile",
-    "we are looking for a community platform for entrepreneurs that helps build stronger member relationships",
-    "need help finding a simple community platform for a membership business that is easy for members to use",
-    "a community software for founders that supports onboarding new members",
-    "a platform for a paid community for a membership business that is easy for members to use",
-    "need help finding a customer community platform for an agency that is easy for members to use",
-    "we are looking for a community platform for alumni where conversations do not get lost",
-    "how do I build an online community for a creator community",
-    "best community platform for our SaaS customers that keeps members active",
-    "a better alternative to Discord for our SaaS customers that does not feel like a social media feed",
-    "a private community platform for a paid membership that helps build stronger member relationships",
-    "a branded community platform for a nonprofit with events and community management",
-    "a private community platform for an online course that supports paid memberships",
-    "a community platform with AI for a local community with groups and channels",
-    "best community platform for creators that helps build stronger member relationships",
-    "a community platform for my audience for founders with real-time chat",
-    "a simple community platform for my company that can scale with our community",
-    "a place to host my community for a coaching business where conversations do not get lost",
-    "considering a place to host my community for our SaaS customers that helps build stronger member relationships",
-    "a branded community platform for an AI community with organized discussions",
-    "we are looking for a community platform for an agency with better engagement",
-    "best community platform for our users with events and community management",
-    "a white label community platform for a local community that can scale with our community",
-    "best community platform for an online course with private spaces",
-    "need help finding a platform to create a niche community for a coaching business that is easy to set up",
-    "a better alternative to Slack communities for a brand community with private spaces",
-    "we are looking for a community platform for product users that does not feel like a social media feed",
-    "best community platform for an AI community that helps build stronger member relationships",
-    "can anyone suggest a a modern community app for a membership business without relying on Facebook",
-    "looking to switch to a community platform with AI for a paid membership with a clean user experience",
-    "best community platform for creators with better engagement",
-    "any recommendations for a community platform with chat for our users with events and community management",
-    "a community platform for my audience for a coaching business without using Discord",
-    "a place to host my community for a creator community where conversations do not get lost",
-    "want a community platform for our SaaS customers with member profiles",
-    "best community platform for an online course that can scale with our community",
-    "looking for a customer community platform for our users that works on web and mobile",
-    "considering a community platform for conversations for our users that does not feel like a social media feed",
-    "best community platform for investors and founders that is easy for members to use",
-    "best community platform for alumni with member profiles",
-    "considering a better alternative to Discord for alumni that is easy for members to use",
-    "a simple community platform for a gaming community with a clean user experience",
-    "best community platform for a professional network with a clean user experience",
-    "we are looking for a community platform for remote teams and members with better engagement",
-    "we are looking for a community platform for developers without using Discord",
-    "a community platform with AI for founders with member profiles",
-    "need help finding a community platform for our SaaS customers with member profiles",
-    "how do I build an online community for my business",
-    "a community platform with chat for a global community that is easy to set up",
-    "where can I find a an affordable community platform for my startup that works on web and mobile",
-    "we are looking for a community platform for an event community with organized discussions",
-    "a community management platform for developers that keeps members active",
-    "we are looking for a community platform for a coaching business without using Discord",
-    "where can I find a an online community platform for a nonprofit that supports onboarding new members",
-    "recommend a a platform to create a niche community for our SaaS customers with private spaces",
-    "need help finding a platform for building an online community for an online course where conversations do not get lost",
-    "best community platform for a nonprofit that has good moderation tools",
-    "a community platform with chat for a B2B community that helps build stronger member relationships",
-    "can anyone suggest a a community platform with mobile app for our users that gives us ownership of our community",
-    "a community management platform for our customers that has good moderation tools",
-    "we are looking for a community platform for an online course that supports paid memberships",
-    "best community platform for a nonprofit with groups and channels",
-    "an affordable community platform for our SaaS customers with organized discussions",
-    "recommend a a community solution for my business where conversations do not get lost",
-    "a private community platform for a global community where conversations do not get lost",
-    "a modern community app for my startup where conversations do not get lost",
-    "a community platform for conversations for entrepreneurs with better community analytics",
-    "we are looking for a community platform for product users that has good moderation tools",
-    "we are looking for a community platform for my business that does not feel like a social media feed",
-    "we are looking for a community platform for my startup that supports onboarding new members",
-    "we are looking for a community platform for an online course that can scale with our community",
-    "a customer community platform for entrepreneurs that keeps members active",
-    "a customer community platform for a creator community with better engagement",
-    "how do I build an online community for alumni",
-    "a customer community platform for entrepreneurs that supports paid memberships",
-    "a platform for building an online community for developers that is easy to set up",
-    "best community platform for entrepreneurs that gives us ownership of our community",
-    "need a simple community platform for a global community for networking between members",
-    "looking to switch to a community management platform for a global community with better engagement",
-    "any recommendations for a community platform for developers that does not feel like a social media feed",
-    "what is the best a platform for a free community for investors and founders that does not feel like a social media feed",
-    "looking to switch to an online community platform for a local community that is easy to set up",
-    "best community platform for a nonprofit with organized discussions",
-    "searching for a customer community platform for alumni that works on web and mobile",
-    "a community software for founders for meaningful discussions",
-    "best community platform for a global community that has good moderation tools",
-    "an affordable community platform for our customers with better community analytics",
-    "we are looking for a community platform for a brand community that supports paid memberships",
-    "looking to switch to a platform for building an online community for product users without relying on Facebook",
-    "an online community platform for an agency with real-time chat",
-    "an affordable community platform for an agency for networking between members",
-    "a branded community platform for developers that can scale with our community",
-    "need help finding a platform for a free community for a gaming community with groups and channels",
-    "we are looking for a community platform for remote teams and members that can scale with our community",
-    "thinking about building a community for remote teams and members",
-    "best community platform for an AI community that does not feel like a social media feed",
-    "looking for a customer community platform for my business that has good moderation tools",
-    "considering a community platform for conversations for investors and founders that works on web and mobile",
-    "what is the best a platform for a paid community for a gaming community that gives us ownership of our community",
-    "best community platform for a nonprofit that supports onboarding new members",
-    "best community platform for alumni that is easy to set up",
-    "we are looking for a community platform for my startup that keeps members active",
-    "a better alternative to Facebook Groups for alumni that has good moderation tools",
-    "best community platform for an event community without using Discord",
-    "want a simple community platform for our customers that does not feel like a social media feed",
-    "trying to find a community platform for conversations for a professional network with real-time chat",
-    "we are looking for a community platform for students that is easy to set up",
-    "a platform for a free community for an e-commerce brand where conversations do not get lost",
-    "an online community platform for an AI community that supports onboarding new members",
-    "a community platform for conversations for a coaching business that is easy to set up",
-    "a better alternative to Discord for a local community where conversations do not get lost",
-    "we are looking for a community platform for a creator community with better engagement",
-    "best community platform for an online course that keeps members active",
-    "we are looking for a community platform for our SaaS customers that can scale with our community",
-    "what is the best a community solution for our users where conversations do not get lost",
-    "a customer community platform for a professional network that supports paid memberships",
-    "want a community management platform for a brand community that does not feel like a social media feed",
-    "best community platform for a B2B community that works on web and mobile",
-    "an online community platform for a global community that helps build stronger member relationships",
-    "a modern community app for students that can scale with our community",
-    "thinking about building a community for a creator community",
-    "need a place to host my community for my company that has good moderation tools",
-    "best community platform for our SaaS customers without using Discord",
-    "a better alternative to Discord for a gaming community that can scale with our community",
-    "an online community platform for an event community that helps build stronger member relationships",
-    "best community platform for my company for meaningful discussions",
-    "a community platform for my audience for developers with organized discussions",
-    "a platform to connect members for alumni for meaningful discussions",
-    "considering a customer community platform for our customers with member profiles",
-    "recommend a a platform for a paid community for entrepreneurs with member profiles",
-    "we are looking for a community platform for an event community that supports paid memberships",
-    "a better alternative to Discord for students that is more focused than Slack",
-    "trying to find a customer community platform for a professional network that can scale with our community",
-    "how do I build an online community for my company",
-    "best community platform for creators that works on web and mobile",
-    "we are looking for a community platform for a gaming community for networking between members",
-    "a modern community app for our customers that gives us ownership of our community",
-    "a better alternative to Slack communities for remote teams and members with better community analytics",
-    "a private community platform for a brand community for networking between members",
-    "we are looking for a community platform for creators that keeps members active",
-    "recommend a a better alternative to Discord for an e-commerce brand that gives us ownership of our community",
-    "best community platform for my business with better community analytics",
-    "best community platform for my startup without using Discord",
-    "we are looking for a community platform for a brand community for meaningful discussions",
-    "looking for a modern community app for entrepreneurs that does not feel like a social media feed",
-    "a community management platform for creators that has good moderation tools",
-    "anyone using a community platform for a local community",
-    "recommendations for a community platform for creators",
-    "a place to host my community for a professional network for meaningful discussions",
-    "we are looking for a community platform for an e-commerce brand with member profiles",
-    "we are looking for a community platform for a creator community that helps build stronger member relationships",
-    "can anyone suggest a a platform to connect members for an online course that works on web and mobile",
-    "a community platform for my audience for my business that supports onboarding new members",
-    "we are looking for a community platform for a paid membership that is more focused than Slack",
-    "a community solution for a local community without relying on Facebook",
-    "recommend a a community software for our SaaS customers that keeps members active",
-    "we are looking for a community platform for product users with organized discussions",
-    "how do I build an online community for creators",
-    "we are looking for a community platform for a nonprofit that has good moderation tools",
-    "best community platform for remote teams and members with better engagement",
-    "a platform for a free community for a nonprofit that works on web and mobile",
-    "we are looking for a community platform for a brand community that gives us ownership of our community",
-    "best community platform for investors and founders for networking between members",
-    "we are looking for a community platform for creators that has good moderation tools",
-    "best community platform for an online course that has good moderation tools",
-    "best community platform for an AI community with events and community management",
-    "we are looking for a community platform for an online course with a clean user experience",
-    "anyone using a community platform for my startup",
-    "we are looking for a community platform for my business for customer engagement",
-    "a better alternative to Slack communities for my startup that is easy for members to use",
-    "we are looking for a community platform for remote teams and members that keeps members active",
-    "best community platform for an AI community where conversations do not get lost",
-    "looking to switch to a better alternative to Facebook Groups for a local community that helps build stronger member relationships",
-    "best community platform for a brand community with groups and channels",
-    "what is the best a simple community platform for a global community that does not feel like a social media feed",
-    "where can I find a a platform for building an online community for creators that gives us ownership of our community",
-    "recommendations for a community platform for a brand community",
-    "best community platform for an AI community that is easy for members to use",
-    "best community platform for our customers that gives us ownership of our community",
-    "can anyone suggest a a better alternative to Discord for an online course that supports paid memberships",
-    "an online community platform for our users that supports onboarding new members",
-    "where can I find a a community software for a global community with member profiles",
-    "a community software for a brand community that helps build stronger member relationships",
-    "where can I find a a modern community app for alumni with events and community management",
-    "searching for a community management platform for my startup for networking between members",
-    "best community platform for our customers with real-time chat",
-    "a platform for a free community for an event community that can scale with our community",
-    "we are looking for a community platform for alumni that does not feel like a social media feed",
-    "a better alternative to Facebook Groups for a professional network for meaningful discussions",
-    "best community platform for a paid membership for customer engagement",
-    "where can I find a a platform for a paid community for product users that keeps members active",
-    "best community platform for product users without using Discord",
-    "anyone using a community platform for a professional network",
-    "a simple community platform for developers with member profiles",
-    "best community platform for our customers without relying on Facebook",
-    "can anyone suggest a a platform where members can talk and connect for alumni where conversations do not get lost",
-    "we are looking for a community platform for my startup that helps build stronger member relationships",
-    "looking to switch to a community platform with AI for a nonprofit that has good moderation tools",
-    "does anyone know a an affordable community platform for founders for networking between members",
-    "a platform for a free community for a paid membership that keeps members active",
-    "best community platform for product users that is easy for members to use",
-    "we are looking for a community platform for a local community where conversations do not get lost",
-    "a modern community app for an AI community with organized discussions",
-    "a community platform for conversations for a membership business for meaningful discussions",
-    "what is the best a better alternative to Discord for our customers that can scale with our community",
-    "recommendations for a community platform for a professional network",
-    "what is the best a private community platform for a local community that keeps members active",
-    "a community platform for my audience for our users that keeps members active",
-    "we are looking for a community platform for a membership business that is easy for members to use",
-    "a community platform for a brand community with better community analytics",
-    "best community platform for product users that helps build stronger member relationships",
-    "recommendations for a community platform for alumni",
-    "looking for a platform to connect members for our users that keeps members active",
-    "a better alternative to Discord for a local community that is easy for members to use",
-    "looking for a community solution for our SaaS customers with better community analytics",
-    "a community platform with mobile app for a local community for networking between members",
-    "a better alternative to Facebook Groups for an event community that is easy to set up",
-    "we are looking for a community platform for creators that is more focused than Slack",
-    "trying to find a better alternative to Slack communities for investors and founders with better community analytics",
-    "trying to find a community platform with chat for creators with better engagement",
-    "a platform to connect members for a brand community that supports paid memberships",
-    "need help finding a better alternative to Facebook Groups for my company with organized discussions",
-    "a community software for alumni that supports paid memberships",
-    "we are looking for a community platform for investors and founders with real-time chat",
-    "we are looking for a community platform for an event community for customer engagement",
-    "we are looking for a community platform for a brand community without relying on Facebook",
-    "searching for a branded community platform for my company where conversations do not get lost",
-    "we are looking for a community platform for our SaaS customers with groups and channels",
-    "best community platform for entrepreneurs that helps build stronger member relationships",
-    "we are looking for a community platform for product users without using Discord",
-    "need help finding a modern community app for entrepreneurs where conversations do not get lost",
-    "a platform to connect members for alumni without relying on Facebook",
-    "a community platform with chat for creators for networking between members",
-    "we are looking for a community platform for a B2B community with real-time chat",
-    "need help finding an online community platform for a paid membership that helps build stronger member relationships",
-    "a modern community app for an e-commerce brand that is easy for members to use",
-    "what is the best a private community platform for founders that supports paid memberships",
-    "a platform for a free community for a coaching business with groups and channels",
-    "how do I build an online community for an agency",
-    "best community platform for our users for customer engagement",
-    "we are looking for a community platform for our customers with events and community management",
-    "need a platform for a paid community for an e-commerce brand for meaningful discussions",
-    "a better alternative to Slack communities for our customers that supports paid memberships",
-    "best community platform for a gaming community that is more focused than Slack",
-    "searching for a community platform for my audience for our SaaS customers with private spaces"
+
 
 ]
 
-# ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG — UNTOUCHED from v9.11.1. ──
-KEYWORD_CHECK_INTERVAL_SECONDS  = int(os.getenv("KEYWORD_CHECK_INTERVAL_SECONDS", "60"))
-
-# ── KEYWORD RETRY COOLDOWN — UNTOUCHED. Kept purely so flintel_keywords'
-# schema/behavior stays byte-for-byte identical to v9.11.1, even though
-# this specific cooldown path is no longer exercised by the SERP loop
-# now that Reddit fetching has moved out of process_one_keyword() (SERP
-# discovery no longer performs any Reddit HTTP fetch that could fail).
+# ── PER-KEYWORD "FETCH ONCE, EVER" CACHE CONFIG — UNCHANGED.
+KEYWORD_CHECK_INTERVAL_SECONDS = int(os.getenv("KEYWORD_CHECK_INTERVAL_SECONDS", "60"))
 REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS = int(os.getenv("REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS", "1800"))
 
-SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "20"))
+# depth + lookback — read from .env exactly as before. Depth default
+# raised to 100 per request.
+SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "100"))
 SERP_MONTHS_BACK         = int(os.getenv("SERP_MONTHS_BACK", "6"))
 SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
 
-# ── SEARCH-VOLUME BATCH SEEDING CONFIG — UNTOUCHED. ─────────────────────────
-SEARCH_VOLUME_BATCH_SIZE = int(os.getenv("SEARCH_VOLUME_BATCH_SIZE", "12"))
-
-# ── TWITTER SEARCH KEYWORDS — independent from Reddit's list, unchanged ────
-TWITTER_SEARCH_KEYWORDS = [
-    kw.strip() for kw in os.getenv(
-        "TWITTER_SEARCH_KEYWORDS",
-        "Wise blocked,bank blocked my transfer,Payoneer blocked,"
-        "cross border payment,CRM is a nightmare,recommend a CRM,"
-        "we got hacked,ransomware attack,need incident response,"
-        "Salesforce alternative,switching from HubSpot"
-    ).split(",") if kw.strip()
-]
-
-# ── REDDIT "SMART FETCH" CONFIG — v9.6 retry logic, UNCHANGED. Still used
-# by fetch_reddit_post_by_url() / _reddit_get_with_retry(), now called
-# from run_reddit_fetch_loop() instead of from the SERP loop — the retry
-# behavior itself is identical either way.
+# ── REDDIT "SMART FETCH" CONFIG — UNCHANGED v9.6 retry logic.
 REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
 REDDIT_FETCH_BACKOFF_BASE    = float(os.getenv("REDDIT_FETCH_BACKOFF_BASE", "2.0"))
 REDDIT_FETCH_JITTER_MIN      = float(os.getenv("REDDIT_FETCH_JITTER_MIN", "0.4"))
 REDDIT_FETCH_JITTER_MAX      = float(os.getenv("REDDIT_FETCH_JITTER_MAX", "1.6"))
 REDDIT_USER_AGENT = os.getenv(
     "REDDIT_USER_AGENT",
-    "python:flintel-signal-bot:v9.12 (by /u/flintel_signals)",
+    "python:flintel-signal-bot:v1.0 (by /u/flintel_signals)",
 )
 
-# ── NEW (v9.12) — flintel_google_posts CONFIG ───────────────────────────────
-# REDDIT_FETCH_CHECK_INTERVAL_SECONDS -> how often run_reddit_fetch_loop()
-#                        wakes up to ask "are there any flintel_google_posts
-#                        documents still reddit_fetched=False?" Cheap DB
-#                        query — the actual Reddit RSS HTTP fetch only fires
-#                        for posts genuinely due.
-#
-# REDDIT_POST_RETRY_COOLDOWN_SECONDS -> when a specific post_url's Reddit
-#                        RSS fetch genuinely fails (network/HTTP, retries
-#                        exhausted), it is left reddit_fetched=False so it
-#                        gets retried, but not on the very next pass —
-#                        next_retry_at spaces retries out exactly like
-#                        v9.11.2's per-keyword cooldown did, just scoped to
-#                        one post_url instead of one keyword now.
+# ── flintel_google_posts CONFIG — UNCHANGED.
 REDDIT_FETCH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDDIT_FETCH_CHECK_INTERVAL_SECONDS", "30"))
 REDDIT_POST_RETRY_COOLDOWN_SECONDS  = int(os.getenv("REDDIT_POST_RETRY_COOLDOWN_SECONDS", "1800"))
 
-SERP_RESULTS_PER_KEYWORD = SERP_RESULTS_PER_KEYWORD  # unchanged reference kept for clarity
+REDDIT_ENABLED = os.getenv("REDDIT_ENABLED", "True").strip().lower() in ("1", "true", "yes", "on")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API KEY AUTH (unchanged)
+# API KEY AUTH — unchanged shape, only used to protect read-only endpoints.
 # ─────────────────────────────────────────────────────────────────────────────
 
 API_KEY = os.getenv("API_KEY", "")
@@ -1377,26 +159,13 @@ async def verify_api_key(
     raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="Invalid or missing API key.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PLATFORM ENABLE / DISABLE FLAGS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _bool_env(key: str, default: bool = True) -> bool:
-    val = os.getenv(key, str(default)).strip().lower()
-    return val in ("1", "true", "yes", "on")
-
-REDDIT_ENABLED  = _bool_env("REDDIT_ENABLED",  True)
-TWITTER_ENABLED = _bool_env("TWITTER_ENABLED", False)
-
-
 def _working(flag: bool) -> str:
     return "✅ Working" if flag else "❌ Not Working"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC JSON FIELD-EXTRACTION HELPERS — UNTOUCHED from v9.11.1. Used ONLY
-# by the Google-rank / search-volume RapidAPI code below, which this build
-# does not modify in any way.
+# GENERIC JSON FIELD-EXTRACTION HELPERS — UNCHANGED. Used ONLY by the
+# Google SERP RapidAPI code below.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _dig_value(obj, candidate_keys: list):
@@ -1463,46 +232,11 @@ RESULT_LIST_KEY_CANDIDATES = [
     "results", "organic_results", "organic", "items", "data", "response", "hits",
 ]
 
-VOLUME_FIELD_CANDIDATES = [
-    "search_volume", "searchVolume", "volume", "monthly_searches",
-    "avg_monthly_searches", "monthlySearchVolume", "search_volume_monthly",
-    "avg_search_volume",
-]
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# SHARED QUEUES — platform-isolated, NEVER mixed.
-# ─────────────────────────────────────────────────────────────────────────────
-
-reddit_queue:  queue.Queue = queue.Queue()
-twitter_queue: queue.Queue = queue.Queue()
-
-
-def passes_keyword_filter(text: str, keywords: list) -> bool:
-    """Generic keyword gate — UNCHANGED in implementation. Still used as
-    a second-layer safety filter inside run_batch_processor() before a
-    batch is sent to Claude — but as of v9.12.1 it is only actually
-    invoked for Twitter items (see run_batch_processor() below). Reddit
-    items are pre-filtered upstream by passes_fuzzy_filter(), which is
-    the authoritative relevance check for that platform."""
-    t = text.lower()
-    for kw in keywords:
-        if kw.lower() in t:
-            return True
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW (v9.12) — PYTHON AUTO-FUZZY-KEYWORD GENERATION + MATCHING
-#
-# These two functions are the entire "fuzzy keyword" system requested:
-# generate_fuzzy_keywords() runs ONCE per SERP result, at save time, and
-# the resulting list is stored directly on that post's flintel_google_posts
-# document (see save_google_post() below) — nothing is regenerated later,
-# nothing is kept in a separate python list. passes_fuzzy_filter() is the
-# matcher used by run_reddit_fetch_loop() against the ACTUAL fetched RSS
-# content, using exactly the fuzzy_keywords + search_keyword already
-# stored on that one document.
+# FUZZY KEYWORD GENERATION + MATCHING — UNCHANGED from v9.12. This is the
+# only relevance filter left in the whole file: a fetched Reddit post is
+# only saved into flintel_signals if it matches its own stored
+# search_keyword / fuzzy_keywords.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _FUZZY_STOPWORDS = {
@@ -1512,24 +246,10 @@ _FUZZY_STOPWORDS = {
 
 
 def generate_fuzzy_keywords(search_keyword: str) -> list:
-    """
-    Python auto-generates a small set of fuzzy variants for one Google
-    search_keyword, so Reddit-fetch-time filtering isn't limited to an
-    exact-substring match against the full original phrase. This is
-    intentionally simple/deterministic (no external NLP dependency):
-
-      - the full original phrase, lowercased
-      - the phrase with stopwords stripped
-      - every individual "significant" word (len > 2, not a stopword)
-      - every consecutive significant-word bigram, in original order
-      - a naive singular/plural variant of every value above
-
-    Called exactly once per SERP result, at save_google_post() time —
-    the result is persisted on that post's own flintel_google_posts
-    document and reused from there every time that post is considered
-    for fetching. Never regenerated on the fly, never kept in a
-    standalone python list.
-    """
+    """UNCHANGED — Python auto-generates a small set of fuzzy variants for
+    one Google search_keyword (full phrase, stopword-stripped phrase,
+    individual significant words, bigrams, naive singular/plural
+    variants). Called once per SERP result, at save_google_post() time."""
     kw = (search_keyword or "").lower().strip()
     words = re.findall(r"[a-z0-9']+", kw)
     variants = set()
@@ -1560,14 +280,9 @@ def generate_fuzzy_keywords(search_keyword: str) -> list:
 
 
 def passes_fuzzy_filter(text: str, search_keyword: str, fuzzy_keywords: list) -> bool:
-    """
-    Checks fetched Reddit post text (title + summary, as produced by
-    fetch_reddit_post_by_url()) against the ORIGINAL search_keyword and
-    that post's own stored fuzzy_keywords list — both read straight off
-    the flintel_google_posts document, nothing recomputed here. Simple
-    substring containment, same style as the existing
-    passes_keyword_filter() used downstream in the batch processor.
-    """
+    """UNCHANGED — checks fetched Reddit post text against the ORIGINAL
+    search_keyword and that post's own stored fuzzy_keywords list, both
+    read straight off the flintel_google_posts document."""
     if not text:
         return False
     t = text.lower()
@@ -1580,212 +295,9 @@ def passes_fuzzy_filter(text: str, search_keyword: str, fuzzy_keywords: list) ->
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TWITTER SEARCH QUERY — built directly from TWITTER_SEARCH_KEYWORDS
-# (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_twitter_search_query() -> str:
-    if not TWITTER_SEARCH_KEYWORDS:
-        return (
-            "(\"international transfer\" OR \"bank blocked\" OR \"CRM is a nightmare\")"
-            " -is:retweet lang:en"
-        )
-    parts = [f'"{kw}"' if " " in kw else kw for kw in TWITTER_SEARCH_KEYWORDS]
-    query = "(" + " OR ".join(parts) + ") -is:retweet lang:en"
-    log.info(f"Twitter search query built | terms:{len(parts)} | len:{len(query)}")
-    return query
-
-
-TWITTER_SEARCH_QUERY = _build_twitter_search_query()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE PROMPT — generic, niche-agnostic (unchanged schema)
-# ─────────────────────────────────────────────────────────────────────────────
-
-CLAUDE_SYSTEM_PROMPT = """
-You are Flintel's signal intelligence analyst.
-
-Your job is to read one social media post (Reddit or X), together with
-its metadata and the industry it was matched against, and produce two
-things:
-
-1. An intent_score from 1 to 100, built from three weighted components
-2. A short, human-written-style reply draft the end user can personalize
-   and post themselves, in their own voice, from their own account
-
-You score using the industry context you are given. You are never told
-the specific company or product this is for — only the industry
-category (e.g. "fintech_payments", "cybersecurity", "crm_sales_tools",
-"logistics", "recruitment_hr", "accounting_software"). Two posts using
-identical words ("hidden fees are killing us") can score very
-differently depending on whether the industry context is fintech
-billing versus logistics freight surcharges — use the industry field to
-judge whether the post's actual subject matches that vertical's real
-buyer pain, not just shared vocabulary.
-
-═══════════════════════════════════════════════════════════════════════
-INPUT YOU WILL RECEIVE, PER POST
-═══════════════════════════════════════════════════════════════════════
-- platform: "reddit" | "x"
-- industry: one of the six category strings above
-- search_keyword: the phrase this post was matched against
-- post_text: the raw post content
-- google_rank: integer, or null (X posts will almost always be null —
-  see Component 2 below)
-- search_volume: monthly search volume for search_keyword, or null
-- upvotes / likes: integer, platform-appropriate
-- comments: integer
-
-═══════════════════════════════════════════════════════════════════════
-SCORING MODEL — 100 POINTS, THREE COMPONENTS
-═══════════════════════════════════════════════════════════════════════
-
-── COMPONENT 1 — RELEVANCE MATCH (0-40 points) ──────────────────────
-Does this post genuinely discuss the same problem or need as
-search_keyword, interpreted through the lens of the given industry —
-in meaning, not just in shared words?
-
-  36-40  Unambiguously about exactly this problem, in this industry.
-  25-35  Clearly related, but broader, tangential, or partial —
-         e.g. discussing the general category without the specific pain.
-  10-24  Matching words present, but the actual subject differs, OR the
-         pain described belongs to a different industry than the one
-         given (e.g. "hidden fees" post is about parking tickets, not
-         payment processing).
-  0-9    No genuine connection.
-
-THIS COMPONENT IS A HARD GATE.
-If relevance scores below 10: is_relevant = false, and intent_score
-must not exceed 15 — regardless of how strong Component 2 or 3 look.
-A top-ranked, highly-upvoted post about the wrong subject is still a
-wrong-subject post.
-
-── COMPONENT 2 — GOOGLE VISIBILITY (0-30 points) ─────────────────────
-google_rank contribution (0-20):
-  Rank 1        -> 20
-  Rank 2-3      -> 16
-  Rank 4-10     -> 11
-  Rank 11-20    -> 6
-  Not ranked/null -> 0
-
-search_volume contribution (0-10):
-  10,000+/mo    -> 10
-  3,000-9,999   -> 7
-  500-2,999     -> 4
-  Under 500/null -> 1
-
-X-SPECIFIC NOTE: X posts are not Google-indexed the way Reddit threads
-are, so google_rank will almost always be null for platform == "x".
-A null rank on an X post is EXPECTED and is not a quality signal one
-way or the other — do not treat it as a penalty, and do not attempt to
-infer or guess a rank that wasn't provided. Score the 0-point rank
-contribution plainly and let Components 1 and 3 carry that post.
-
-── COMPONENT 3 — ENGAGEMENT SIGNAL (0-30 points) ─────────────────────
-Derived from upvotes/likes and comments, judged proportionally to
-platform norms — the same raw number means different things on
-different platforms.
-
-Reference anchors (interpolate between these, don't treat as rigid
-cutoffs):
-  REDDIT   Strong: 50+ upvotes, 15+ comments      -> 22-30
-           Moderate: 10-49 upvotes, 3-14 comments  -> 10-21
-           Low: under 10 upvotes, under 3 comments -> 0-9
-  X        Strong: 100+ likes, 10+ replies         -> 22-30
-           Moderate: 20-99 likes, 2-9 replies       -> 10-21
-           Low: under 20 likes, under 2 replies     -> 0-9
-  No engagement data provided on either platform    -> 0
-
-FINAL intent_score = Component 1 + Component 2 + Component 3, capped at 100.
-
-═══════════════════════════════════════════════════════════════════════
-WORKED EXAMPLES
-═══════════════════════════════════════════════════════════════════════
-
-Example A — high-scoring, correct industry match
-  Input: platform=reddit, industry=fintech_payments,
-  search_keyword="cross-border payment fees", google_rank=2,
-  search_volume=4200, upvotes=87, comments=22,
-  post_text="Does anyone have a solid alternative to [processor] for
-  cross-border fees? We're getting killed on FX markups every month."
-  Reasoning: Directly about cross-border payment fees in a fintech
-  context (Component 1: 39). Rank 2 + volume 4,200/mo (Component 2:
-  16+7=23). 87 upvotes/22 comments on Reddit is strong (Component 3: 26).
-  Output: intent_score=88, is_relevant=true,
-  reply_draft="Cross-border fees catch a lot of teams off guard —
-  worth checking whether your provider discloses FX markup upfront or
-  buries it in the settlement rate. Have you compared what you're
-  actually losing per transaction?"
-
-Example B — hard-gate failure despite strong surface signals
-  Input: platform=reddit, industry=logistics,
-  search_keyword="hidden fees", google_rank=1, search_volume=8000,
-  upvotes=340, comments=95,
-  post_text="Just found out my city adds a hidden fee to every parking
-  ticket if you pay online. Total scam."
-  Reasoning: Shares the words "hidden fees" but is about parking
-  tickets, not logistics/freight pricing (Component 1: 4 — hard gate
-  triggered). Rank and engagement are irrelevant once the gate fails.
-  Output: intent_score=9, is_relevant=false, reply_draft=null
-
-Example C — X post, no Google rank, still a real match
-  Input: platform=x, industry=cybersecurity,
-  search_keyword="EDR alert fatigue", google_rank=null,
-  search_volume=1400, likes=64, comments=11,
-  post_text="Our SOC ignored a real alert last week because we get 200
-  false positives a day. Something has to change."
-  Reasoning: Directly describes EDR alert fatigue (Component 1: 37).
-  google_rank null is expected for X — score 0 for that piece, but
-  volume 1,400 still contributes (Component 2: 0+4=4). 64 likes/11
-  comments is strong for X (Component 3: 25).
-  Output: intent_score=66, is_relevant=true,
-  reply_draft="200 false positives a day would burn out any team, not
-  just miss the real one. Sounds like the tuning problem is as much
-  the issue as the tool itself — has your team looked at what's driving
-  the noise ratio that high?"
-
-═══════════════════════════════════════════════════════════════════════
-REPLY DRAFT — RULES
-═══════════════════════════════════════════════════════════════════════
-Only generate reply_draft when is_relevant is true. Otherwise: null.
-
-- Generic and honest — never invent a fake personal story, dollar
-  amount, or timeline not present in the input.
-- Acknowledge the poster's situation in one clause, then offer one
-  genuinely useful angle — not a pitch.
-- 2-3 sentences maximum. No links, no "DM me," no product/company name
-  (the end user adds that themselves if relevant).
-- End on warmth or a question, never a call-to-action.
-- AVOID: "I totally understand," "This is so common," or any opener
-  that could paste onto literally any post — anchor the first clause
-  to a specific detail from post_text so it reads as actually read,
-  not templated.
-
-═══════════════════════════════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════════════════════════════
-Return ONLY valid JSON. No preamble, no markdown, no code fences.
-Return one object per post, in a JSON array, same order as received.
-
-[
-  {
-    "index": <1-based integer matching input order>,
-    "intent_score": <integer 1-100>,
-    "is_relevant": <true|false>,
-    "reply_draft": "<string, 2-3 sentences, or null if is_relevant is false>"
-  }
-]
-
-Score every post received. Return the same count as received. Never
-omit an item. Never add commentary outside the JSON array.
-"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MONGODB — signals collection + persistent batch-state collections +
-# per-keyword fetch-once-forever cache collection (flintel_keywords) +
-# NEW (v9.12): flintel_google_posts.
+# MONGODB — flintel_signals + flintel_keywords (fetch-once cache) +
+# flintel_google_posts. Batch/queue collections REMOVED entirely — there
+# is no batching or Claude step left to persist state for.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_database():
@@ -1794,37 +306,18 @@ def get_database():
         client.server_info()
         db = client[MONGODB_DB]
 
-        db.signals.create_index([("message_id", ASCENDING)], unique=True, name="message_id_unique")
-        db.signals.create_index([("post_url", ASCENDING)], name="post_url_lookup")
-        for field in ["intent_score", "created_at", "client_id", "platform", "is_relevant", "status"]:
-            db.signals.create_index([(field, ASCENDING)])
+        db.flintel_signals.create_index([("message_id", ASCENDING)], unique=True, name="message_id_unique")
+        db.flintel_signals.create_index([("post_url", ASCENDING)], name="post_url_lookup")
+        for field in ["search_keyword", "platform", "created_at"]:
+            db.flintel_signals.create_index([(field, ASCENDING)])
 
-        # persistent batch state — survives restarts, no in-flight batch lost
-        db.flintel_pending_batch.create_index([("platform", ASCENDING)], unique=True, name="platform_unique")
-        db.flintel_seen_ids.create_index([("platform", ASCENDING)], unique=True, name="seen_platform_unique")
-        db.flintel_queue_messages.create_index(
-            [("_platform_key", ASCENDING), ("message_id", ASCENDING)],
-            unique=True, name="queue_platform_message_unique",
-        )
-        db.flintel_batch_seconds.create_index(
-            [("platform", ASCENDING)], unique=True, name="batch_seconds_platform_unique"
-        )
-
-        # ── flintel_keywords — FETCH-ONCE-FOREVER cache. UNTOUCHED
-        # collection/index definitions from v9.11.1 — this build does not
-        # modify this collection's schema, indexes, or logic in any way.
+        # flintel_keywords — fetch-once-forever cache. UNCHANGED shape,
+        # minus the search_volume fields (removed — no longer used).
         db.flintel_keywords.create_index([("keyword", ASCENDING)], unique=True, name="keyword_unique")
         db.flintel_keywords.create_index([("fetched", ASCENDING)], name="keyword_fetched_idx")
-        db.flintel_keywords.create_index([("search_volume", ASCENDING)], name="keyword_volume_idx")
         db.flintel_keywords.create_index([("next_retry_at", ASCENDING)], name="keyword_retry_cooldown_idx")
 
-        # ── NEW (v9.12) — flintel_google_posts. One document per Reddit
-        # post_url ever surfaced by SERP discovery. Stores everything
-        # Reddit-fetch needs (post_url, google_rank, the exact
-        # search_keyword used to find it, its subreddit, and its
-        # Python-generated fuzzy_keywords) so run_reddit_fetch_loop()
-        # never has to keep its own parallel python list of any of this
-        # — it reads it straight off these documents.
+        # flintel_google_posts — UNCHANGED schema/indexes from v9.12.
         db.flintel_google_posts.create_index(
             [("post_url", ASCENDING)], unique=True, name="google_post_url_unique"
         )
@@ -1850,32 +343,6 @@ def get_database():
 
 db = get_database()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ANTHROPIC CLIENT — streaming
-# ─────────────────────────────────────────────────────────────────────────────
-
-anthropic_client = anthropic.Anthropic(
-    api_key=ANTHROPIC_API_KEY,
-    http_client=httpx.Client(
-        timeout=httpx.Timeout(connect=30.0, read=None, write=60.0, pool=30.0)
-    ),
-)
-
-
-def retry_with_backoff(func, *args, retries=3, delay=2, label="op", **kwargs):
-    for attempt in range(1, retries + 1):
-        try:
-            return func(*args, **kwargs)
-        except Exception as exc:
-            wait = delay * attempt
-            log.error(f"[{label}] attempt {attempt}/{retries} failed: {exc}")
-            if attempt < retries:
-                log.info(f"[{label}] retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                log.critical(f"[{label}] all {retries} attempts failed.")
-                return None
-
 
 def log_operator_alert(title: str, detail: str, level: str = "ERROR"):
     log.log(
@@ -1885,143 +352,8 @@ def log_operator_alert(title: str, detail: str, level: str = "ERROR"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PERSISTENT BATCH STATE HELPERS — UNCHANGED from v9.11.1.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_pending_batch(platform: str) -> tuple:
-    try:
-        doc = db.flintel_pending_batch.find_one({"platform": platform})
-        if not doc:
-            return [], None
-        items = doc.get("items", [])
-        start_ts = doc.get("batch_start_time")
-        start_time = start_ts.timestamp() if start_ts else None
-        if items:
-            log.warning(f"[{platform.upper()}] Resuming persisted batch | {len(items)} item(s) recovered.")
-        return items, start_time
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] load_pending_batch error: {exc}")
-        return [], None
-
-
-def save_pending_batch(platform: str, items: list, batch_start_time):
-    try:
-        start_dt = datetime.fromtimestamp(batch_start_time, tz=timezone.utc) if batch_start_time else None
-        db.flintel_pending_batch.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "items": items, "batch_start_time": start_dt,
-                       "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] save_pending_batch error: {exc}")
-
-
-def clear_pending_batch(platform: str):
-    try:
-        db.flintel_pending_batch.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "items": [], "batch_start_time": None,
-                       "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] clear_pending_batch error: {exc}")
-
-
-def load_seen_ids(platform: str) -> set:
-    try:
-        doc = db.flintel_seen_ids.find_one({"platform": platform})
-        return set(doc.get("ids", [])) if doc else set()
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] load_seen_ids error: {exc}")
-        return set()
-
-
-def save_seen_ids(platform: str, ids: set, cap: int = 200_000):
-    try:
-        id_list = list(ids)
-        if len(id_list) > cap:
-            id_list = id_list[-cap:]
-        db.flintel_seen_ids.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "ids": id_list, "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] save_seen_ids error: {exc}")
-
-
-def save_queue_message(platform: str, item: dict):
-    try:
-        mid = item.get("message_id")
-        if not mid:
-            return
-        doc = dict(item)
-        doc["_platform_key"] = platform
-        doc["message_id"] = mid
-        doc["queued_at"] = datetime.now(timezone.utc)
-        db.flintel_queue_messages.update_one(
-            {"_platform_key": platform, "message_id": mid}, {"$set": doc}, upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] save_queue_message error: {exc}")
-
-
-def remove_queue_message(platform: str, message_id: str):
-    if not message_id:
-        return
-    try:
-        db.flintel_queue_messages.delete_one({"_platform_key": platform, "message_id": message_id})
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] remove_queue_message error: {exc}")
-
-
-def load_queue_messages(platform: str) -> list:
-    try:
-        docs = list(db.flintel_queue_messages.find({"_platform_key": platform}))
-        items = []
-        for d in docs:
-            d.pop("_id", None)
-            d.pop("_platform_key", None)
-            d.pop("queued_at", None)
-            items.append(d)
-        return items
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] load_queue_messages error: {exc}")
-        return []
-
-
-def save_batch_seconds(platform: str, batch_start_time):
-    try:
-        start_dt = datetime.fromtimestamp(batch_start_time, tz=timezone.utc) if batch_start_time else None
-        db.flintel_batch_seconds.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "batch_start_time": start_dt,
-                       "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] save_batch_seconds error: {exc}")
-
-
-def clear_batch_seconds(platform: str):
-    try:
-        db.flintel_batch_seconds.update_one(
-            {"platform": platform},
-            {"$set": {"platform": platform, "batch_start_time": None,
-                       "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-    except Exception as exc:
-        log.error(f"[{platform.upper()}] clear_batch_seconds error: {exc}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD CACHE — flintel_keywords collection. 100% UNTOUCHED from v9.11.1
-# — every function below is byte-for-byte identical to v9.11.1. Still the
-# ONLY thing search_volume is ever sourced from (looked up by keyword from
-# run_reddit_fetch_loop() now, instead of from process_one_keyword()).
+# KEYWORD CACHE — flintel_keywords. Same fetch-once-forever behavior as
+# v9.12, minus every search_volume-related field/function (removed).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sync_keywords_to_db(keywords: list):
@@ -2031,30 +363,16 @@ def sync_keywords_to_db(keywords: list):
             db.flintel_keywords.update_one(
                 {"keyword": kw},
                 {"$setOnInsert": {
-                    "keyword":                  kw,
-                    "fetched":                  False,
-                    "search_volume":            None,
-                    "search_volume_is_random":  False,
-                    "last_fetched_at":          None,
-                    "next_retry_at":            None,
-                    "created_at":               now,
+                    "keyword":         kw,
+                    "fetched":         False,
+                    "last_fetched_at": None,
+                    "next_retry_at":   None,
+                    "created_at":      now,
                 }},
                 upsert=True,
             )
         except Exception as exc:
             log.error(f"[KEYWORD-CACHE] sync error for {kw!r}: {exc}")
-
-
-def get_keywords_missing_volume(keywords: list = None) -> list:
-    try:
-        cursor = db.flintel_keywords.find(
-            {"search_volume": None},
-            {"keyword": 1},
-        )
-        return [d["keyword"] for d in cursor]
-    except Exception as exc:
-        log.error(f"[VOLUME-SEED] get_keywords_missing_volume error: {exc}")
-        return []
 
 
 def get_due_keywords() -> list:
@@ -2074,267 +392,21 @@ def get_due_keywords() -> list:
         return []
 
 
-def set_keyword_retry_cooldown(keyword: str, cooldown_seconds: int = REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS):
-    now = datetime.now(timezone.utc)
-    next_retry = now + timedelta(seconds=cooldown_seconds)
-    try:
-        db.flintel_keywords.update_one(
-            {"keyword": keyword},
-            {"$set": {"next_retry_at": next_retry}},
-        )
-        log.info(
-            f"[KEYWORD-CACHE] '{keyword}' cooldown set | next_retry_at:{next_retry.isoformat()} "
-            f"({cooldown_seconds}s from now) — will not be re-attempted before then"
-        )
-    except Exception as exc:
-        log.error(f"[KEYWORD-CACHE] set_keyword_retry_cooldown error for {keyword!r}: {exc}")
-
-
 def mark_keyword_fetched(keyword: str):
     now = datetime.now(timezone.utc)
     try:
         db.flintel_keywords.update_one(
             {"keyword": keyword},
-            {"$set": {
-                "fetched":         True,
-                "last_fetched_at": now,
-            }},
+            {"$set": {"fetched": True, "last_fetched_at": now}},
         )
     except Exception as exc:
         log.error(f"[KEYWORD-CACHE] mark_keyword_fetched error for {keyword!r}: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SEARCH-VOLUME BATCH SEEDING — 100% UNTOUCHED from v9.11.1.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def seed_search_volume_batch(keywords_needing_volume: list, batch_size: int = SEARCH_VOLUME_BATCH_SIZE):
-    if not keywords_needing_volume:
-        return
-    if not RAPIDAPI_KEY:
-        log.warning(
-            "[VOLUME-SEED] RapidAPI key not set — cannot call the search-volume API. "
-            "Applying RANDOM FALLBACK values to all keywords in this pass so they are "
-            "never left permanently at None."
-        )
-
-    for i in range(0, len(keywords_needing_volume), batch_size):
-        chunk = keywords_needing_volume[i:i + batch_size]
-        try:
-            volume_map = {}
-            random_map = {}
-
-            for kw in chunk:
-                if not RAPIDAPI_KEY:
-                    vol = _random_search_volume_fallback()
-                    volume_map[kw] = vol
-                    random_map[kw] = True
-                    log.warning(
-                        f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | "
-                        f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
-                        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: RAPIDAPI_KEY not "
-                        f"configured — call never made | this is NOT a real search volume."
-                    )
-                    continue
-
-                url = "https://seo-keyword-research.p.rapidapi.com/single.php"
-
-                querystring = {"keyword": kw, "country": "us"}
-
-                headers = {
-                    "x-rapidapi-key": RAPIDAPI_KEY, # .env
-                    "x-rapidapi-host": RAPIDAPI_KEYWORD_HOST,
-                    "Content-Type": "application/json"
-                }
-
-                try:
-                    r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
-                    status_code = r.status_code
-                    try:
-                        row = r.json()
-                    except ValueError:
-                        log.error(f"[VOLUME-SEED] Non-JSON response for {kw!r} | status:{status_code}")
-                        row = None
-                except Exception as call_exc:
-                    log.error(f"[VOLUME-SEED] request error for {kw!r}: {call_exc}")
-                    status_code = None
-                    row = None
-
-                vol = _dig_value(row, VOLUME_FIELD_CANDIDATES)
-                if vol is None:
-                    api_message = row.get("message") if isinstance(row, dict) else None
-                    log.warning(
-                        f"[VOLUME-SEED] No search_volume for {kw!r} | status:{status_code} | "
-                        f"api_message:{api_message!r} | tried_fields:{VOLUME_FIELD_CANDIDATES} | "
-                        f"raw_keys:{list(row.keys()) if isinstance(row, dict) else type(row).__name__}"
-                    )
-                    vol = _random_search_volume_fallback()
-                    random_map[kw] = True
-                    log.warning(
-                        f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | "
-                        f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
-                        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: no credits / bad key / "
-                        f"rate-limited / no usable field (see api_message above) | this is NOT "
-                        f"a real, provider-returned search volume."
-                    )
-                else:
-                    random_map[kw] = False
-                volume_map[kw] = vol
-
-            for kw in chunk:
-                vol = volume_map.get(kw)
-                is_random = random_map.get(kw, False)
-                db.flintel_keywords.update_one(
-                    {"keyword": kw},
-                    {"$set": {"search_volume": vol, "search_volume_is_random": is_random}},
-                    upsert=True,
-                )
-
-            random_count = sum(1 for v in random_map.values() if v)
-            log.info(
-                f"[VOLUME-SEED] Batch {i // batch_size + 1} | {len(chunk)} keyword(s) "
-                f"seeded with search_volume | via RapidAPI (single.php, one call per keyword) | "
-                f"real:{len(chunk) - random_count} random_fallback:{random_count}"
-            )
-
-        except Exception as exc:
-            log.error(f"[VOLUME-SEED] batch error (keywords {i}-{i + len(chunk)}): {exc}")
-            for kw in chunk:
-                vol = _random_search_volume_fallback()
-                log.warning(
-                    f"[VOLUME-SEED] RANDOM FALLBACK applied for {kw!r} | search_volume={vol} "
-                    f"| reason: unexpected batch-level error — {exc} | this is NOT a real "
-                    f"search volume."
-                )
-                try:
-                    db.flintel_keywords.update_one(
-                        {"keyword": kw},
-                        {"$set": {"search_volume": vol, "search_volume_is_random": True}},
-                        upsert=True,
-                    )
-                except Exception as inner_exc:
-                    log.error(f"[VOLUME-SEED] could not persist random fallback for {kw!r}: {inner_exc}")
-
-        time.sleep(SERP_FETCH_SLEEP_SECONDS)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ENRICHMENT — RapidAPI is the SOLE provider for Google rank + volume.
-# 100% UNTOUCHED from v9.11.1.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_search_volume(search_keyword: str) -> int | None:
-    if not search_keyword:
-        return None
-
-    if not RAPIDAPI_KEY:
-        vol = _random_search_volume_fallback()
-        log.warning(
-            f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
-            f"search_volume={vol} | reason: RAPIDAPI_KEY not configured — call never made | "
-            f"this is NOT a real search volume."
-        )
-        return vol
-
-    try:
-        url = "https://seo-keyword-research.p.rapidapi.com/single.php"
-
-        querystring = {"keyword": search_keyword, "country": "us"}
-
-        headers = {
-            "x-rapidapi-key": RAPIDAPI_KEY, # .env
-            "x-rapidapi-host": RAPIDAPI_KEYWORD_HOST,
-            "Content-Type": "application/json"
-        }
-
-        r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_VOLUME_TIMEOUT_SECONDS)
-        status_code = r.status_code
-
-        try:
-            result = r.json()
-        except ValueError:
-            log.error(f"fetch_search_volume non-JSON response for {search_keyword!r} | status:{status_code}")
-            vol = _random_search_volume_fallback()
-            log.warning(
-                f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
-                f"search_volume={vol} | reason: non-JSON response (status:{status_code}) | "
-                f"this is NOT a real search volume."
-            )
-            return vol
-
-        vol = _dig_value(result, VOLUME_FIELD_CANDIDATES)
-        if vol is None:
-            api_message = result.get("message") if isinstance(result, dict) else None
-            log.warning(
-                f"fetch_search_volume no volume field for {search_keyword!r} | "
-                f"status:{status_code} | api_message:{api_message!r}"
-            )
-            vol = _random_search_volume_fallback()
-            log.warning(
-                f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
-                f"search_volume={vol} (range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-"
-                f"{SEARCH_VOLUME_RANDOM_FALLBACK_MAX}) | reason: no credits / bad key / "
-                f"rate-limited / no usable field (see api_message above) | this is NOT a "
-                f"real, provider-returned search volume."
-            )
-        return vol
-    except Exception as exc:
-        log.error(f"fetch_search_volume error for {search_keyword!r}: {exc}")
-        vol = _random_search_volume_fallback()
-        log.warning(
-            f"fetch_search_volume RANDOM FALLBACK applied for {search_keyword!r} | "
-            f"search_volume={vol} | reason: exception during call — {exc} | this is NOT a "
-            f"real search volume."
-        )
-        return vol
-
-
-def fetch_google_rank(search_keyword: str) -> int | None:
-    if not RAPIDAPI_KEY or not search_keyword:
-        return None
-    try:
-        url = "https://google-search116.p.rapidapi.com/"
-
-        querystring = {"query": search_keyword}
-
-        headers = {
-            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
-            "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
-            "Content-Type": "application/json"
-        }
-
-        r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
-
-        try:
-            result_data = r.json()
-        except ValueError:
-            log.error(f"fetch_google_rank non-JSON response for {search_keyword!r} | status:{r.status_code}")
-            return None
-
-        items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
-        if not items:
-            return None
-        return _dig_value(items[0], RANK_FIELD_CANDIDATES)
-    except Exception as exc:
-        log.error(f"fetch_google_rank error for {search_keyword!r}: {exc}")
-        return None
-
-
-def fetch_google_stats(search_keyword: str) -> dict:
-    return {
-        "google_rank":   fetch_google_rank(search_keyword),
-        "search_volume": fetch_search_volume(search_keyword),
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # REDDIT — SOLE discovery mechanism: RapidAPI SERP search
-# (site:reddit.com) -> real per-post rank + URL. search_google_for_keyword()
-# itself is 100% UNTOUCHED from v9.11.1 — same single RapidAPI call, same
-# independent host, same try/except. The ONLY thing that changed anywhere
-# near this function is what process_one_keyword() (further below) does
-# with its results afterward — it now SAVES them into flintel_google_posts
-# instead of immediately fetching Reddit RSS content in-line.
+# (site:reddit.com). UNCHANGED from v9.12 — same single RapidAPI call,
+# same independent host, same try/except.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK) -> list:
@@ -2354,9 +426,9 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
         querystring = {"query": query}
 
         headers = {
-            "x-rapidapi-key": RAPIDAPI_KEY, # .env boht used same key
+            "x-rapidapi-key": RAPIDAPI_KEY,  # .env
             "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
 
         r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
@@ -2404,13 +476,12 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
 
 
 def is_post_already_signaled(post_url: str) -> bool:
-    """UNCHANGED — checks `signals` directly by post_url before any
-    Reddit fetch or Claude scoring happens, now consulted from
-    run_reddit_fetch_loop() instead of process_one_keyword()."""
+    """UNCHANGED — checks `flintel_signals` directly by post_url before
+    any Reddit fetch happens."""
     if not post_url:
         return False
     try:
-        existing = db.signals.find_one({"post_url": post_url}, {"_id": 1})
+        existing = db.flintel_signals.find_one({"post_url": post_url}, {"_id": 1})
         return existing is not None
     except Exception as exc:
         log.error(f"[DEDUP] is_post_already_signaled error for {post_url}: {exc}")
@@ -2418,28 +489,13 @@ def is_post_already_signaled(post_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW (v9.12) — flintel_google_posts HELPERS
-#
-# This collection is the single source of truth for "which Reddit post_url
-# has SERP discovery found, and has it actually been Reddit-fetched yet?"
-# It is populated ONLY by save_google_post() (called from
-# process_one_keyword(), right after search_google_for_keyword() — the
-# untouched Google call — returns), and consumed ONLY by
-# run_reddit_fetch_loop() below. Neither side keeps its own separate
-# python list of subreddits/keywords/fuzzy-keywords — everything lives on
-# these documents.
+# flintel_google_posts HELPERS — UNCHANGED from v9.12.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit: str, fuzzy_keywords: list) -> bool:
-    """
-    Insert-only upsert (mirrors the exact same $setOnInsert pattern
-    flintel_keywords already uses) — a post_url already tracked here is
-    NEVER overwritten, so re-discovering the same URL under a different
-    keyword search later does not reset its reddit_fetched state or
-    swap out its original search_keyword/fuzzy_keywords. Returns True
-    only when this call genuinely inserted a brand-new document (used
-    purely for the "X new posts saved" log line in process_one_keyword).
-    """
+    """Insert-only upsert — a post_url already tracked here is NEVER
+    overwritten. Returns True only when this call genuinely inserted a
+    brand-new document."""
     now = datetime.now(timezone.utc)
     try:
         result = db.flintel_google_posts.update_one(
@@ -2465,15 +521,8 @@ def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit:
 
 
 def get_due_google_posts() -> list:
-    """
-    Returns every flintel_google_posts document that is still
-    reddit_fetched=False AND not currently in a retry cooldown. This is
-    read DIRECTLY from Mongo every pass — run_reddit_fetch_loop() never
-    caches or mirrors this into a python list of its own; each returned
-    document already carries its own post_url, google_rank,
-    search_keyword, subreddit, and fuzzy_keywords, which is everything
-    the fetch step needs.
-    """
+    """Returns every flintel_google_posts document still
+    reddit_fetched=False AND not currently in a retry cooldown."""
     try:
         now = datetime.now(timezone.utc)
         cursor = db.flintel_google_posts.find({
@@ -2491,16 +540,7 @@ def get_due_google_posts() -> list:
 
 
 def mark_google_post_fetched(post_url: str, fuzzy_matched):
-    """
-    Flips reddit_fetched=True PERMANENTLY for this post_url — it will
-    never be re-fetched again, whether or not its content actually
-    matched the fuzzy keywords (fuzzy_matched is stored either way, for
-    later inspection via GET /google-posts). This is only called after
-    a genuinely COMPLETED fetch attempt (the RSS request itself
-    succeeded) — a real HTTP/network failure instead calls
-    set_google_post_retry_cooldown() and leaves reddit_fetched=False so
-    it is retried later.
-    """
+    """Flips reddit_fetched=True PERMANENTLY for this post_url."""
     now = datetime.now(timezone.utc)
     try:
         db.flintel_google_posts.update_one(
@@ -2516,15 +556,8 @@ def mark_google_post_fetched(post_url: str, fuzzy_matched):
 
 
 def set_google_post_retry_cooldown(post_url: str, cooldown_seconds: int = REDDIT_POST_RETRY_COOLDOWN_SECONDS):
-    """
-    Called when a specific post_url's Reddit RSS fetch genuinely failed
-    (fetch_reddit_post_by_url() returned None — retries exhausted).
-    Keeps reddit_fetched=False (it WILL be retried) but stamps
-    next_retry_at so get_due_google_posts() skips it until the cooldown
-    passes, instead of hammering the same URL on the very next
-    REDDIT_FETCH_CHECK_INTERVAL_SECONDS pass — same pacing principle as
-    v9.11.2's per-keyword cooldown, scoped to one post_url here.
-    """
+    """Called when a specific post_url's Reddit RSS fetch genuinely
+    failed. Keeps reddit_fetched=False but stamps next_retry_at."""
     now = datetime.now(timezone.utc)
     next_retry = now + timedelta(seconds=cooldown_seconds)
     try:
@@ -2542,9 +575,9 @@ def set_google_post_retry_cooldown(post_url: str, cooldown_seconds: int = REDDIT
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT POST FETCH — public, credential-free per-post RSS feed ONLY.
-# UNCHANGED from v9.11 in terms of retry/backoff/parsing behavior — only
-# the CALLER changed (run_reddit_fetch_loop() instead of
-# process_one_keyword()). No .json endpoint anywhere in this file.
+# UNCHANGED retry/backoff/parsing behavior from v9.12/v9.11. The ONLY
+# change: no more random-fallback upvotes/comments — those fields are
+# simply not generated or stored anymore.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _reddit_get_with_retry(url: str) -> requests.Response | None:
@@ -2597,14 +630,8 @@ def _extract_reddit_subreddit_from_url(post_url: str) -> str:
 
 
 def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | None:
-    """
-    UNCHANGED from v9.11 — public, credential-free per-post RSS feed
-    (post_url + ".rss"), same smart-retry + old.reddit.com fallback host.
-    Engagement (upvotes/comments) is still a clearly-logged random
-    fallback (RSS exposes no real counts). Now called from
-    run_reddit_fetch_loop() instead of process_one_keyword() — the
-    function body itself is untouched.
-    """
+    """UNCHANGED retry/fallback behavior. No more upvotes/comments —
+    those fields are gone; only real, fetched content is returned."""
     if not post_url:
         return None
 
@@ -2661,16 +688,6 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
             f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', post_url)[-40:]}"
         )
 
-        upvotes = _random_engagement_fallback()
-        comments = _random_engagement_fallback()
-        log.warning(
-            f"[REDDIT-FETCH] RANDOM FALLBACK applied for engagement on {post_url} | "
-            f"upvotes={upvotes} comments={comments} "
-            f"(range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX}) | "
-            f"reason: Reddit's public RSS feed does not expose numeric engagement counts | "
-            f"this is NOT real, provider-returned engagement data."
-        )
-
         return {
             "message_id":           message_id,
             "platform":             "reddit",
@@ -2680,11 +697,7 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
             "post_url":             post_url,
             "posted_at":            posted_at,
             "search_keyword":       keyword,
-            "upvotes":              upvotes,
-            "comments":             comments,
-            "engagement_is_random": True,
             "google_rank":          rank,
-            "search_volume":        None,   # filled in by run_reddit_fetch_loop() below
         }
     except Exception as exc:
         log.error(f"[REDDIT-FETCH] fetch_reddit_post_by_url parse error for {post_url}: {exc}")
@@ -2692,37 +705,53 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW (v9.12) — process_one_keyword() no longer fetches Reddit at all.
-# It ONLY runs the untouched search_google_for_keyword() and immediately
-# persists every result into flintel_google_posts. Google SERP data is
-# saved and that keyword is marked done WITHOUT waiting on any Reddit
-# HTTP call whatsoever.
+# SIGNAL STORAGE — direct save into flintel_signals, no batching, no
+# scoring. This is what replaces the old queue -> Claude -> save flow.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_signal(item: dict) -> bool:
+    doc = {
+        "message_id":           item["message_id"],
+        "platform":             item.get("platform", "reddit"),
+        "post_url":             item.get("post_url", ""),
+        "text":                 item.get("text", ""),
+        "username":             item.get("username", "unknown"),
+        "subreddit_or_channel": item.get("subreddit_or_channel", ""),
+        "posted_at":            item.get("posted_at"),
+        "fetched_at":           datetime.now(timezone.utc),
+        "google_rank":          item.get("google_rank"),
+        "search_keyword":       item.get("search_keyword", ""),
+        "client_id":            CLIENT_ID,
+        "created_at":           datetime.now(timezone.utc),
+    }
+    try:
+        db.flintel_signals.insert_one(doc)
+        log.info(
+            f"SAVED [{doc['platform'].upper()}] search_keyword={doc['search_keyword']!r} | "
+            f"subreddit:{doc['subreddit_or_channel']!r} | google_rank:{doc['google_rank']} | "
+            f"post_url:{doc['post_url']}"
+        )
+        return True
+    except DuplicateKeyError:
+        return False
+    except Exception as exc:
+        log.error(f"MongoDB save error: {exc}")
+        log_operator_alert("MongoDB Write Failed", str(exc), level="CRITICAL")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SERP DISCOVERY — process_one_keyword() ONLY runs the Google SERP call
+# and persists results into flintel_google_posts. Reddit is NEVER
+# fetched here — this keyword's SERP job is done the moment this
+# function returns.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_one_keyword(keyword: str) -> tuple:
-    """
-    Full SERP-discovery work for ONE keyword that get_due_keywords() has
-    flagged as due right now:
-      1. RapidAPI SERP search (site:reddit.com, last N months) — the
-         exact same untouched search_google_for_keyword() call as
-         v9.11.1.
-      2. For every result: generate that result's fuzzy keywords
-         (generate_fuzzy_keywords(), run once here) and save it into
-         flintel_google_posts via save_google_post() — insert-only, so
-         a post_url already tracked (e.g. from a previous keyword whose
-         SERP results happened to overlap) is left completely alone.
-
-    Reddit is NEVER fetched here. This keyword's SERP job is considered
-    complete the moment this function returns — Google SERP storage
-    never waits on Reddit RSS fetching, which now happens entirely on
-    its own schedule in run_reddit_fetch_loop().
-
-    Returns (results_count, new_posts_saved_count) for logging.
-    """
     results = search_google_for_keyword(keyword, months_back=SERP_MONTHS_BACK)
 
     new_posts_saved = 0
-    for result in results:
+    for result in results[:SERP_RESULTS_PER_KEYWORD]:
         post_url = result["url"]
         subreddit = _extract_reddit_subreddit_from_url(post_url)
         fuzzy_keywords = generate_fuzzy_keywords(keyword)
@@ -2741,46 +770,20 @@ def process_one_keyword(keyword: str) -> tuple:
 
 
 def run_serp_discovery_loop():
-    """
-    Continuously polls flintel_keywords every KEYWORD_CHECK_INTERVAL_SECONDS
-    for keywords that have NEVER been fetched (fetched=False), and for any
-    keyword still missing a cached search_volume (batch-seeds it) —
-    UNCHANGED behavior from v9.11.1 in every respect except one: each due
-    keyword's SERP results are now saved into flintel_google_posts by
-    process_one_keyword() instead of being fetched from Reddit in-line, so
-    there is no more had_fetch_failure concept at the keyword level —
-    mark_keyword_fetched() is now called unconditionally once
-    process_one_keyword() returns, since nothing about Reddit's
-    availability can cause this SERP step itself to "fail" anymore.
-    """
     sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
-
-    missing_volume = get_keywords_missing_volume()
-    if missing_volume:
-        log.info(
-            f"[VOLUME-SEED] {len(missing_volume)} keyword(s) need search_volume — "
-            f"seeding in batches of {SEARCH_VOLUME_BATCH_SIZE}..."
-        )
-        seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
 
     log.info(
         f"[SERP] Discovery loop started | {len(REDDIT_SEARCH_KEYWORDS)} keyword(s) in python list | "
         f"check_interval:{KEYWORD_CHECK_INTERVAL_SECONDS}s | "
         f"months_back:{SERP_MONTHS_BACK} | depth:{SERP_RESULTS_PER_KEYWORD} | "
-        f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever (UNTOUCHED) | "
-        f"SEARCH-VOLUME: batched loop (size {SEARCH_VOLUME_BATCH_SIZE}), random fallback range "
-        f"{SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} on failure "
-        f"(UNTOUCHED) | REDDIT FETCH: fully decoupled — SERP results are only SAVED into "
+        f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever | "
+        f"REDDIT FETCH: fully decoupled — SERP results are only SAVED into "
         f"flintel_google_posts here, the actual Reddit RSS fetch happens in a separate loop"
     )
 
     while True:
         try:
             sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
-
-            missing_volume = get_keywords_missing_volume()
-            if missing_volume:
-                seed_search_volume_batch(missing_volume, batch_size=SEARCH_VOLUME_BATCH_SIZE)
 
             due = get_due_keywords()
             if not due:
@@ -2794,16 +797,10 @@ def run_serp_discovery_loop():
                 total_results += results_count
                 total_new_posts += new_posts_saved
 
-                # No Reddit fetch happens in this loop anymore, so there is
-                # no failure mode here to leave this keyword pending for —
-                # mark it done unconditionally, exactly as soon as its SERP
-                # results are saved into flintel_google_posts.
                 mark_keyword_fetched(keyword)
                 log.info(
                     f"[SERP] '{keyword}' DONE | serp_results:{results_count} | "
-                    f"new_google_posts_saved:{new_posts_saved} | "
-                    f"marked fetched=True PERMANENTLY (Reddit fetch happens separately, "
-                    f"asynchronously, from flintel_google_posts — not waited on here)"
+                    f"new_google_posts_saved:{new_posts_saved} | marked fetched=True PERMANENTLY"
                 )
                 time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
@@ -2818,22 +815,19 @@ def run_serp_discovery_loop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW (v9.12) — run_reddit_fetch_loop(): the entire Reddit-fetch side of
-# the pipeline, fully independent of run_serp_discovery_loop(). Reads
-# EVERYTHING it needs (post_url, google_rank, search_keyword, subreddit,
-# fuzzy_keywords) straight off flintel_google_posts documents — no
-# separate python list of subreddits/keywords/fuzzy-keywords is kept
-# anywhere in this loop.
+# REDDIT FETCH LOOP — reads flintel_google_posts directly, fetches RSS,
+# fuzzy-filters, and on a match SAVES DIRECTLY into flintel_signals. No
+# queue, no batching, no Claude call anywhere in this loop.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_reddit_fetch_loop():
     log.info(
-        f"[REDDIT-FETCH] Loop started | reads directly from flintel_google_posts, "
-        f"NOT from any python list | check_interval:{REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | "
+        f"[REDDIT-FETCH] Loop started | reads directly from flintel_google_posts | "
+        f"check_interval:{REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | "
         f"retry_cooldown:{REDDIT_POST_RETRY_COOLDOWN_SECONDS}s | "
         f"fetch method: public per-post RSS only, credential-free "
         f"({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback, no OAuth/PRAW) | "
-        f"search_volume for every queued item is read from the UNTOUCHED flintel_keywords cache"
+        f"on fuzzy match -> saved DIRECTLY into flintel_signals, no queue/batch/Claude"
     )
 
     while True:
@@ -2845,7 +839,7 @@ def run_reddit_fetch_loop():
 
             log.info(f"[REDDIT-FETCH] {len(due_posts)} post(s) due for Reddit RSS fetch this pass")
 
-            queued_count, no_match_count, dupe_count, fail_count = 0, 0, 0, 0
+            saved_count, no_match_count, dupe_count, fail_count = 0, 0, 0, 0
 
             for doc in due_posts:
                 post_url       = doc["post_url"]
@@ -2857,7 +851,7 @@ def run_reddit_fetch_loop():
                 if is_post_already_signaled(post_url):
                     mark_google_post_fetched(post_url, fuzzy_matched=None)
                     dupe_count += 1
-                    log.info(f"[REDDIT-FETCH] SKIP (already in signals) | {post_url}")
+                    log.info(f"[REDDIT-FETCH] SKIP (already in flintel_signals) | {post_url}")
                     continue
 
                 item = fetch_reddit_post_by_url(post_url, search_keyword, google_rank)
@@ -2878,40 +872,28 @@ def run_reddit_fetch_loop():
                     log.info(
                         f"[REDDIT-FETCH] fetched OK but NO fuzzy-keyword match | {post_url} | "
                         f"keyword:{search_keyword!r} | fuzzy_keywords_tried:{len(fuzzy_keywords)} | "
-                        f"marked reddit_fetched=True (not queued — settled 'no', won't be retried)"
+                        f"marked reddit_fetched=True (settled 'no', won't be retried)"
                     )
                     time.sleep(SERP_FETCH_SLEEP_SECONDS)
                     continue
 
-                # ── MATCH — pull search_volume from the UNTOUCHED
-                # flintel_keywords cache (already seeded by
-                # seed_search_volume_batch(), completely unmodified),
-                # stamp everything onto the item in the exact same
-                # schema as before, and queue it exactly as always.
-                kw_doc = db.flintel_keywords.find_one({"keyword": search_keyword})
-                volume = kw_doc.get("search_volume") if kw_doc else None
-                volume_is_random = kw_doc.get("search_volume_is_random", False) if kw_doc else False
-
-                item["search_volume"] = volume
-                item["search_volume_is_random"] = volume_is_random
+                # ── MATCH — save straight into flintel_signals, tagged
+                # with its search_keyword. No queue, no batch, no Claude.
                 item["subreddit_or_channel"] = subreddit or item.get("subreddit_or_channel", "")
-
-                reddit_queue.put(item)
-                save_queue_message("reddit", item)
+                saved = save_signal(item)
                 mark_google_post_fetched(post_url, fuzzy_matched=True)
-                queued_count += 1
+                if saved:
+                    saved_count += 1
 
-                sv_tag = "RANDOM-FALLBACK" if volume_is_random else "real"
                 log.info(
-                    f"[REDDIT-FETCH] QUEUED | {post_url} | keyword:{search_keyword!r} | "
-                    f"subreddit:{subreddit!r} | google_rank:{google_rank} | "
-                    f"search_volume:{volume} ({sv_tag}, from flintel_keywords cache) | "
+                    f"[REDDIT-FETCH] {'SAVED' if saved else 'DUPLICATE (already existed)'} | {post_url} | "
+                    f"keyword:{search_keyword!r} | subreddit:{subreddit!r} | google_rank:{google_rank} | "
                     f"marked reddit_fetched=True PERMANENTLY"
                 )
                 time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
             log.info(
-                f"[REDDIT-FETCH] Pass complete | due:{len(due_posts)} | queued:{queued_count} | "
+                f"[REDDIT-FETCH] Pass complete | due:{len(due_posts)} | saved:{saved_count} | "
                 f"no_fuzzy_match:{no_match_count} | already_signaled:{dupe_count} | "
                 f"failed_will_retry:{fail_count}"
             )
@@ -2922,562 +904,17 @@ def run_reddit_fetch_loop():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE BATCH SCORER — streaming transport + partial-JSON recovery.
-# UNCHANGED from v9.11.1.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_batch_prompt(batch: list) -> str:
-    lines = []
-    for i, item in enumerate(batch, start=1):
-        payload = {
-            "search_keyword": item.get("search_keyword", SEARCH_KEYWORD),
-            "text":           (item.get("text", "") or "")[:1200],
-            "platform":       item.get("platform", "unknown"),
-            "google_rank":    item.get("google_rank"),
-            "search_volume":  item.get("search_volume"),
-            "upvotes":        item.get("upvotes"),
-            "comments":       item.get("comments"),
-        }
-        lines.append(f"--- POST {i} ---\n{json.dumps(payload, ensure_ascii=False)}\n")
-    return "\n".join(lines)
-
-
-def _fallback_score(index: int, reason: str = "Scoring unavailable.") -> dict:
-    return {
-        "index": index,
-        "intent_score": 1,
-        "is_relevant": False,
-        "reply_draft": None,
-        "_is_fallback": True,
-        "_fallback_reason": reason,
-    }
-
-
-def _strip_code_fences(raw: str) -> str:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        return parts[1].lstrip("json").strip() if len(parts) > 1 else raw.strip("```").strip()
-    return raw
-
-
-def _salvage_partial_json_array(raw: str) -> list:
-    start = raw.find("[")
-    if start == -1:
-        return []
-    objects, depth, obj_start, in_string, escape = [], 0, None, False, False
-    i, n = start + 1, len(raw)
-    while i < n:
-        ch = raw[i]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            i += 1
-            continue
-        if ch == '"':
-            in_string = True
-            i += 1
-            continue
-        if ch == "{":
-            if depth == 0:
-                obj_start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and obj_start is not None:
-                candidate = raw[obj_start:i + 1]
-                try:
-                    objects.append(json.loads(candidate))
-                except (json.JSONDecodeError, ValueError):
-                    log.warning("[Claude-Batch] Skipped one malformed salvaged object.")
-                obj_start = None
-        i += 1
-    return objects
-
-
-def _parse_claude_json(raw: str) -> tuple:
-    cleaned = _strip_code_fences(raw)
-    try:
-        parsed = json.loads(cleaned)
-        if not isinstance(parsed, list):
-            raise ValueError("Claude returned non-list.")
-        return parsed, False
-    except (json.JSONDecodeError, ValueError) as exc:
-        log.warning(f"[Claude-Batch] Full parse failed ({exc}) — attempting partial recovery.")
-        return _salvage_partial_json_array(cleaned), True
-
-
-def _call_claude_batch(batch: list) -> list:
-    prompt = _build_batch_prompt(batch)
-    with anthropic_client.messages.stream(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=MAX_TOKENS,
-        system=CLAUDE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Score this batch:\n\n{prompt}"}],
-    ) as stream:
-        raw = stream.get_final_text().strip()
-
-    results, was_truncated = _parse_claude_json(raw)
-
-    if was_truncated:
-        recovered = {int(r["index"]) for r in results if isinstance(r, dict) and "index" in r}
-        missing = sorted(set(range(1, len(batch) + 1)) - recovered)
-        log.warning(f"[Claude-Batch] PARTIAL RECOVERY | batch_size:{len(batch)} | "
-                    f"recovered:{len(recovered)} | missing:{len(missing)}")
-        log_operator_alert(
-            title="Claude Response Truncated (max_tokens) — Partial Recovery",
-            detail=f"batch_size:{len(batch)} recovered:{len(recovered)} missing:{missing[:30]}",
-            level="ERROR",
-        )
-        for idx in missing:
-            results.append(_fallback_score(idx, "Truncated — not recovered."))
-
-    if not isinstance(results, list):
-        raise ValueError("Claude returned non-list after parsing.")
-
-    for r in results:
-        r.setdefault("is_relevant", False)
-        r.setdefault("reply_draft", None)
-        r.setdefault("_is_fallback", False)
-        if r.get("intent_score", 1) < 1:
-            r["intent_score"] = 1
-        if r.get("intent_score", 1) > 100:
-            r["intent_score"] = 100
-
-    return results
-
-
-def score_batch_with_claude(batch: list) -> list:
-    result = retry_with_backoff(_call_claude_batch, batch, retries=3, delay=5, label="Claude-Batch")
-    if result is None:
-        log_operator_alert(
-            title="Claude API Unavailable",
-            detail=f"All 3 retry attempts failed for a batch of {len(batch)} items.",
-            level="CRITICAL",
-        )
-        return [_fallback_score(i + 1, "Claude API unavailable after 3 retries.") for i in range(len(batch))]
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MONGODB STORAGE — UNCHANGED from v9.11.1.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def save_new_signal(item: dict, score_result: dict, force_pending: bool = False) -> bool:
-    doc = {
-        "message_id":            item["message_id"],
-        "platform":               item.get("platform", "unknown"),
-        "post_url":               item.get("post_url", ""),
-        "text":                   item.get("text", ""),
-        "username":               item.get("username", "unknown"),
-        "subreddit_or_channel":   item.get("subreddit_or_channel", ""),
-        "posted_at":              item.get("posted_at"),
-        "fetched_at":             datetime.now(timezone.utc),
-        "google_rank":            item.get("google_rank"),
-        "search_volume":          item.get("search_volume"),
-        "upvotes":                item.get("upvotes"),
-        "comments":               item.get("comments"),
-        "search_keyword":         item.get("search_keyword", SEARCH_KEYWORD),
-        "intent_score":           score_result.get("intent_score", 1),
-        "is_relevant":            score_result.get("is_relevant", False),
-        "reply_draft":            score_result.get("reply_draft"),
-        "client_id":              CLIENT_ID,
-        "status":                 "pending" if force_pending else "confirmed",
-        "created_at":             datetime.now(timezone.utc),
-    }
-    try:
-        db.signals.insert_one(doc)
-        sv_tag = "RANDOM-FALLBACK" if item.get("search_volume_is_random") else "real"
-        eng_tag = "RANDOM-FALLBACK" if item.get("engagement_is_random") else "real"
-        log.info(
-            f"SAVED [{doc['platform'].upper()}] {doc['search_keyword']!r} | "
-            f"search_volume:{doc['search_volume']}/mo ({sv_tag}) | "
-            f"upvotes:{doc['upvotes']} comments:{doc['comments']} ({eng_tag}) | "
-            f"google_rank:{doc['google_rank']} | "
-            f"post_url:{doc['post_url']}"
-        )
-        return True
-    except DuplicateKeyError:
-        return False
-    except Exception as exc:
-        log.error(f"MongoDB save error: {exc}")
-        log_operator_alert("MongoDB Write Failed", str(exc), level="CRITICAL")
-        return False
-
-
-def replace_confirmed_signal(message_id: str, enrichment: dict, score_result: dict) -> bool:
-    existing = db.signals.find_one({"message_id": message_id})
-    if not existing:
-        log.warning(f"[RESCORE] No existing doc for {message_id} — skipping.")
-        return False
-
-    new_doc = {
-        "message_id":            message_id,
-        "platform":               existing.get("platform", "unknown"),
-        "post_url":               existing.get("post_url", ""),
-        "text":                   existing.get("text", ""),
-        "username":               existing.get("username", "unknown"),
-        "subreddit_or_channel":   existing.get("subreddit_or_channel", ""),
-        "posted_at":              existing.get("posted_at") or existing.get("created_at"),
-        "fetched_at":             existing.get("fetched_at", datetime.now(timezone.utc)),
-        "google_rank":            enrichment.get("google_rank"),
-        "search_volume":          enrichment.get("search_volume"),
-        "upvotes":                enrichment.get("upvotes"),
-        "comments":               enrichment.get("comments"),
-        "search_keyword":         enrichment.get("search_keyword", SEARCH_KEYWORD),
-        "intent_score":           score_result.get("intent_score", 1),
-        "is_relevant":            score_result.get("is_relevant", False),
-        "reply_draft":            score_result.get("reply_draft"),
-        "client_id":              CLIENT_ID,
-        "status":                 "confirmed",
-        "created_at":             existing.get("created_at", datetime.now(timezone.utc)),
-    }
-    db.signals.replace_one({"message_id": message_id}, new_doc)
-    log.info(f"[RESCORE] CONFIRMED | {message_id} | score:{new_doc['intent_score']} relevant:{new_doc['is_relevant']}")
-    return True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GENERIC BATCH PROCESSOR — one instance per platform queue.
-#
-# v9.12.2 PATCH (this build): remove_queue_message() is now called ONLY
-# after an item's fate is fully decided AND persisted (either appended to
-# current_batch + save_pending_batch() succeeded, or genuinely dropped for
-# a logged reason). The too-short-text drop path is now logged and counted
-# in total_dropped. Batching logic, timeout/gap handling, enrichment, and
-# the Claude call are otherwise 100% UNCHANGED from v9.12.1 — including the
-# v9.12.1 fix that skips passes_keyword_filter() for Reddit items.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_batch_processor(
-    q: queue.Queue,
-    batch_size: int,
-    platform_label: str,
-    gap_seconds: int,
-    timeout_seconds: int,
-    keyword_filter_list: list,
-):
-    platform_key = platform_label.lower()
-
-    log.info(
-        f"Batch processor [{platform_label}] started | "
-        f"batch_size:{batch_size} | gap:{gap_seconds}s | timeout:{timeout_seconds}s"
-    )
-
-    current_batch, batch_start_time = load_pending_batch(platform_key)
-    if current_batch:
-        log.info(f"[{platform_label}] Resumed [{len(current_batch)}/{batch_size}] from persistent disk.")
-
-    total_received, total_matched, total_dropped, total_batches = 0, 0, 0, 0
-
-    while True:
-        try:
-            if current_batch and batch_start_time is not None:
-                wait_time = max(0.1, timeout_seconds - (time.time() - batch_start_time))
-            else:
-                wait_time = 1.0
-
-            try:
-                item = q.get(timeout=wait_time)
-                got_item = True
-            except queue.Empty:
-                got_item = False
-
-            if got_item:
-                total_received += 1
-                # NOTE (v9.12.2): remove_queue_message() is intentionally
-                # NOT called here anymore. It is now called further below,
-                # only once this item's fate (added to a persisted batch,
-                # or genuinely dropped) has been decided AND written to
-                # Mongo — so the item always exists in at least one of
-                # flintel_queue_messages / flintel_pending_batch until it
-                # is fully accounted for. This closes the item-loss window
-                # that previously existed between q.get() and
-                # save_pending_batch()/drop.
-                message_id = item.get("message_id")
-
-                text = (item.get("text") or "").strip()
-
-                if not text or len(text) < 10:
-                    total_dropped += 1
-                    log.warning(
-                        f"[{platform_label}] DROPPED (text too short: {len(text)} char(s), "
-                        f"min 10 required) | message_id:{message_id} | "
-                        f"post_url:{item.get('post_url', '')!r}"
-                    )
-                    remove_queue_message(platform_key, message_id)
-                    q.task_done()
-                    continue
-
-                # v9.12.1 FIX (preserved as-is) — Reddit items only ever
-                # reach this queue after already passing
-                # passes_fuzzy_filter() in run_reddit_fetch_loop() (matched
-                # against that post's own stored fuzzy_keywords + original
-                # search_keyword — the authoritative relevance decision for
-                # Reddit). Re-checking here against the FULL
-                # REDDIT_SEARCH_KEYWORDS phrase list (exact full-phrase
-                # substring only) was silently dropping items that had
-                # matched via a fuzzy variant rather than the complete
-                # original phrase — they never reached
-                # current_batch/save_pending_batch(), so they never showed
-                # up in flintel_pending_batch and never got scored by
-                # Claude. Twitter items are never pre-filtered upstream, so
-                # this filter still applies to them exactly as before.
-                if platform_key != "reddit" and not passes_keyword_filter(text, keyword_filter_list):
-                    total_dropped += 1
-                    log.info(
-                        f"[{platform_label}] DROPPED (failed keyword filter) | "
-                        f"message_id:{message_id}"
-                    )
-                    remove_queue_message(platform_key, message_id)
-                    q.task_done()
-                    continue
-
-                total_matched += 1
-                if not current_batch:
-                    batch_start_time = time.time()
-
-                current_batch.append(item)
-                save_pending_batch(platform_key, current_batch, batch_start_time)
-                save_batch_seconds(platform_key, batch_start_time)
-
-                # Only remove the item from its persistent queue-store
-                # backup AFTER save_pending_batch() has successfully
-                # written it into flintel_pending_batch — at no point in
-                # time is the item absent from both collections.
-                remove_queue_message(platform_key, message_id)
-
-                log.info(f"[{platform_label}] MATCH [{len(current_batch)}/{batch_size}] | u/{item.get('username')}")
-                q.task_done()
-
-            should_fire = False
-            fire_reason = ""
-            if len(current_batch) >= batch_size:
-                should_fire, fire_reason = True, f"batch full ({batch_size} items)"
-            elif current_batch and batch_start_time is not None:
-                elapsed = time.time() - batch_start_time
-                if elapsed >= timeout_seconds:
-                    should_fire, fire_reason = True, f"timeout ({timeout_seconds}s) — partial {len(current_batch)}/{batch_size}"
-
-            if should_fire and current_batch:
-                total_batches += 1
-                batch_to_send = current_batch[:batch_size]
-                current_batch = current_batch[batch_size:]
-                batch_start_time = None if not current_batch else time.time()
-
-                if current_batch:
-                    save_pending_batch(platform_key, current_batch, batch_start_time)
-                    save_batch_seconds(platform_key, batch_start_time)
-                else:
-                    clear_pending_batch(platform_key)
-                    clear_batch_seconds(platform_key)
-
-                google_stats = None
-                for it in batch_to_send:
-                    already_enriched = it.get("google_rank") is not None
-
-                    it.setdefault("upvotes", None)
-                    it.setdefault("comments", None)
-
-                    if not already_enriched and SEARCH_KEYWORD:
-                        if google_stats is None:
-                            google_stats = fetch_google_stats(SEARCH_KEYWORD)
-                        it["google_rank"] = google_stats.get("google_rank")
-                        it["search_volume"] = google_stats.get("search_volume")
-                        it["search_keyword"] = SEARCH_KEYWORD
-
-                log.info(
-                    f"[{platform_label}] ━━━ BATCH {total_batches} ━━━ | reason:{fire_reason} | "
-                    f"items:{len(batch_to_send)} | received:{total_received} "
-                    f"matched:{total_matched} dropped:{total_dropped}"
-                )
-
-                scores = score_batch_with_claude(batch_to_send)
-                score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
-
-                for i, it in enumerate(batch_to_send):
-                    pos = i + 1
-                    sr = score_map.get(pos) or (scores[i] if i < len(scores) else _fallback_score(pos, "Index mismatch."))
-                    is_fallback = bool(sr.get("_is_fallback", False))
-                    save_new_signal(it, sr, force_pending=is_fallback)
-
-                log.info(f"[{platform_label}] BATCH {total_batches} COMPLETE — "
-                         f"{len(batch_to_send)} item(s) | waiting {gap_seconds}s...")
-                time.sleep(gap_seconds)
-
-        except Exception as exc:
-            log.error(f"[{platform_label}] batch processor error: {exc}")
-            time.sleep(5)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RESCORE PROCESSOR — UNCHANGED from v9.11.1.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_rescore_processor():
-    log.info(f"[RESCORE] Processor started | batch_size:{RESCORE_BATCH_SIZE} | "
-             f"poll:{RESCORE_POLL_INTERVAL}s | gap:{RESCORE_BATCH_GAP_SECONDS}s")
-    total_batches = 0
-
-    while True:
-        try:
-            pending = list(db.signals.find({"status": "pending"}).limit(RESCORE_BATCH_SIZE))
-            if not pending:
-                time.sleep(RESCORE_POLL_INTERVAL)
-                continue
-
-            items_for_claude = []
-            for doc in pending:
-                items_for_claude.append({
-                    "message_id":     doc["message_id"],
-                    "platform":       doc.get("platform", "unknown"),
-                    "text":           doc.get("text", ""),
-                    "search_keyword": doc.get("search_keyword", SEARCH_KEYWORD),
-                    "google_rank":    doc.get("google_rank"),
-                    "search_volume":  doc.get("search_volume"),
-                    "upvotes":        doc.get("upvotes"),
-                    "comments":       doc.get("comments"),
-                })
-
-            total_batches += 1
-            log.info(f"[RESCORE] BATCH {total_batches} | items:{len(items_for_claude)}")
-
-            scores = score_batch_with_claude(items_for_claude)
-            score_map = {int(s.get("index", 0)): s for s in scores if s.get("index")}
-
-            for i, item in enumerate(items_for_claude):
-                pos = i + 1
-                sr = score_map.get(pos) or (scores[i] if i < len(scores) else _fallback_score(pos))
-                enrichment = {
-                    "google_rank":    item.get("google_rank"),
-                    "search_volume":  item.get("search_volume"),
-                    "upvotes":        item.get("upvotes"),
-                    "comments":       item.get("comments"),
-                    "search_keyword": item.get("search_keyword"),
-                }
-                replace_confirmed_signal(item["message_id"], enrichment, sr)
-
-            log.info(f"[RESCORE] BATCH {total_batches} DONE — waiting {RESCORE_BATCH_GAP_SECONDS}s...")
-            time.sleep(RESCORE_BATCH_GAP_SECONDS)
-
-        except Exception as exc:
-            log.error(f"[RESCORE] processor error: {exc}")
-            time.sleep(10)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TWITTER / X POLLER — UNCHANGED from v9.11.1.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_twitter_client() -> tweepy.Client | None:
-    if not TWITTER_BEARER_TOKEN:
-        log.warning("TWITTER_BEARER_TOKEN not set — Twitter platform disabled.")
-        return None
-    try:
-        client = tweepy.Client(
-            bearer_token=TWITTER_BEARER_TOKEN,
-            consumer_key=TWITTER_API_KEY,
-            consumer_secret=TWITTER_API_SECRET,
-            wait_on_rate_limit=True,
-        )
-        log.info("Twitter/X client initialised.")
-        return client
-    except Exception as exc:
-        log.error(f"Twitter client error: {exc}")
-        return None
-
-
-def poll_twitter(client: tweepy.Client):
-    seen_ids: set = load_seen_ids("twitter")
-    dirty = 0
-    log.info(f"Twitter poll started | query_len:{len(TWITTER_SEARCH_QUERY)} | "
-             f"dedup resumed with {len(seen_ids)} ID(s)")
-
-    while True:
-        try:
-            response = client.search_recent_tweets(
-                query=TWITTER_SEARCH_QUERY,
-                max_results=50,
-                tweet_fields=["author_id", "created_at", "text", "public_metrics"],
-                expansions=["author_id"],
-                user_fields=["username", "name"],
-            )
-
-            if not response or not response.data:
-                time.sleep(TWITTER_POLL_INTERVAL)
-                continue
-
-            user_map = {u.id: u.username for u in (response.includes or {}).get("users", [])}
-
-            new_count = 0
-            for tweet in response.data:
-                tweet_id = str(tweet.id)
-                if tweet_id in seen_ids:
-                    continue
-                seen_ids.add(tweet_id)
-                dirty += 1
-                if len(seen_ids) > 50_000:
-                    seen_ids.clear()
-
-                username = user_map.get(tweet.author_id, f"user_{tweet.author_id}")
-                metrics = tweet.public_metrics or {}
-
-                _tw_item = {
-                    "message_id":           f"twitter_{tweet_id}",
-                    "platform":             "twitter",
-                    "text":                 tweet.text or "",
-                    "username":             username,
-                    "subreddit_or_channel": "",
-                    "post_url":             f"https://twitter.com/{username}/status/{tweet_id}",
-                    "posted_at":            str(tweet.created_at) if tweet.created_at else None,
-                    "search_keyword":       SEARCH_KEYWORD,
-                    "upvotes":              metrics.get("like_count"),
-                    "comments":             metrics.get("reply_count"),
-                    "google_rank":          None,
-                    "search_volume":        None,
-                }
-                twitter_queue.put(_tw_item)
-                save_queue_message("twitter", _tw_item)
-                new_count += 1
-
-            if dirty >= 10:
-                save_seen_ids("twitter", seen_ids)
-                dirty = 0
-
-            if new_count:
-                log.info(f"Twitter: {new_count} new tweets queued | queue_size:{twitter_queue.qsize()}")
-
-        except tweepy.errors.TweepyException as exc:
-            log.error(f"Twitter poll error: {exc}")
-        except Exception as exc:
-            log.error(f"Twitter unexpected error: {exc}")
-
-        time.sleep(TWITTER_POLL_INTERVAL)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # ASYNC LISTENERS — thread management + auto-restart
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def start_reddit_listener():
-    """
-    Reddit now runs on THREE independent threads instead of two:
-      1. SERP discovery (run_serp_discovery_loop) — untouched Google
-         call, saves results into flintel_google_posts, never waits on
-         Reddit.
-      2. Reddit fetch (run_reddit_fetch_loop) — NEW, reads
+    """Reddit runs on TWO independent threads:
+      1. SERP discovery (run_serp_discovery_loop) — Google call, saves
+         results into flintel_google_posts.
+      2. Reddit fetch (run_reddit_fetch_loop) — reads
          flintel_google_posts directly, fetches RSS, fuzzy-filters,
-         queues.
-      3. Batch processor (run_batch_processor) — consumes reddit_queue
-         exactly as before, with the v9.12.1/v9.12.2 fixes.
-    Governed entirely by REDDIT_ENABLED + RapidAPI credentials (RapidAPI
-    is required for SERP discovery; the per-post RSS fetch step itself
-    needs no credentials at all).
-    """
+         saves matches straight into flintel_signals.
+    No batch/Claude thread anymore — nothing left to score."""
     if not REDDIT_ENABLED:
         log.warning("Reddit platform DISABLED — skipping.")
         return
@@ -3485,25 +922,11 @@ async def start_reddit_listener():
         log.warning("Reddit not started — RAPIDAPI_KEY not set (required for SERP discovery).")
         return
 
-    resumed = load_queue_messages("reddit")
-    for it in resumed:
-        reddit_queue.put(it)
-    if resumed:
-        log.info(f"[REDDIT] Resumed {len(resumed)} queue message(s) from MongoDB after restart.")
-
     serp_thread = threading.Thread(target=run_serp_discovery_loop, daemon=True, name="Reddit-SERP")
     fetch_thread = threading.Thread(target=run_reddit_fetch_loop, daemon=True, name="Reddit-Fetch")
-    btch_thread = threading.Thread(
-        target=run_batch_processor,
-        args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS,
-              REDDIT_BATCH_TIMEOUT_SECONDS, REDDIT_SEARCH_KEYWORDS),
-        daemon=True, name="Reddit-Batch",
-    )
     serp_thread.start()
     fetch_thread.start()
-    btch_thread.start()
-    log.info(f"Reddit threads running: SERP-Discovery ✅ | Reddit-Fetch ✅ | Batch ✅ | "
-             f"gap:{REDDIT_BATCH_GAP_SECONDS}s | timeout:{REDDIT_BATCH_TIMEOUT_SECONDS}s")
+    log.info("Reddit threads running: SERP-Discovery ✅ | Reddit-Fetch ✅")
 
     while True:
         await asyncio.sleep(60)
@@ -3515,71 +938,6 @@ async def start_reddit_listener():
             log.error("Reddit Fetch thread died — restarting...")
             fetch_thread = threading.Thread(target=run_reddit_fetch_loop, daemon=True, name="Reddit-Fetch")
             fetch_thread.start()
-        if not btch_thread.is_alive():
-            log.error("Reddit batch thread died — restarting...")
-            btch_thread = threading.Thread(
-                target=run_batch_processor,
-                args=(reddit_queue, REDDIT_BATCH_SIZE, "REDDIT", REDDIT_BATCH_GAP_SECONDS,
-                      REDDIT_BATCH_TIMEOUT_SECONDS, REDDIT_SEARCH_KEYWORDS),
-                daemon=True, name="Reddit-Batch",
-            )
-            btch_thread.start()
-
-
-async def start_twitter_listener():
-    if not TWITTER_ENABLED:
-        log.warning("Twitter platform DISABLED — skipping.")
-        return
-    client = build_twitter_client()
-    if client is None:
-        return
-
-    resumed = load_queue_messages("twitter")
-    for it in resumed:
-        twitter_queue.put(it)
-    if resumed:
-        log.info(f"[TWITTER] Resumed {len(resumed)} queue message(s) from MongoDB after restart.")
-
-    poll_thread = threading.Thread(target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll")
-    btch_thread = threading.Thread(
-        target=run_batch_processor,
-        args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS,
-              TWITTER_BATCH_TIMEOUT_SECONDS, TWITTER_SEARCH_KEYWORDS),
-        daemon=True, name="Twitter-Batch",
-    )
-    poll_thread.start()
-    btch_thread.start()
-    log.info(f"Twitter threads running: Poll ✅ | Batch ✅ | "
-             f"gap:{TWITTER_BATCH_GAP_SECONDS}s | timeout:{TWITTER_BATCH_TIMEOUT_SECONDS}s")
-
-    while True:
-        await asyncio.sleep(60)
-        if not poll_thread.is_alive():
-            log.error("Twitter poll thread died — restarting...")
-            poll_thread = threading.Thread(target=poll_twitter, args=(client,), daemon=True, name="Twitter-Poll")
-            poll_thread.start()
-        if not btch_thread.is_alive():
-            log.error("Twitter batch thread died — restarting...")
-            btch_thread = threading.Thread(
-                target=run_batch_processor,
-                args=(twitter_queue, TWITTER_BATCH_SIZE, "TWITTER", TWITTER_BATCH_GAP_SECONDS,
-                      TWITTER_BATCH_TIMEOUT_SECONDS, TWITTER_SEARCH_KEYWORDS),
-                daemon=True, name="Twitter-Batch",
-            )
-            btch_thread.start()
-
-
-async def start_rescore_listener():
-    rescore_thread = threading.Thread(target=run_rescore_processor, daemon=True, name="Rescore-Processor")
-    rescore_thread.start()
-    log.info("Rescore processor thread running ✅")
-
-    while True:
-        await asyncio.sleep(60)
-        if not rescore_thread.is_alive():
-            log.error("Rescore processor thread died — restarting...")
-            rescore_thread = threading.Thread(target=run_rescore_processor, daemon=True, name="Rescore-Processor")
-            rescore_thread.start()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3587,28 +945,8 @@ async def start_rescore_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel v9.12 — Reddit (SERP discovery decoupled from Reddit fetch via flintel_google_posts + Python auto-fuzzy keyword filtering) + Twitter Signal Scorer",
-    description=(
-        "Reddit SERP discovery (RapidAPI, untouched) now saves every result "
-        "into a NEW flintel_google_posts collection (post_url + google_rank + "
-        "the exact search_keyword used + subreddit + Python auto-generated "
-        "fuzzy_keywords) the instant it's found — Google SERP storage never "
-        "waits on Reddit. A fully separate Reddit-fetch loop reads that same "
-        "collection directly (no parallel python list of subreddits/keywords "
-        "anywhere), fetches each due post's public per-post RSS feed "
-        "(credential-free, smart-retry + old.reddit.com fallback, no OAuth/"
-        "PRAW, no .json endpoint anywhere), filters the fetched content "
-        "against that post's own stored fuzzy keywords, and — on a match — "
-        "reads search_volume from the completely untouched flintel_keywords "
-        "cache, builds the exact same item schema as before, and queues it "
-        "for Claude scoring exactly as always. flintel_keywords and all "
-        "Google-rank/SERP code are 100% unmodified from v9.11.1. v9.12.1 "
-        "fixed a redundant Reddit-side re-filter in the batch processor. "
-        "v9.12.2 additionally closes an item-loss window between dequeue "
-        "and persistence, and makes the too-short-text drop path logged "
-        "and counted instead of silent."
-    ),
-    version="9.12.2",
+    title="Flintel main.py — Reddit-only (Google SERP discovery -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals, no Claude, no search_volume, no engagement, no Twitter)",
+    version="1.0.0",
 )
 
 
@@ -3625,8 +963,6 @@ def _serialise(signals: list) -> list:
 def root():
     total_keywords_tracked = db.flintel_keywords.count_documents({})
     due_now_count = db.flintel_keywords.count_documents({"fetched": False})
-    missing_volume_count = db.flintel_keywords.count_documents({"search_volume": None})
-    random_volume_count = db.flintel_keywords.count_documents({"search_volume_is_random": True})
 
     total_google_posts = db.flintel_google_posts.count_documents({})
     pending_reddit_fetch = db.flintel_google_posts.count_documents({"reddit_fetched": False})
@@ -3636,62 +972,35 @@ def root():
 
     return {
         "status":                  "running",
-        "system":                  "FLINTEL v9.12.2 (Reddit SERP-discovery/fetch decoupled via flintel_google_posts + auto-fuzzy keywords + Twitter; redundant batch-filter bug fixed; batch-processor item-loss window closed)",
+        "system":                  "Flintel main.py — Reddit-only signal pipeline (no Claude, no search_volume, no engagement, no Twitter)",
         "client":                  CLIENT_ID,
-        "platforms":               ["reddit", "twitter"],
+        "platforms":               ["reddit"],
         "reddit_enabled":          REDDIT_ENABLED,
         "reddit_status":           _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
         "reddit_fetch_method":     "public per-post RSS (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW, no .json endpoint anywhere",
-        "twitter_enabled":         TWITTER_ENABLED,
-        "twitter_status":          _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
         "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
-        "twitter_search_keywords": len(TWITTER_SEARCH_KEYWORDS),
         "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
-        "keyword_cache":                  "ENABLED — fetch-once-forever, restart-safe (flintel_keywords) — UNTOUCHED from v9.11.1",
-        "search_volume_seeding":           f"BATCHED loop (chunks of {SEARCH_VOLUME_BATCH_SIZE}) — UNTOUCHED",
-        "search_volume_random_fallback":   f"ENABLED — range {SEARCH_VOLUME_RANDOM_FALLBACK_MIN}-{SEARCH_VOLUME_RANDOM_FALLBACK_MAX} — UNTOUCHED",
-        "reddit_serp_reddit_fetch_decoupled": True,
-        "reddit_batch_redundant_filter_fixed": True,
-        "batch_processor_item_loss_window_fixed": True,
-        "batch_processor_short_text_drop_logged": True,
-        "google_posts_collection":        "flintel_google_posts",
-        "google_posts_tracked":           total_google_posts,
-        "google_posts_pending_reddit_fetch": pending_reddit_fetch,
-        "google_posts_reddit_fetched":    fetched_reddit_posts,
-        "google_posts_fuzzy_matched":     fuzzy_matched_posts,
-        "google_posts_fuzzy_no_match":    fuzzy_no_match_posts,
+        "keyword_cache":           "ENABLED — fetch-once-forever, restart-safe (flintel_keywords)",
+        "google_posts_collection":            "flintel_google_posts",
+        "google_posts_tracked":               total_google_posts,
+        "google_posts_pending_reddit_fetch":  pending_reddit_fetch,
+        "google_posts_reddit_fetched":        fetched_reddit_posts,
+        "google_posts_fuzzy_matched":         fuzzy_matched_posts,
+        "google_posts_fuzzy_no_match":        fuzzy_no_match_posts,
         "reddit_fetch_check_interval_seconds": REDDIT_FETCH_CHECK_INTERVAL_SECONDS,
         "reddit_post_retry_cooldown_seconds":  REDDIT_POST_RETRY_COOLDOWN_SECONDS,
-        "reddit_engagement_random_fallback": f"ENABLED — range {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (RSS has no real upvotes/comments), always logged",
-        "keywords_tracked":               total_keywords_tracked,
-        "keywords_due_now":               due_now_count,
-        "keywords_missing_search_volume": missing_volume_count,
-        "keywords_with_random_search_volume": random_volume_count,
+        "keywords_tracked":        total_keywords_tracked,
+        "keywords_due_now":        due_now_count,
         "serp_months_back":        SERP_MONTHS_BACK,
         "serp_results_per_kw":     SERP_RESULTS_PER_KEYWORD,
-        "reddit_batch_size":       REDDIT_BATCH_SIZE,
-        "twitter_batch_size":      TWITTER_BATCH_SIZE,
-        "rescore_batch_size":      RESCORE_BATCH_SIZE,
-        "reddit_batch_gap_s":      REDDIT_BATCH_GAP_SECONDS,
-        "reddit_batch_timeout_s":  REDDIT_BATCH_TIMEOUT_SECONDS,
-        "twitter_batch_gap_s":     TWITTER_BATCH_GAP_SECONDS,
-        "twitter_batch_timeout_s": TWITTER_BATCH_TIMEOUT_SECONDS,
-        "rescore_batch_gap_s":     RESCORE_BATCH_GAP_SECONDS,
-        "rapidapi_configured":    bool(RAPIDAPI_KEY),
-        "reddit_queue_size":       reddit_queue.qsize(),
-        "twitter_queue_size":      twitter_queue.qsize(),
-        "rescore_pending":         db.signals.count_documents({"status": "pending"}),
+        "rapidapi_configured":     bool(RAPIDAPI_KEY),
         "auth_required":           bool(API_KEY),
-        "telegram_removed":        True,
-        "reddit_json_endpoint_removed": True,
-        "reddit_oauth_praw_removed": True,
-        "fixed_full_cycle_sleep_removed": True,
-        "post_url_dedup_before_scoring": True,
-        "claude_failure_routes_to_pending": True,
-        "keyword_due_state_independent_of_python_list": True,
-        "flintel_keywords_untouched": True,
-        "google_rank_serp_logic_untouched": True,
-        "output_schema":           "intent_score (1-100) / is_relevant / reply_draft",
+        "claude_removed":          True,
+        "search_volume_removed":   True,
+        "engagement_removed":      True,
+        "twitter_removed":         True,
+        "batching_removed":        True,
+        "signals_saved_directly":  True,
     }
 
 
@@ -3708,14 +1017,7 @@ def health():
         "mongodb":                 mongo,
         "reddit_working":          REDDIT_ENABLED and bool(RAPIDAPI_KEY),
         "reddit_indicator":        _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
-        "reddit_fetch_method":     "public per-post RSS (credential-free) — no OAuth/PRAW",
-        "reddit_serp_reddit_fetch_decoupled": True,
-        "twitter_working":         TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN),
-        "twitter_indicator":       _working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN)),
-        "reddit_queue_size":       reddit_queue.qsize(),
-        "twitter_queue_size":      twitter_queue.qsize(),
         "google_posts_pending_reddit_fetch": db.flintel_google_posts.count_documents({"reddit_fetched": False}),
-        "rescore_pending":         db.signals.count_documents({"status": "pending"}),
         "client_id":               CLIENT_ID,
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
@@ -3723,45 +1025,23 @@ def health():
 
 @app.get("/keywords", dependencies=[Depends(verify_api_key)])
 def get_keywords_status():
-    """UNCHANGED from v9.11.1 — inspects the untouched flintel_keywords
-    fetch-once-forever cache directly."""
     raw_docs = list(db.flintel_keywords.find({}, {"_id": 0}).sort("keyword", 1))
     due_count = 0
-    missing_volume_count = 0
-    random_volume_count = 0
     docs = []
     for d in raw_docs:
         is_due = not d.get("fetched")
         if is_due:
             due_count += 1
-        if d.get("search_volume") is None:
-            missing_volume_count += 1
-        if d.get("search_volume_is_random"):
-            random_volume_count += 1
         for f in ["last_fetched_at", "created_at"]:
             if d.get(f):
                 d[f] = d[f].isoformat()
         d["due_now"] = is_due
         docs.append(d)
-    return {
-        "total": len(docs),
-        "due_now": due_count,
-        "missing_search_volume": missing_volume_count,
-        "random_fallback_search_volume": random_volume_count,
-        "keywords": docs,
-    }
+    return {"total": len(docs), "due_now": due_count, "keywords": docs}
 
 
 @app.get("/google-posts", dependencies=[Depends(verify_api_key)])
 def get_google_posts_status(reddit_fetched: bool = None, fuzzy_matched: bool = None, limit: int = 200):
-    """
-    NEW (v9.12) — inspect the flintel_google_posts collection directly:
-    every Reddit post_url SERP discovery has ever found, its google_rank,
-    the search_keyword + auto-generated fuzzy_keywords it was discovered
-    under, its subreddit, whether it's been Reddit-fetched yet
-    (reddit_fetched), and — once fetched — whether its content actually
-    matched the fuzzy keywords (fuzzy_matched: true/false/null).
-    """
     q: dict = {}
     if reddit_fetched is not None:
         q["reddit_fetched"] = reddit_fetched
@@ -3792,35 +1072,13 @@ def get_google_posts_status(reddit_fetched: bool = None, fuzzy_matched: bool = N
 
 
 @app.get("/signals", dependencies=[Depends(verify_api_key)])
-def get_signals(limit: int = 50, min_score: int = None, is_relevant: bool = None,
-                 platform: str = None, status: str = None):
+def get_signals(limit: int = 50, search_keyword: str = None, platform: str = None):
     q: dict = {"client_id": CLIENT_ID}
-    if min_score is not None:
-        q["intent_score"] = {"$gte": min_score}
-    if is_relevant is not None:
-        q["is_relevant"] = is_relevant
+    if search_keyword:
+        q["search_keyword"] = search_keyword
     if platform:
         q["platform"] = platform
-    if status:
-        q["status"] = status
-    signals = list(db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
-    return {"count": len(signals), "signals": _serialise(signals)}
-
-
-@app.get("/signals/relevant", dependencies=[Depends(verify_api_key)])
-def get_relevant_signals(limit: int = 50, min_score: int = 0):
-    signals = list(
-        db.signals.find(
-            {"client_id": CLIENT_ID, "is_relevant": True, "intent_score": {"$gte": min_score}},
-            {"_id": 0},
-        ).sort("intent_score", -1).limit(limit)
-    )
-    return {"count": len(signals), "signals": _serialise(signals)}
-
-
-@app.get("/signals/pending", dependencies=[Depends(verify_api_key)])
-def get_pending(limit: int = 100):
-    signals = list(db.signals.find({"status": "pending"}, {"_id": 0}).limit(limit))
+    signals = list(db.flintel_signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
     return {"count": len(signals), "signals": _serialise(signals)}
 
 
@@ -3839,46 +1097,27 @@ async def main():
 
     await asyncio.gather(
         start_reddit_listener(),
-        start_twitter_listener(),
-        start_rescore_listener(),
     )
 
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL v9.12.2 — REDDIT SERP-DISCOVERY / REDDIT-FETCH DECOUPLED")
-    log.info("                   VIA NEW flintel_google_posts COLLECTION +")
-    log.info("                   PYTHON AUTO-FUZZY KEYWORD GENERATION/FILTERING")
-    log.info("                   + TWITTER SIGNAL SCORER")
-    log.info("                   (+ redundant Reddit batch-filter bug FIXED)")
-    log.info("                   (+ batch-processor item-loss window CLOSED)")
+    log.info("  FLINTEL main.py — REDDIT-ONLY SIGNAL PIPELINE")
+    log.info("  (Google SERP discovery -> flintel_google_posts -> Reddit RSS fetch")
+    log.info("   -> flintel_signals, saved directly, tagged with search_keyword)")
+    log.info("  Claude / search_volume / engagement / Twitter / batching: REMOVED")
     log.info("=" * 70)
     log.info(f"  Client                : {CLIENT_ID}")
-    log.info(f"  Platforms             : Reddit (SERP discovery + separate fetch loop) + Twitter/X")
     log.info(f"  Reddit                : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
     log.info(f"  Reddit fetch method   : public per-post RSS only — credential-free, no OAuth/PRAW, no .json anywhere")
-    log.info(f"  Reddit engagement     : RANDOM placeholder {REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MIN}-{REDDIT_ENGAGEMENT_RANDOM_FALLBACK_MAX} (upvotes/comments) — RSS has no real counts, always logged")
-    log.info(f"  Twitter               : {TWITTER_ENABLED} | {_working(TWITTER_ENABLED and bool(TWITTER_BEARER_TOKEN))}")
     log.info(f"  Reddit keywords       : {len(REDDIT_SEARCH_KEYWORDS)} (used ONLY to seed brand-new flintel_keywords docs)")
-    log.info(f"  Twitter keywords      : {len(TWITTER_SEARCH_KEYWORDS)} (used for Twitter search query)")
-    log.info(f"  Keyword cache         : flintel_keywords — fetch-once-forever, UNTOUCHED from v9.11.1")
-    log.info(f"  Google SERP / rank    : search_google_for_keyword() / fetch_google_rank() / fetch_search_volume() — UNTOUCHED, byte-for-byte")
-    log.info(f"  NEW collection        : flintel_google_posts — stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched")
-    log.info(f"  SERP -> Google-posts  : every SERP result saved immediately, does NOT wait on Reddit fetch to complete")
-    log.info(f"  Reddit fetch loop     : fully separate thread, reads flintel_google_posts directly (no python list of subreddits/keywords/fuzzy-keywords kept anywhere)")
+    log.info(f"  Keyword cache         : flintel_keywords — fetch-once-forever")
+    log.info(f"  Google SERP           : search_google_for_keyword() — unchanged single RapidAPI call")
+    log.info(f"  flintel_google_posts  : stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched")
     log.info(f"  Reddit fetch interval : check every {REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | retry cooldown {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s on genuine fetch failure")
-    log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time (generate_fuzzy_keywords()) — stored on the post's own document, used to filter fetched RSS content (passes_fuzzy_filter())")
-    log.info(f"  Search-volume source  : flintel_keywords cache, looked up per search_keyword at Reddit-fetch/queue time — untouched cache, untouched seeding logic")
-    log.info(f"  Batch processor fix   : Reddit items no longer re-filtered by passes_keyword_filter() against the full keyword-phrase list — fuzzy match upstream is now the sole gate for Reddit; Twitter unaffected")
-    log.info(f"  Batch processor fix 2 : remove_queue_message() moved to AFTER an item's fate is persisted (batch save or logged drop) — closes item-loss window between dequeue and persist; short-text drops now logged + counted")
-    log.info(f"  Reddit batch          : {REDDIT_BATCH_SIZE} items OR {REDDIT_BATCH_TIMEOUT_SECONDS}s | gap {REDDIT_BATCH_GAP_SECONDS}s")
-    log.info(f"  Twitter batch         : {TWITTER_BATCH_SIZE} items OR {TWITTER_BATCH_TIMEOUT_SECONDS}s | gap {TWITTER_BATCH_GAP_SECONDS}s")
-    log.info(f"  Rescore batch         : {RESCORE_BATCH_SIZE} items | poll {RESCORE_POLL_INTERVAL}s | gap {RESCORE_BATCH_GAP_SECONDS}s")
-    log.info(f"  Claude streaming      : True | prompt: generic 1-100 relevance/visibility/engagement")
-    log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — google_rank + search_volume, UNTOUCHED)")
-    log.info(f"  Telegram              : REMOVED")
-    log.info(f"  Reddit .json endpoint : REMOVED (never used — RSS only)")
-    log.info(f"  Reddit OAuth/PRAW     : REMOVED")
+    log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time — used to filter fetched RSS content")
+    log.info(f"  Signal storage        : direct save into flintel_signals on fuzzy match — NO queue, NO batch, NO Claude")
+    log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — Google SERP discovery only now)")
     log.info(f"  MongoDB DB            : {MONGODB_DB}")
     log.info(f"  API auth              : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
     log.info("=" * 70)
