@@ -1,5 +1,5 @@
 """
-FLINTEL — main.py  (STRIPPED-DOWN SIGNAL PIPELINE, based on v9.12)
+FLINTEL — index.py  (STRIPPED-DOWN SIGNAL PIPELINE, based on v9.12)
 =====================================================================
 WHAT THIS FILE IS:
   A simplified version of the v9.12 service. The SERP-discovery ->
@@ -52,10 +52,22 @@ WHAT THIS FILE IS:
        post_url, text, username, subreddit, posted_at — no score, no
        queue, no batch, no Claude call anywhere in this file.
 
+  BUGFIX vs. original main.py:
+    - The unique index on flintel_signals.message_id was being created
+      here under the name "message_id_unique". On any deployment where
+      this collection/index already existed under its original name
+      ("signals_message_id_unique" — same key, same uniqueness), Mongo
+      refuses to create a second index with an identical key pattern
+      under a different name and raises IndexOptionsConflict (error
+      code 85) on every startup. Fixed by creating the index under the
+      name that already exists in the database, so create_index() is a
+      no-op on deployments that already have it, and creates it fresh
+      (under the same name) on brand-new deployments.
+
 Run:
     pip install fastapi uvicorn pymongo python-dotenv httpx requests \
                 feedparser
-    python main.py
+    python index.py
 """
 
 import asyncio
@@ -306,7 +318,15 @@ def get_database():
         client.server_info()
         db = client[MONGODB_DB]
 
-        db.flintel_signals.create_index([("message_id", ASCENDING)], unique=True, name="message_id_unique")
+        # NOTE: name matches the index this collection already has in
+        # production ("signals_message_id_unique"). Same key/uniqueness
+        # as before — only the *name* passed to create_index() changed,
+        # so this is a no-op on deployments that already have it, and
+        # creates it correctly (under this name) on brand-new ones.
+        # Using any other name here for the same key pattern causes
+        # pymongo.errors.OperationFailure: IndexOptionsConflict (code 85)
+        # on every startup once the index already exists.
+        db.flintel_signals.create_index([("message_id", ASCENDING)], unique=True, name="signals_message_id_unique")
         db.flintel_signals.create_index([("post_url", ASCENDING)], name="post_url_lookup")
         for field in ["search_keyword", "platform", "created_at"]:
             db.flintel_signals.create_index([(field, ASCENDING)])
@@ -945,7 +965,7 @@ async def start_reddit_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel main.py — Reddit-only (Google SERP discovery -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals, no Claude, no search_volume, no engagement, no Twitter)",
+    title="Flintel index.py — Reddit-only (Google SERP discovery -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals, no Claude, no search_volume, no engagement, no Twitter)",
     version="1.0.0",
 )
 
@@ -972,7 +992,7 @@ def root():
 
     return {
         "status":                  "running",
-        "system":                  "Flintel main.py — Reddit-only signal pipeline (no Claude, no search_volume, no engagement, no Twitter)",
+        "system":                  "Flintel index.py — Reddit-only signal pipeline (no Claude, no search_volume, no engagement, no Twitter)",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -1102,7 +1122,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  FLINTEL main.py — REDDIT-ONLY SIGNAL PIPELINE")
+    log.info("  FLINTEL index.py — REDDIT-ONLY SIGNAL PIPELINE")
     log.info("  (Google SERP discovery -> flintel_google_posts -> Reddit RSS fetch")
     log.info("   -> flintel_signals, saved directly, tagged with search_keyword)")
     log.info("  Claude / search_volume / engagement / Twitter / batching: REMOVED")
