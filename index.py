@@ -84,7 +84,7 @@ from dotenv import load_dotenv
 import requests
 import feedparser
 from pymongo import MongoClient, ASCENDING
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, OperationFailure
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 from starlette.status import HTTP_403_FORBIDDEN
@@ -312,46 +312,72 @@ def passes_fuzzy_filter(text: str, search_keyword: str, fuzzy_keywords: list) ->
 # is no batching or Claude step left to persist state for.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _ensure_index(collection, keys, **kwargs):
+    """Create an index, but never let a pre-existing index under a
+    *different* name for the *same* key pattern crash startup.
+
+    Different deployments of this service have accumulated indexes
+    under slightly different auto-generated / hand-picked names over
+    past versions (e.g. "signals_message_id_unique",
+    "signals_search_keyword"). Mongo refuses to create a second index
+    with an identical key spec under a new name and raises
+    OperationFailure code 85 (IndexOptionsConflict). Since an
+    equivalent index already existing under another name is completely
+    fine functionally (same key, same options), we just log it and
+    move on instead of raising.
+    """
+    try:
+        collection.create_index(keys, **kwargs)
+    except OperationFailure as exc:
+        if exc.code == 85:  # IndexOptionsConflict
+            log.warning(
+                f"[INDEX] Equivalent index for {keys} already exists under a "
+                f"different name on {collection.name} — skipping create "
+                f"(requested name: {kwargs.get('name')!r}): {exc.details.get('errmsg', exc)}"
+            )
+        else:
+            raise
+
+
 def get_database():
     try:
         client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         client.server_info()
         db = client[MONGODB_DB]
 
-        # NOTE: name matches the index this collection already has in
-        # production ("signals_message_id_unique"). Same key/uniqueness
-        # as before — only the *name* passed to create_index() changed,
-        # so this is a no-op on deployments that already have it, and
-        # creates it correctly (under this name) on brand-new ones.
-        # Using any other name here for the same key pattern causes
-        # pymongo.errors.OperationFailure: IndexOptionsConflict (code 85)
-        # on every startup once the index already exists.
-        db.flintel_signals.create_index([("message_id", ASCENDING)], unique=True, name="signals_message_id_unique")
-        db.flintel_signals.create_index([("post_url", ASCENDING)], name="post_url_lookup")
-        for field in ["search_keyword", "platform", "created_at"]:
-            db.flintel_signals.create_index([(field, ASCENDING)])
+        # NOTE: names below match what this collection already has in
+        # production. Same keys/uniqueness as before — only the *name*
+        # passed to create_index() matters here. Any mismatch for a
+        # key pattern that already exists under a different name is
+        # now handled gracefully by _ensure_index() instead of crashing
+        # the process with IndexOptionsConflict (code 85).
+        _ensure_index(db.flintel_signals, [("message_id", ASCENDING)], unique=True, name="signals_message_id_unique")
+        _ensure_index(db.flintel_signals, [("post_url", ASCENDING)], name="post_url_lookup")
+        _ensure_index(db.flintel_signals, [("search_keyword", ASCENDING)], name="signals_search_keyword")
+        _ensure_index(db.flintel_signals, [("platform", ASCENDING)], name="signals_platform")
+        _ensure_index(db.flintel_signals, [("created_at", ASCENDING)], name="signals_created_at")
 
         # flintel_keywords — fetch-once-forever cache. UNCHANGED shape,
         # minus the search_volume fields (removed — no longer used).
-        db.flintel_keywords.create_index([("keyword", ASCENDING)], unique=True, name="keyword_unique")
-        db.flintel_keywords.create_index([("fetched", ASCENDING)], name="keyword_fetched_idx")
-        db.flintel_keywords.create_index([("next_retry_at", ASCENDING)], name="keyword_retry_cooldown_idx")
+        _ensure_index(db.flintel_keywords, [("keyword", ASCENDING)], unique=True, name="keyword_unique")
+        _ensure_index(db.flintel_keywords, [("fetched", ASCENDING)], name="keyword_fetched_idx")
+        _ensure_index(db.flintel_keywords, [("next_retry_at", ASCENDING)], name="keyword_retry_cooldown_idx")
 
         # flintel_google_posts — UNCHANGED schema/indexes from v9.12.
-        db.flintel_google_posts.create_index(
-            [("post_url", ASCENDING)], unique=True, name="google_post_url_unique"
+        _ensure_index(
+            db.flintel_google_posts, [("post_url", ASCENDING)], unique=True, name="google_post_url_unique"
         )
-        db.flintel_google_posts.create_index(
-            [("reddit_fetched", ASCENDING)], name="google_post_fetched_idx"
+        _ensure_index(
+            db.flintel_google_posts, [("reddit_fetched", ASCENDING)], name="google_post_fetched_idx"
         )
-        db.flintel_google_posts.create_index(
-            [("next_retry_at", ASCENDING)], name="google_post_retry_cooldown_idx"
+        _ensure_index(
+            db.flintel_google_posts, [("next_retry_at", ASCENDING)], name="google_post_retry_cooldown_idx"
         )
-        db.flintel_google_posts.create_index(
-            [("subreddit", ASCENDING)], name="google_post_subreddit_idx"
+        _ensure_index(
+            db.flintel_google_posts, [("subreddit", ASCENDING)], name="google_post_subreddit_idx"
         )
-        db.flintel_google_posts.create_index(
-            [("search_keyword", ASCENDING)], name="google_post_search_keyword_idx"
+        _ensure_index(
+            db.flintel_google_posts, [("search_keyword", ASCENDING)], name="google_post_search_keyword_idx"
         )
 
         log.info("MongoDB connected.")
