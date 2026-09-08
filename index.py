@@ -64,6 +64,29 @@ WHAT THIS FILE IS:
       no-op on deployments that already have it, and creates it fresh
       (under the same name) on brand-new deployments.
 
+  COST-CONTROL BATCHING (NEW, this version only):
+    - The Google SERP discovery step no longer fires ONE RapidAPI call
+      per keyword. Due keywords are now grouped into batches of
+      GOOGLE_SERP_BATCH (default 10, .env-overridable) and ONE RapidAPI
+      call is made per batch, using a single OR'd query
+      (site:reddit.com ("kw1" OR "kw2" OR ... "kw10")). This cuts
+      RapidAPI usage ~GOOGLE_SERP_BATCH-fold.
+    - Every result returned by a batched call is still resolved back to
+      exactly ONE keyword from that batch (via
+      _find_best_matching_keyword — exact substring match first, same
+      fuzzy-keyword variants used everywhere else in this file as a
+      fallback) before being saved, so flintel_google_posts keeps
+      storing a single, unambiguous search_keyword + fuzzy_keywords per
+      document, exactly like the old one-call-per-keyword flow did.
+      A result that can't be confidently attributed to any keyword in
+      its batch is skipped rather than mis-tagged.
+    - Absolutely nothing else changes: flintel_google_posts schema,
+      Reddit RSS fetch loop, fuzzy filtering downstream, signal storage,
+      indexes, endpoints — all 100% as before. The old single-keyword
+      search_google_for_keyword() / process_one_keyword() functions are
+      kept in place (unused by the loop now, left for reference /
+      backward compatibility) rather than removed.
+
 Run:
     pip install fastapi uvicorn pymongo python-dotenv httpx requests \
                 feedparser
@@ -122,545 +145,206 @@ REDDIT_JSON_TIMEOUT_SECONDS     = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "
 # seed brand-new keyword documents into flintel_keywords (insert-only).
 REDDIT_SEARCH_KEYWORDS = [
     
-    
-     "3PL",
-      "A/B testing tool",
-      "BigCommerce",
-      "SMS marketing",
-      "Shopify",
-      "UGC platform",
-      "WooCommerce",
-      "affiliate program",
-      "affordable 3PL",
-      "affordable A/B testing tool",
-      "affordable BigCommerce",
-      "affordable POS",
-      "affordable SMS marketing",
-      "affordable Shopify",
-      "affordable UGC platform",
-      "affordable WooCommerce",
-      "affordable affiliate program",
-      "affordable amazon FBA",
-      "affordable barcode labeling",
-      "affordable cart recovery",
-      "affordable chargeback management",
-      "affordable checkout",
-      "affordable conversion optimization",
-      "affordable customer service software",
-      "affordable customs broker",
-      "affordable dropshipping",
-      "affordable ecommerce accountant",
-      "affordable email marketing",
-      "affordable etsy shop",
-      "affordable freight forwarder",
-      "affordable fulfillment",
-      "affordable influencer platform",
-      "affordable inventory tool",
-      "affordable live chat widget",
-      "affordable loyalty program",
-      "affordable marketplace integration",
-      "affordable packaging supplier",
-      "affordable pricing tool",
-      "affordable print on demand",
-      "affordable product listing service",
-      "affordable product photography",
-      "affordable returns management",
-      "affordable review platform",
-      "affordable shipping software",
-      "affordable storefront builder",
-      "affordable subscription billing",
-      "affordable supplier sourcing",
-      "affordable warehouse software",
-      "affordable wholesaler",
-      "amazon FBA",
-      "barcode labeling",
-      "budget 3PL",
-      "budget A/B testing tool",
-      "budget BigCommerce",
-      "budget POS",
-      "budget SMS marketing",
-      "budget Shopify",
-      "budget UGC platform",
-      "budget WooCommerce",
-      "budget affiliate program",
-      "budget amazon FBA",
-      "budget barcode labeling",
-      "budget cart recovery",
-      "budget chargeback management",
-      "budget checkout",
-      "budget conversion optimization",
-      "budget customer service software",
-      "budget customs broker",
-      "budget dropshipping",
-      "budget ecommerce accountant",
-      "budget email marketing",
-      "budget etsy shop",
-      "budget freight forwarder",
-      "budget fulfillment",
-      "budget influencer platform",
-      "budget inventory tool",
-      "budget live chat widget",
-      "budget loyalty program",
-      "budget marketplace integration",
-      "budget packaging supplier",
-      "budget pricing tool",
-      "budget print on demand",
-      "budget product listing service",
-      "budget product photography",
-      "budget returns management",
-      "budget review platform",
-      "budget shipping software",
-      "budget storefront builder",
-      "budget subscription billing",
-      "budget supplier sourcing",
-      "budget warehouse software",
-      "budget wholesaler",
-      "cart recovery",
-      "certified 3PL",
-      "certified A/B testing tool",
-      "certified BigCommerce",
-      "certified POS",
-      "certified SMS marketing",
-      "certified Shopify",
-      "certified UGC platform",
-      "certified WooCommerce",
-      "certified affiliate program",
-      "certified amazon FBA",
-      "certified barcode labeling",
-      "certified cart recovery",
-      "certified chargeback management",
-      "certified checkout",
-      "certified conversion optimization",
-      "certified customer service software",
-      "certified customs broker",
-      "certified dropshipping",
-      "certified ecommerce accountant",
-      "certified email marketing",
-      "certified etsy shop",
-      "certified freight forwarder",
-      "certified fulfillment",
-      "certified influencer platform",
-      "certified inventory tool",
-      "certified live chat widget",
-      "certified loyalty program",
-      "certified marketplace integration",
-      "certified packaging supplier",
-      "certified pricing tool",
-      "certified print on demand",
-      "certified product listing service",
-      "certified product photography",
-      "certified returns management",
-      "certified review platform",
-      "certified shipping software",
-      "certified storefront builder",
-      "certified subscription billing",
-      "certified supplier sourcing",
-      "certified warehouse software",
-      "certified wholesaler",
-      "chargeback management",
-      "checkout",
-      "commercial 3PL",
-      "commercial A/B testing tool",
-      "commercial BigCommerce",
-      "commercial POS",
-      "commercial SMS marketing",
-      "commercial Shopify",
-      "commercial UGC platform",
-      "commercial WooCommerce",
-      "commercial affiliate program",
-      "commercial amazon FBA",
-      "commercial barcode labeling",
-      "commercial cart recovery",
-      "commercial chargeback management",
-      "commercial checkout",
-      "commercial conversion optimization",
-      "commercial customer service software",
-      "commercial customs broker",
-      "commercial dropshipping",
-      "commercial ecommerce accountant",
-      "commercial email marketing",
-      "commercial etsy shop",
-      "commercial freight forwarder",
-      "commercial fulfillment",
-      "commercial influencer platform",
-      "commercial inventory tool",
-      "commercial live chat widget",
-      "commercial loyalty program",
-      "commercial marketplace integration",
-      "commercial packaging supplier",
-      "commercial pricing tool",
-      "commercial print on demand",
-      "commercial product listing service",
-      "commercial product photography",
-      "commercial returns management",
-      "commercial review platform",
-      "commercial shipping software",
-      "commercial storefront builder",
-      "commercial subscription billing",
-      "commercial supplier sourcing",
-      "commercial warehouse software",
-      "commercial wholesaler",
-      "conversion optimization",
-      "custom 3PL",
-      "custom A/B testing tool",
-      "custom BigCommerce",
-      "custom POS",
-      "custom SMS marketing",
-      "custom Shopify",
-      "custom UGC platform",
-      "custom WooCommerce",
-      "custom affiliate program",
-      "custom amazon FBA",
-      "custom barcode labeling",
-      "custom cart recovery",
-      "custom chargeback management",
-      "custom checkout",
-      "custom conversion optimization",
-      "custom customer service software",
-      "custom customs broker",
-      "custom dropshipping",
-      "custom ecommerce accountant",
-      "custom email marketing",
-      "custom etsy shop",
-      "custom freight forwarder",
-      "custom fulfillment",
-      "custom influencer platform",
-      "custom inventory tool",
-      "custom live chat widget",
-      "custom loyalty program",
-      "custom marketplace integration",
-      "custom packaging supplier",
-      "custom pricing tool",
-      "custom print on demand",
-      "custom product listing service",
-      "custom product photography",
-      "custom returns management",
-      "custom review platform",
-      "custom shipping software",
-      "custom storefront builder",
-      "custom subscription billing",
-      "custom supplier sourcing",
-      "custom warehouse software",
-      "custom wholesaler",
-      "customer service software",
-      "customs broker",
-      "dropshipping",
-      "ecommerce accountant",
-      "email marketing",
-      "emergency 3PL",
-      "emergency A/B testing tool",
-      "emergency BigCommerce",
-      "emergency POS",
-      "emergency SMS marketing",
-      "emergency Shopify",
-      "emergency UGC platform",
-      "emergency WooCommerce",
-      "emergency affiliate program",
-      "emergency amazon FBA",
-      "emergency barcode labeling",
-      "emergency cart recovery",
-      "emergency chargeback management",
-      "emergency checkout",
-      "emergency conversion optimization",
-      "emergency customer service software",
-      "emergency customs broker",
-      "emergency dropshipping",
-      "emergency ecommerce accountant",
-      "emergency email marketing",
-      "emergency etsy shop",
-      "emergency freight forwarder",
-      "emergency fulfillment",
-      "emergency influencer platform",
-      "emergency inventory tool",
-      "emergency live chat widget",
-      "emergency loyalty program",
-      "emergency marketplace integration",
-      "emergency packaging supplier",
-      "emergency pricing tool",
-      "emergency print on demand",
-      "emergency product listing service",
-      "emergency product photography",
-      "emergency returns management",
-      "emergency review platform",
-      "emergency shipping software",
-      "emergency storefront builder",
-      "emergency subscription billing",
-      "emergency supplier sourcing",
-      "emergency warehouse software",
-      "emergency wholesaler",
-      "enterprise 3PL",
-      "enterprise A/B testing tool",
-      "enterprise BigCommerce",
-      "enterprise POS",
-      "enterprise SMS marketing",
-      "enterprise Shopify",
-      "enterprise UGC platform",
-      "enterprise WooCommerce",
-      "enterprise affiliate program",
-      "enterprise amazon FBA",
-      "enterprise barcode labeling",
-      "enterprise cart recovery",
-      "enterprise chargeback management",
-      "enterprise checkout",
-      "enterprise conversion optimization",
-      "enterprise customer service software",
-      "enterprise customs broker",
-      "enterprise dropshipping",
-      "enterprise ecommerce accountant",
-      "enterprise email marketing",
-      "enterprise etsy shop",
-      "enterprise freight forwarder",
-      "enterprise fulfillment",
-      "enterprise influencer platform",
-      "enterprise inventory tool",
-      "enterprise live chat widget",
-      "enterprise loyalty program",
-      "enterprise marketplace integration",
-      "enterprise packaging supplier",
-      "enterprise pricing tool",
-      "enterprise print on demand",
-      "enterprise product listing service",
-      "enterprise product photography",
-      "enterprise returns management",
-      "enterprise review platform",
-      "enterprise shipping software",
-      "enterprise storefront builder",
-      "enterprise subscription billing",
-      "enterprise supplier sourcing",
-      "enterprise warehouse software",
-      "enterprise wholesaler",
-      "etsy shop",
-      "freelance 3PL",
-      "freelance A/B testing tool",
-      "freelance BigCommerce",
-      "freelance POS",
-      "freelance SMS marketing",
-      "freelance Shopify",
-      "freelance UGC platform",
-      "freelance WooCommerce",
-      "freelance affiliate program",
-      "freelance amazon FBA",
-      "freelance barcode labeling",
-      "freelance cart recovery",
-      "freelance chargeback management",
-      "freelance checkout",
-      "freelance conversion optimization",
-      "freelance customer service software",
-      "freelance customs broker",
-      "freelance dropshipping",
-      "freelance ecommerce accountant",
-      "freelance email marketing",
-      "freelance etsy shop",
-      "freelance freight forwarder",
-      "freelance fulfillment",
-      "freelance influencer platform",
-      "freelance inventory tool",
-      "freelance live chat widget",
-      "freelance loyalty program",
-      "freelance marketplace integration",
-      "freelance packaging supplier",
-      "freelance pricing tool",
-      "freelance print on demand",
-      "freelance product listing service",
-      "freelance product photography",
-      "freelance returns management",
-      "freelance review platform",
-      "freelance shipping software",
-      "freelance storefront builder",
-      "freelance subscription billing",
-      "freelance supplier sourcing",
-      "freelance warehouse software",
-      "freelance wholesaler",
-      "freight forwarder",
-      "fulfillment",
-      "influencer platform",
-      "inventory tool",
-      "licensed 3PL",
-      "licensed A/B testing tool",
-      "licensed BigCommerce",
-      "licensed POS",
-      "licensed SMS marketing",
-      "licensed Shopify",
-      "licensed UGC platform",
-      "licensed WooCommerce",
-      "licensed affiliate program",
-      "licensed amazon FBA",
-      "licensed barcode labeling",
-      "licensed cart recovery",
-      "licensed chargeback management",
-      "licensed checkout",
-      "licensed conversion optimization",
-      "licensed customer service software",
-      "licensed customs broker",
-      "licensed dropshipping",
-      "licensed ecommerce accountant",
-      "licensed email marketing",
-      "licensed etsy shop",
-      "licensed freight forwarder",
-      "licensed fulfillment",
-      "licensed influencer platform",
-      "licensed inventory tool",
-      "licensed live chat widget",
-      "licensed loyalty program",
-      "licensed marketplace integration",
-      "licensed packaging supplier",
-      "licensed pricing tool",
-      "licensed print on demand",
-      "licensed product listing service",
-      "licensed product photography",
-      "licensed returns management",
-      "licensed review platform",
-      "licensed shipping software",
-      "licensed storefront builder",
-      "licensed subscription billing",
-      "licensed supplier sourcing",
-      "licensed warehouse software",
-      "licensed wholesaler",
-      "live chat widget",
-      "local 3PL",
-      "local A/B testing tool",
-      "local BigCommerce",
-      "local POS",
-      "local SMS marketing",
-      "local Shopify",
-      "local UGC platform",
-      "local WooCommerce",
-      "local affiliate program",
-      "local amazon FBA",
-      "local barcode labeling",
-      "local cart recovery",
-      "local chargeback management",
-      "local checkout",
-      "local conversion optimization",
-      "local customer service software",
-      "local customs broker",
-      "local dropshipping",
-      "local ecommerce accountant",
-      "local email marketing",
-      "local etsy shop",
-      "local freight forwarder",
-      "local fulfillment",
-      "local influencer platform",
-      "local inventory tool",
-      "local live chat widget",
-      "local loyalty program",
-      "local marketplace integration",
-      "local packaging supplier",
-      "local pricing tool",
-      "local print on demand",
-      "local product listing service",
-      "local product photography",
-      "local returns management",
-      "local review platform",
-      "local shipping software",
-      "local storefront builder",
-      "local subscription billing",
-      "local supplier sourcing",
-      "local warehouse software",
-      "local wholesaler",
-      "loyalty program",
-      "marketplace integration",
-      "online 3PL",
-      "online A/B testing tool",
-      "online BigCommerce",
-      "online POS",
-      "online SMS marketing",
-      "online Shopify",
-      "online UGC platform",
-      "online WooCommerce",
-      "online affiliate program",
-      "online amazon FBA",
-      "online barcode labeling",
-      "online cart recovery",
-      "online chargeback management",
-      "online checkout",
-      "online conversion optimization",
-      "online customer service software",
-      "online customs broker",
-      "online dropshipping",
-      "online ecommerce accountant",
-      "online email marketing",
-      "online etsy shop",
-      "online freight forwarder",
-      "online fulfillment",
-      "online influencer platform",
-      "online inventory tool",
-      "online live chat widget",
-      "online loyalty program",
-      "online marketplace integration",
-      "online packaging supplier",
-      "online pricing tool",
-      "online print on demand",
-      "online product listing service",
-      "online product photography",
-      "online returns management",
-      "online review platform",
-      "online shipping software",
-      "online storefront builder",
-      "online subscription billing",
-      "online supplier sourcing",
-      "online warehouse software",
-      "online wholesaler",
-      "packaging supplier",
-      "premium 3PL",
-      "premium A/B testing tool",
-      "premium BigCommerce",
-      "premium POS",
-      "premium SMS marketing",
-      "premium Shopify",
-      "premium UGC platform",
-      "premium WooCommerce",
-      "premium affiliate program",
-      "premium amazon FBA",
-      "premium barcode labeling",
-      "premium cart recovery",
-      "premium chargeback management",
-      "premium checkout",
-      "premium conversion optimization",
-      "premium customer service software",
-      "premium customs broker",
-      "premium dropshipping",
-      "premium ecommerce accountant",
-      "premium email marketing",
-      "premium etsy shop",
-      "premium freight forwarder",
-      "premium fulfillment",
-      "premium influencer platform",
-      "premium inventory tool",
-      "premium live chat widget",
-      "premium loyalty program",
-      "premium marketplace integration",
-      "premium packaging supplier",
-      "premium pricing tool",
-      "premium print on demand",
-      "premium product listing service",
-      "premium product photography",
-      "premium returns management",
-      "premium review platform",
-      "premium shipping software",
-      "premium storefront builder",
-      "premium subscription billing",
-      "premium supplier sourcing",
-      "premium warehouse software",
-      "premium wholesaler",
-      "pricing tool",
-      "print on demand",
-      "product listing service",
-      "product photography",
-      "remote 3PL",
-      "remote A/B testing tool",
-      "remote BigCommerce",
-      "remote POS",
-      "remote SMS marketing",
-      "remote Shopify",
-      "remote UGC platform",
-      "remote WooCommerce",
-      "remote affiliate program",
-      "remote amazon FBA",
-      "remote barcode labeling",
-      "remote cart recovery",
-      "remote chargeback management",
-
+    "remote checkout",
+      "remote conversion optimization",
+      "remote customer service software",
+      "remote customs broker",
+      "remote dropshipping",
+      "remote ecommerce accountant",
+      "remote email marketing",
+      "remote etsy shop",
+      "remote freight forwarder",
+      "remote fulfillment",
+      "remote influencer platform",
+      "remote inventory tool",
+      "remote live chat widget",
+      "remote loyalty program",
+      "remote marketplace integration",
+      "remote packaging supplier",
+      "remote pricing tool",
+      "remote print on demand",
+      "remote product listing service",
+      "remote product photography",
+      "remote returns management",
+      "remote review platform",
+      "remote shipping software",
+      "remote storefront builder",
+      "remote subscription billing",
+      "remote supplier sourcing",
+      "remote warehouse software",
+      "remote wholesaler",
+      "residential 3PL",
+      "residential A/B testing tool",
+      "residential BigCommerce",
+      "residential POS",
+      "residential SMS marketing",
+      "residential Shopify",
+      "residential UGC platform",
+      "residential WooCommerce",
+      "residential affiliate program",
+      "residential amazon FBA",
+      "residential barcode labeling",
+      "residential cart recovery",
+      "residential chargeback management",
+      "residential checkout",
+      "residential conversion optimization",
+      "residential customer service software",
+      "residential customs broker",
+      "residential dropshipping",
+      "residential ecommerce accountant",
+      "residential email marketing",
+      "residential etsy shop",
+      "residential freight forwarder",
+      "residential fulfillment",
+      "residential influencer platform",
+      "residential inventory tool",
+      "residential live chat widget",
+      "residential loyalty program",
+      "residential marketplace integration",
+      "residential packaging supplier",
+      "residential pricing tool",
+      "residential print on demand",
+      "residential product listing service",
+      "residential product photography",
+      "residential returns management",
+      "residential review platform",
+      "residential shipping software",
+      "residential storefront builder",
+      "residential subscription billing",
+      "residential supplier sourcing",
+      "residential warehouse software",
+      "residential wholesaler",
+      "returns management",
+      "review platform",
+      "shipping software",
+      "small business 3PL",
+      "small business BigCommerce",
+      "small business POS",
+      "small business SMS marketing",
+      "small business Shopify",
+      "small business UGC platform",
+      "small business WooCommerce",
+      "small business affiliate program",
+      "small business amazon FBA",
+      "small business barcode labeling",
+      "small business cart recovery",
+      "small business chargeback management",
+      "small business checkout",
+      "small business conversion optimization",
+      "small business customs broker",
+      "small business dropshipping",
+      "small business ecommerce accountant",
+      "small business email marketing",
+      "small business etsy shop",
+      "small business freight forwarder",
+      "small business fulfillment",
+      "small business influencer platform",
+      "small business inventory tool",
+      "small business loyalty program",
+      "small business marketplace integration",
+      "small business packaging supplier",
+      "small business pricing tool",
+      "small business product photography",
+      "small business returns management",
+      "small business review platform",
+      "small business shipping software",
+      "small business storefront builder",
+      "small business subscription billing",
+      "small business supplier sourcing",
+      "small business warehouse software",
+      "small business wholesaler",
+      "storefront builder",
+      "subscription billing",
+      "supplier sourcing",
+      "warehouse software",
+      "wholesaler",
+    "technology_software",
+      "API gateway",
+      "AWS consultant",
+      "CI/CD pipeline",
+      "CRM",
+      "DevOps engineer",
+      "GraphQL developer",
+      "IT staffing agency",
+      "QA testing",
+      "REST API",
+      "SOC 2 audit",
+      "SSO provider",
+      "SaaS platform",
+      "UX designer",
+      "affordable API gateway",
+      "affordable AWS consultant",
+      "affordable CI/CD pipeline",
+      "affordable CRM",
+      "affordable DevOps engineer",
+      "affordable GraphQL developer",
+      "affordable IT staffing agency",
+      "affordable QA testing",
+      "affordable REST API",
+      "affordable SOC 2 audit",
+      "affordable SSO provider",
+      "affordable SaaS platform",
+      "affordable UX designer",
+      "affordable app builder",
+      "affordable backend developer",
+      "affordable cloud hosting",
+      "affordable code audit",
+      "affordable code review",
+      "affordable cybersecurity audit",
+      "affordable data engineer",
+      "affordable data pipeline",
+      "affordable database admin",
+      "affordable frontend developer",
+      "affordable full-stack developer",
+      "affordable kubernetes consultant",
+      "affordable legacy system migration",
+      "affordable load testing",
+      "affordable microservices consultant",
+      "affordable mobile app developer",
+      "affordable no-code builder",
+      "affordable outsourced dev team",
+      "affordable penetration testing",
+      "affordable product manager",
+      "affordable scrum master",
+      "affordable site reliability engineer",
+      "affordable software architect",
+      "affordable software escrow",
+      "affordable technical co-founder",
+      "affordable technical writer",
+      "affordable white-label software",
+      "app builder",
+      "backend developer",
+      "budget API gateway",
+      "budget AWS consultant",
+      "budget CI/CD pipeline",
+      "budget CRM",
+      "budget DevOps engineer",
+      "budget GraphQL developer",
+      "budget IT staffing agency",
+      "budget QA testing",
+      "budget REST API",
+      "budget SOC 2 audit",
+      "budget SSO provider",
+      "budget SaaS platform",
+      "budget UX designer",
+      "budget app builder",
+      "budget backend developer",
+      "budget cloud hosting",
+      "budget code audit",
+      "budget code review",
+      "budget cybersecurity audit",
+      "budget data engineer",
+      "budget data pipeline",
+      "budget database admin",
+      "budget frontend developer",
+      "budget full-stack developer",
+      "budget kubernetes consultant",
+      "budget legacy system migration",
+      "budget load testing",
+      "budget microservices consultant",
+      "budget mobile app developer",
+      "budget no-code builder",
+      "budget outsourced dev team",
 
 ]
 
@@ -673,6 +357,11 @@ REDDIT_KEYWORD_RETRY_COOLDOWN_SECONDS = int(os.getenv("REDDIT_KEYWORD_RETRY_COOL
 SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "100"))
 SERP_MONTHS_BACK         = int(os.getenv("SERP_MONTHS_BACK", "6"))
 SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
+
+# ── GOOGLE SERP BATCHING (NEW) — how many keywords get combined into a
+# SINGLE RapidAPI call via an OR'd query, instead of one call/keyword.
+# This is the ONLY cost-control change in this version. Default 10.
+GOOGLE_SERP_BATCH = int(os.getenv("GOOGLE_SERP_BATCH", "10"))
 
 # ── REDDIT "SMART FETCH" CONFIG — UNCHANGED v9.6 retry logic.
 REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
@@ -995,6 +684,10 @@ def mark_keyword_fetched(keyword: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK) -> list:
+    """UNCHANGED, one-keyword-per-call version. Kept in place for
+    reference / backward compatibility — the live discovery loop below
+    now calls the batched version (search_google_for_keywords_batch)
+    instead, to cut RapidAPI usage. This function itself is untouched."""
     if not RAPIDAPI_KEY:
         log.warning("[SERP] RapidAPI key not set — skipping SERP search.")
         return []
@@ -1057,6 +750,132 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
 
     except Exception as exc:
         log.error(f"[SERP] RapidAPI search error for {keyword!r}: {exc}")
+        return []
+
+
+def _find_best_matching_keyword(text: str, keywords_batch: list) -> str | None:
+    """
+    NEW — resolves a single SERP result (coming back from a combined /
+    batched OR query) to exactly ONE of the keywords in that batch, so
+    every flintel_google_posts document still stores a single,
+    unambiguous search_keyword + fuzzy_keywords set — exactly like the
+    old one-call-per-keyword flow produced.
+
+    1. Exact substring match of the raw keyword against the result's
+       title+url (case-insensitive) — same confidence as before.
+    2. Falls back to the same generate_fuzzy_keywords() variants used
+       everywhere else in this file, so behavior stays consistent with
+       passes_fuzzy_filter() downstream.
+    3. Returns None if nothing in the batch matches — the caller skips
+       that result instead of mis-tagging it under the wrong keyword.
+    """
+    t = (text or "").lower()
+    for kw in keywords_batch:
+        if kw and kw.lower() in t:
+            return kw
+    for kw in keywords_batch:
+        for fkw in generate_fuzzy_keywords(kw):
+            if fkw and fkw in t:
+                return kw
+    return None
+
+
+def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SERP_MONTHS_BACK) -> list:
+    """
+    NEW — batches up to GOOGLE_SERP_BATCH keywords into a SINGLE
+    RapidAPI SERP call using one OR'd query
+    (site:reddit.com ("kw1" OR "kw2" OR ...)), instead of firing one
+    RapidAPI call per keyword. This is the sole cost-control change in
+    this version — cuts RapidAPI usage roughly GOOGLE_SERP_BATCH-fold.
+
+    Everything downstream is unaffected: each returned result is still
+    resolved back to exactly one search_keyword (via
+    _find_best_matching_keyword) before flintel_google_posts ever sees
+    it, so save_google_post(), fuzzy_keywords generation, the Reddit
+    fetch loop, and signal storage all keep working exactly as before.
+    """
+    if not RAPIDAPI_KEY:
+        log.warning("[SERP-BATCH] RapidAPI key not set — skipping SERP search.")
+        return []
+    if not keywords_batch:
+        return []
+
+    today = datetime.now(timezone.utc)
+    date_from = today - timedelta(days=months_back * 30)
+    cd_min = date_from.strftime("%m/%d/%Y")
+    cd_max = today.strftime("%m/%d/%Y")
+
+    quoted_terms = " OR ".join(f'"{kw}"' for kw in keywords_batch)
+    query = f'site:reddit.com ({quoted_terms})'
+
+    try:
+        url = "https://google-search116.p.rapidapi.com/"
+
+        querystring = {"query": query}
+
+        headers = {
+            "x-rapidapi-key": RAPIDAPI_KEY,  # .env
+            "x-rapidapi-host": RAPIDAPI_SEARCH_HOST,
+            "Content-Type": "application/json",
+        }
+
+        r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
+
+        try:
+            result_data = r.json()
+        except ValueError:
+            log.error(f"[SERP-BATCH] Non-JSON response for batch {keywords_batch!r} | status:{r.status_code}")
+            return []
+
+        raw_items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
+        results = []
+        rank_misses = 0
+        skipped_unattributed = 0
+        for pos, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict):
+                continue
+            item_url = item.get("url", "") or item.get("link", "")
+            if "reddit.com" not in item_url:
+                continue
+            rank = _dig_value(item, RANK_FIELD_CANDIDATES)
+            if rank is None:
+                rank = pos
+                rank_misses += 1
+            title = item.get("title", "")
+
+            matched_keyword = _find_best_matching_keyword(f"{title} {item_url}", keywords_batch)
+            if matched_keyword is None:
+                skipped_unattributed += 1
+                continue
+
+            results.append({
+                "url":     item_url,
+                "rank":    rank,
+                "title":   title,
+                "keyword": matched_keyword,
+            })
+
+        if rank_misses and rank_misses == len(results) and results:
+            log.warning(
+                f"[SERP-BATCH] batch {keywords_batch!r} — no explicit rank field found in any "
+                f"result (tried {RANK_FIELD_CANDIDATES}); used result order as rank fallback."
+            )
+
+        if skipped_unattributed:
+            log.debug(
+                f"[SERP-BATCH] batch {keywords_batch!r} — {skipped_unattributed} result(s) "
+                f"could not be confidently attributed to any keyword in the batch — skipped."
+            )
+
+        log.info(
+            f"[SERP-BATCH] batch of {len(keywords_batch)} keyword(s) → {len(results)} attributed "
+            f"Reddit result(s) (last {months_back} months: {cd_min} to {cd_max}) | "
+            f"1 RapidAPI call | query:{query!r}"
+        )
+        return results
+
+    except Exception as exc:
+        log.error(f"[SERP-BATCH] RapidAPI search error for batch {keywords_batch!r}: {exc}")
         return []
 
 
@@ -1326,13 +1145,16 @@ def save_signal(item: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SERP DISCOVERY — process_one_keyword() ONLY runs the Google SERP call
-# and persists results into flintel_google_posts. Reddit is NEVER
-# fetched here — this keyword's SERP job is done the moment this
-# function returns.
+# SERP DISCOVERY — process_one_keyword() / process_keywords_batch() ONLY
+# run the Google SERP call(s) and persist results into
+# flintel_google_posts. Reddit is NEVER fetched here — SERP's job is
+# done the moment these functions return.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_one_keyword(keyword: str) -> tuple:
+    """UNCHANGED, one-keyword-per-call version. Kept for reference /
+    backward compatibility — the live loop below now calls
+    process_keywords_batch() instead, to batch RapidAPI calls."""
     results = search_google_for_keyword(keyword, months_back=SERP_MONTHS_BACK)
 
     new_posts_saved = 0
@@ -1354,6 +1176,41 @@ def process_one_keyword(keyword: str) -> tuple:
     return len(results), new_posts_saved
 
 
+def process_keywords_batch(keywords_batch: list) -> tuple:
+    """
+    NEW — batched counterpart to process_one_keyword(). Runs exactly ONE
+    RapidAPI call for up to GOOGLE_SERP_BATCH keywords at once (instead
+    of one call per keyword) via search_google_for_keywords_batch(), and
+    persists results into flintel_google_posts exactly like
+    process_one_keyword() did — same save_google_post() call, same
+    insert-only behavior, same fuzzy_keywords generation, just keyed off
+    each result's resolved keyword instead of a single fixed keyword.
+    """
+    results = search_google_for_keywords_batch(keywords_batch, months_back=SERP_MONTHS_BACK)
+
+    new_posts_saved = 0
+    # Cap kept proportional to batch size so the effective per-keyword
+    # depth stays the same as before batching (SERP_RESULTS_PER_KEYWORD
+    # per keyword in the batch).
+    for result in results[:SERP_RESULTS_PER_KEYWORD * len(keywords_batch)]:
+        post_url = result["url"]
+        matched_keyword = result["keyword"]
+        subreddit = _extract_reddit_subreddit_from_url(post_url)
+        fuzzy_keywords = generate_fuzzy_keywords(matched_keyword)
+
+        was_new = save_google_post(
+            post_url=post_url,
+            google_rank=result["rank"],
+            search_keyword=matched_keyword,
+            subreddit=subreddit,
+            fuzzy_keywords=fuzzy_keywords,
+        )
+        if was_new:
+            new_posts_saved += 1
+
+    return len(results), new_posts_saved
+
+
 def run_serp_discovery_loop():
     sync_keywords_to_db(REDDIT_SEARCH_KEYWORDS)
 
@@ -1361,6 +1218,7 @@ def run_serp_discovery_loop():
         f"[SERP] Discovery loop started | {len(REDDIT_SEARCH_KEYWORDS)} keyword(s) in python list | "
         f"check_interval:{KEYWORD_CHECK_INTERVAL_SECONDS}s | "
         f"months_back:{SERP_MONTHS_BACK} | depth:{SERP_RESULTS_PER_KEYWORD} | "
+        f"GOOGLE_SERP_BATCH:{GOOGLE_SERP_BATCH} keyword(s) per RapidAPI call (cost control) | "
         f"KEYWORD CACHE: fetch-once-forever, restart-safe, no re-fetch ever | "
         f"REDDIT FETCH: fully decoupled — SERP results are only SAVED into "
         f"flintel_google_posts here, the actual Reddit RSS fetch happens in a separate loop"
@@ -1376,21 +1234,31 @@ def run_serp_discovery_loop():
                 continue
 
             total_results, total_new_posts = 0, 0
-            for doc in due:
-                keyword = doc["keyword"]
-                results_count, new_posts_saved = process_one_keyword(keyword)
+
+            # ── Batch due keywords into groups of GOOGLE_SERP_BATCH —
+            # ONE RapidAPI call per group instead of one per keyword.
+            for i in range(0, len(due), GOOGLE_SERP_BATCH):
+                batch_docs = due[i:i + GOOGLE_SERP_BATCH]
+                batch_keywords = [doc["keyword"] for doc in batch_docs]
+
+                results_count, new_posts_saved = process_keywords_batch(batch_keywords)
                 total_results += results_count
                 total_new_posts += new_posts_saved
 
-                mark_keyword_fetched(keyword)
+                for kw in batch_keywords:
+                    mark_keyword_fetched(kw)
+
                 log.info(
-                    f"[SERP] '{keyword}' DONE | serp_results:{results_count} | "
-                    f"new_google_posts_saved:{new_posts_saved} | marked fetched=True PERMANENTLY"
+                    f"[SERP] batch {batch_keywords!r} DONE | 1 RapidAPI call for "
+                    f"{len(batch_keywords)} keyword(s) | serp_results:{results_count} | "
+                    f"new_google_posts_saved:{new_posts_saved} | all marked fetched=True PERMANENTLY"
                 )
                 time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
+            rapidapi_calls_used = (len(due) + GOOGLE_SERP_BATCH - 1) // GOOGLE_SERP_BATCH
             log.info(
                 f"[SERP] Pass complete | keywords_processed:{len(due)} | "
+                f"rapidapi_calls_used:{rapidapi_calls_used} (batch_size:{GOOGLE_SERP_BATCH}) | "
                 f"total_serp_results:{total_results} | new_google_posts_saved:{total_new_posts}"
             )
 
@@ -1494,7 +1362,8 @@ def run_reddit_fetch_loop():
 
 async def start_reddit_listener():
     """Reddit runs on TWO independent threads:
-      1. SERP discovery (run_serp_discovery_loop) — Google call, saves
+      1. SERP discovery (run_serp_discovery_loop) — Google call(s),
+         batched GOOGLE_SERP_BATCH keywords per RapidAPI call, saves
          results into flintel_google_posts.
       2. Reddit fetch (run_reddit_fetch_loop) — reads
          flintel_google_posts directly, fetches RSS, fuzzy-filters,
@@ -1530,8 +1399,8 @@ async def start_reddit_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel index.py — Reddit-only (Google SERP discovery -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals, no Claude, no search_volume, no engagement, no Twitter)",
-    version="1.0.0",
+    title="Flintel index.py — Reddit-only (Google SERP discovery, batched GOOGLE_SERP_BATCH/keywords per call -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals, no Claude, no search_volume, no engagement, no Twitter)",
+    version="1.1.0",
 )
 
 
@@ -1566,6 +1435,7 @@ def root():
         "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
         "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
         "keyword_cache":           "ENABLED — fetch-once-forever, restart-safe (flintel_keywords)",
+        "google_serp_batch_size":  GOOGLE_SERP_BATCH,
         "google_posts_collection":            "flintel_google_posts",
         "google_posts_tracked":               total_google_posts,
         "google_posts_pending_reddit_fetch":  pending_reddit_fetch,
@@ -1688,21 +1558,22 @@ async def main():
 if __name__ == "__main__":
     log.info("=" * 70)
     log.info("  FLINTEL index.py — REDDIT-ONLY SIGNAL PIPELINE")
-    log.info("  (Google SERP discovery -> flintel_google_posts -> Reddit RSS fetch")
-    log.info("   -> flintel_signals, saved directly, tagged with search_keyword)")
-    log.info("  Claude / search_volume / engagement / Twitter / batching: REMOVED")
+    log.info("  (Google SERP discovery, batched per GOOGLE_SERP_BATCH keywords/call")
+    log.info("   -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals,")
+    log.info("   saved directly, tagged with search_keyword)")
+    log.info("  Claude / search_volume / engagement / Twitter / queueing: REMOVED")
     log.info("=" * 70)
     log.info(f"  Client                : {CLIENT_ID}")
     log.info(f"  Reddit                : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
     log.info(f"  Reddit fetch method   : public per-post RSS only — credential-free, no OAuth/PRAW, no .json anywhere")
     log.info(f"  Reddit keywords       : {len(REDDIT_SEARCH_KEYWORDS)} (used ONLY to seed brand-new flintel_keywords docs)")
     log.info(f"  Keyword cache         : flintel_keywords — fetch-once-forever")
-    log.info(f"  Google SERP           : search_google_for_keyword() — unchanged single RapidAPI call")
+    log.info(f"  Google SERP           : search_google_for_keywords_batch() — {GOOGLE_SERP_BATCH} keyword(s) OR'd into ONE RapidAPI call (cost control)")
     log.info(f"  flintel_google_posts  : stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched")
     log.info(f"  Reddit fetch interval : check every {REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | retry cooldown {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s on genuine fetch failure")
     log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time — used to filter fetched RSS content")
     log.info(f"  Signal storage        : direct save into flintel_signals on fuzzy match — NO queue, NO batch, NO Claude")
-    log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — Google SERP discovery only now)")
+    log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — Google SERP discovery only now, batched {GOOGLE_SERP_BATCH}/call)")
     log.info(f"  MongoDB DB            : {MONGODB_DB}")
     log.info(f"  API auth              : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
     log.info("=" * 70)
