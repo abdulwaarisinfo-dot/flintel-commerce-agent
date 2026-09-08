@@ -80,12 +80,24 @@ WHAT THIS FILE IS:
       document, exactly like the old one-call-per-keyword flow did.
       A result that can't be confidently attributed to any keyword in
       its batch is skipped rather than mis-tagged.
-    - Absolutely nothing else changes: flintel_google_posts schema,
-      Reddit RSS fetch loop, fuzzy filtering downstream, signal storage,
-      indexes, endpoints — all 100% as before. The old single-keyword
-      search_google_for_keyword() / process_one_keyword() functions are
-      kept in place (unused by the loop now, left for reference /
-      backward compatibility) rather than removed.
+    - Everything else stays the same: flintel_google_posts schema,
+      signal storage, indexes, endpoints — all as before. The old
+      single-keyword search_google_for_keyword() / process_one_keyword()
+      functions are kept in place (unused by the loop now, left for
+      reference / backward compatibility) rather than removed.
+
+  POST-FETCH CONTENT FILTER REMOVED (NEW, this version only):
+    - The Reddit fetch loop (run_reddit_fetch_loop) NO LONGER re-checks
+      a fetched post's RSS text against its stored search_keyword /
+      fuzzy_keywords before saving. fuzzy_keywords are still generated
+      and used ONLY at SERP-discovery time (to resolve/tag which
+      keyword a SERP result belongs to — see generate_fuzzy_keywords()
+      and process_keywords_batch()). Once a post_url is tracked in
+      flintel_google_posts with a resolved search_keyword, a
+      SUCCESSFUL Reddit RSS fetch for that exact post_url is now the
+      only condition needed to save it straight into flintel_signals.
+      passes_fuzzy_filter() is left defined in this file (unused by the
+      loop) rather than removed.
 
 Run:
     pip install fastapi uvicorn pymongo python-dotenv httpx requests \
@@ -145,7 +157,7 @@ REDDIT_JSON_TIMEOUT_SECONDS     = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "
 # seed brand-new keyword documents into flintel_keywords (insert-only).
 REDDIT_SEARCH_KEYWORDS = [
     
-    "remote checkout",
+      "remote checkout",
       "remote conversion optimization",
       "remote customer service software",
       "remote customs broker",
@@ -1274,13 +1286,29 @@ def run_serp_discovery_loop():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_reddit_fetch_loop():
+    """
+    UPDATED (per request) — the post-fetch fuzzy CONTENT filter has been
+    REMOVED from this loop. fuzzy_keywords are still generated and used
+    at SERP-discovery time (to find/tag which posts belong to which
+    keyword — unchanged, see generate_fuzzy_keywords() /
+    process_keywords_batch()). But once a flintel_google_posts document
+    is already tagged with a post_url + search_keyword, this loop no
+    longer re-checks the fetched RSS text against that keyword.
+
+    New, simpler rule: if the post_url's Reddit RSS fetch SUCCEEDS
+    (matched post_url — content was retrieved), it is saved straight
+    into flintel_signals. No content-based accept/reject step anymore.
+    passes_fuzzy_filter() is left defined elsewhere in this file (in
+    case it's needed again later) but is no longer called here.
+    """
     log.info(
         f"[REDDIT-FETCH] Loop started | reads directly from flintel_google_posts | "
         f"check_interval:{REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | "
         f"retry_cooldown:{REDDIT_POST_RETRY_COOLDOWN_SECONDS}s | "
         f"fetch method: public per-post RSS only, credential-free "
         f"({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback, no OAuth/PRAW) | "
-        f"on fuzzy match -> saved DIRECTLY into flintel_signals, no queue/batch/Claude"
+        f"on successful post_url fetch -> saved DIRECTLY into flintel_signals "
+        f"(no post-fetch content/fuzzy filter, no queue/batch/Claude)"
     )
 
     while True:
@@ -1292,12 +1320,11 @@ def run_reddit_fetch_loop():
 
             log.info(f"[REDDIT-FETCH] {len(due_posts)} post(s) due for Reddit RSS fetch this pass")
 
-            saved_count, no_match_count, dupe_count, fail_count = 0, 0, 0, 0
+            saved_count, dupe_count, fail_count = 0, 0, 0
 
             for doc in due_posts:
                 post_url       = doc["post_url"]
                 search_keyword = doc.get("search_keyword", "")
-                fuzzy_keywords = doc.get("fuzzy_keywords", [])
                 subreddit      = doc.get("subreddit", "")
                 google_rank    = doc.get("google_rank")
 
@@ -1318,20 +1345,9 @@ def run_reddit_fetch_loop():
                     time.sleep(SERP_FETCH_SLEEP_SECONDS)
                     continue
 
-                matched = passes_fuzzy_filter(item.get("text", ""), search_keyword, fuzzy_keywords)
-                if not matched:
-                    mark_google_post_fetched(post_url, fuzzy_matched=False)
-                    no_match_count += 1
-                    log.info(
-                        f"[REDDIT-FETCH] fetched OK but NO fuzzy-keyword match | {post_url} | "
-                        f"keyword:{search_keyword!r} | fuzzy_keywords_tried:{len(fuzzy_keywords)} | "
-                        f"marked reddit_fetched=True (settled 'no', won't be retried)"
-                    )
-                    time.sleep(SERP_FETCH_SLEEP_SECONDS)
-                    continue
-
-                # ── MATCH — save straight into flintel_signals, tagged
-                # with its search_keyword. No queue, no batch, no Claude.
+                # ── post_url fetch SUCCEEDED — save straight into
+                # flintel_signals, tagged with its search_keyword. No
+                # content/fuzzy check anymore, no queue, no batch, no Claude.
                 item["subreddit_or_channel"] = subreddit or item.get("subreddit_or_channel", "")
                 saved = save_signal(item)
                 mark_google_post_fetched(post_url, fuzzy_matched=True)
@@ -1347,8 +1363,7 @@ def run_reddit_fetch_loop():
 
             log.info(
                 f"[REDDIT-FETCH] Pass complete | due:{len(due_posts)} | saved:{saved_count} | "
-                f"no_fuzzy_match:{no_match_count} | already_signaled:{dupe_count} | "
-                f"failed_will_retry:{fail_count}"
+                f"already_signaled:{dupe_count} | failed_will_retry:{fail_count}"
             )
 
         except Exception as exc:
