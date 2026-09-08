@@ -157,206 +157,206 @@ REDDIT_JSON_TIMEOUT_SECONDS     = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "
 # seed brand-new keyword documents into flintel_keywords (insert-only).
 REDDIT_SEARCH_KEYWORDS = [
     
-"budget penetration testing",
-      "budget product manager",
-      "budget scrum master",
-      "budget site reliability engineer",
-      "budget software architect",
-      "budget software escrow",
-      "budget technical co-founder",
-      "budget technical writer",
-      "budget white-label software",
-      "certified API gateway",
-      "certified AWS consultant",
-      "certified CI/CD pipeline",
-      "certified CRM",
-      "certified DevOps engineer",
-      "certified GraphQL developer",
-      "certified IT staffing agency",
-      "certified QA testing",
-      "certified REST API",
-      "certified SOC 2 audit",
-      "certified SSO provider",
-      "certified SaaS platform",
-      "certified UX designer",
-      "certified app builder",
-      "certified backend developer",
-      "certified cloud hosting",
-      "certified code audit",
-      "certified code review",
-      "certified cybersecurity audit",
-      "certified data engineer",
-      "certified data pipeline",
-      "certified database admin",
-      "certified frontend developer",
-      "certified full-stack developer",
-      "certified kubernetes consultant",
-      "certified legacy system migration",
-      "certified load testing",
-      "certified microservices consultant",
-      "certified mobile app developer",
-      "certified no-code builder",
-      "certified outsourced dev team",
-      "certified penetration testing",
-      "certified product manager",
-      "certified scrum master",
-      "certified site reliability engineer",
-      "certified software architect",
-      "certified software escrow",
-      "certified technical co-founder",
-      "certified technical writer",
-      "certified white-label software",
-      "cloud hosting",
-      "code audit",
-      "code review",
-      "commercial API gateway",
-      "commercial AWS consultant",
-      "commercial CI/CD pipeline",
-      "commercial CRM",
-      "commercial DevOps engineer",
-      "commercial GraphQL developer",
-      "commercial IT staffing agency",
-      "commercial QA testing",
-      "commercial REST API",
-      "commercial SOC 2 audit",
-      "commercial SSO provider",
-      "commercial SaaS platform",
-      "commercial UX designer",
-      "commercial app builder",
-      "commercial backend developer",
-      "commercial cloud hosting",
-      "commercial code audit",
-      "commercial code review",
-      "commercial cybersecurity audit",
-      "commercial data engineer",
-      "commercial data pipeline",
-      "commercial database admin",
-      "commercial frontend developer",
-      "commercial full-stack developer",
-      "commercial kubernetes consultant",
-      "commercial legacy system migration",
-      "commercial load testing",
-      "commercial microservices consultant",
-      "commercial mobile app developer",
-      "commercial no-code builder",
-      "commercial outsourced dev team",
-      "commercial penetration testing",
-      "commercial product manager",
-      "commercial scrum master",
-      "commercial site reliability engineer",
-      "commercial software architect",
-      "commercial software escrow",
-      "commercial technical co-founder",
-      "commercial technical writer",
-      "commercial white-label software",
-      "custom API gateway",
-      "custom AWS consultant",
-      "custom CI/CD pipeline",
-      "custom CRM",
-      "custom DevOps engineer",
-      "custom GraphQL developer",
-      "custom IT staffing agency",
-      "custom QA testing",
-      "custom REST API",
-      "custom SOC 2 audit",
-      "custom SSO provider",
-      "custom SaaS platform",
-      "custom UX designer",
-      "custom app builder",
-      "custom backend developer",
-      "custom cloud hosting",
-      "custom code audit",
-      "custom code review",
-      "custom cybersecurity audit",
-      "custom data engineer",
-      "custom data pipeline",
-      "custom database admin",
-      "custom frontend developer",
-      "custom full-stack developer",
-      "custom kubernetes consultant",
-      "custom legacy system migration",
-      "custom load testing",
-      "custom microservices consultant",
-      "custom mobile app developer",
-      "custom no-code builder",
-      "custom outsourced dev team",
-      "custom penetration testing",
-      "custom product manager",
-      "custom scrum master",
-      "custom site reliability engineer",
-      "custom software architect",
-      "custom software escrow",
-      "custom technical co-founder",
-      "custom technical writer",
-      "custom white-label software",
-      "cybersecurity audit",
-      "data engineer",
-      "data pipeline",
-      "database admin",
-      "emergency API gateway",
-      "emergency AWS consultant",
-      "emergency CI/CD pipeline",
-      "emergency CRM",
-      "emergency DevOps engineer",
-      "emergency GraphQL developer",
-      "emergency IT staffing agency",
-      "emergency QA testing",
-      "emergency REST API",
-      "emergency SOC 2 audit",
-      "emergency SSO provider",
-      "emergency SaaS platform",
-      "emergency UX designer",
-      "emergency app builder",
-      "emergency backend developer",
-      "emergency cloud hosting",
-      "emergency code audit",
-      "emergency code review",
-      "emergency cybersecurity audit",
-      "emergency data engineer",
-      "emergency data pipeline",
-      "emergency database admin",
-      "emergency frontend developer",
-      "emergency full-stack developer",
-      "emergency kubernetes consultant",
-      "emergency legacy system migration",
-      "emergency load testing",
-      "emergency microservices consultant",
-      "emergency mobile app developer",
-      "emergency no-code builder",
-      "emergency outsourced dev team",
-      "emergency penetration testing",
-      "emergency product manager",
-      "emergency scrum master",
-      "emergency site reliability engineer",
-      "emergency software architect",
-      "emergency software escrow",
-      "emergency technical co-founder",
-      "emergency technical writer",
-      "emergency white-label software",
-      "enterprise API gateway",
-      "enterprise AWS consultant",
-      "enterprise CI/CD pipeline",
-      "enterprise CRM",
-      "enterprise DevOps engineer",
-      "enterprise GraphQL developer",
-      "enterprise IT staffing agency",
-      "enterprise QA testing",
-      "enterprise REST API",
-      "enterprise SOC 2 audit",
-      "enterprise SSO provider",
-      "enterprise SaaS platform",
-      "enterprise UX designer",
-      "enterprise app builder",
-      "enterprise backend developer",
-      "enterprise cloud hosting",
-      "enterprise code audit",
-      "enterprise code review",
-      "enterprise cybersecurity audit",
-      "enterprise data engineer",
-      "enterprise data pipeline",
-      "enterprise database admin",
-      "enterprise frontend developer",
-      "enterprise full-stack developer",
+     "enterprise kubernetes consultant",
+      "enterprise legacy system migration",
+      "enterprise load testing",
+      "enterprise microservices consultant",
+      "enterprise mobile app developer",
+      "enterprise no-code builder",
+      "enterprise outsourced dev team",
+      "enterprise penetration testing",
+      "enterprise product manager",
+      "enterprise scrum master",
+      "enterprise site reliability engineer",
+      "enterprise software architect",
+      "enterprise software escrow",
+      "enterprise technical co-founder",
+      "enterprise technical writer",
+      "enterprise white-label software",
+      "freelance API gateway",
+      "freelance AWS consultant",
+      "freelance CI/CD pipeline",
+      "freelance CRM",
+      "freelance DevOps engineer",
+      "freelance GraphQL developer",
+      "freelance IT staffing agency",
+      "freelance QA testing",
+      "freelance REST API",
+      "freelance SOC 2 audit",
+      "freelance SSO provider",
+      "freelance SaaS platform",
+      "freelance UX designer",
+      "freelance app builder",
+      "freelance backend developer",
+      "freelance cloud hosting",
+      "freelance code audit",
+      "freelance code review",
+      "freelance cybersecurity audit",
+      "freelance data engineer",
+      "freelance data pipeline",
+      "freelance database admin",
+      "freelance frontend developer",
+      "freelance full-stack developer",
+      "freelance kubernetes consultant",
+      "freelance legacy system migration",
+      "freelance load testing",
+      "freelance microservices consultant",
+      "freelance mobile app developer",
+      "freelance no-code builder",
+      "freelance outsourced dev team",
+      "freelance penetration testing",
+      "freelance product manager",
+      "freelance scrum master",
+      "freelance site reliability engineer",
+      "freelance software architect",
+      "freelance software escrow",
+      "freelance technical co-founder",
+      "freelance technical writer",
+      "freelance white-label software",
+      "frontend developer",
+      "full-stack developer",
+      "kubernetes consultant",
+      "legacy system migration",
+      "licensed API gateway",
+      "licensed AWS consultant",
+      "licensed CI/CD pipeline",
+      "licensed CRM",
+      "licensed DevOps engineer",
+      "licensed GraphQL developer",
+      "licensed IT staffing agency",
+      "licensed QA testing",
+      "licensed REST API",
+      "licensed SOC 2 audit",
+      "licensed SSO provider",
+      "licensed SaaS platform",
+      "licensed UX designer",
+      "licensed app builder",
+      "licensed backend developer",
+      "licensed cloud hosting",
+      "licensed code audit",
+      "licensed code review",
+      "licensed cybersecurity audit",
+      "licensed data engineer",
+      "licensed data pipeline",
+      "licensed database admin",
+      "licensed frontend developer",
+      "licensed full-stack developer",
+      "licensed kubernetes consultant",
+      "licensed legacy system migration",
+      "licensed load testing",
+      "licensed microservices consultant",
+      "licensed mobile app developer",
+      "licensed no-code builder",
+      "licensed outsourced dev team",
+      "licensed penetration testing",
+      "licensed product manager",
+      "licensed scrum master",
+      "licensed site reliability engineer",
+      "licensed software architect",
+      "licensed software escrow",
+      "licensed technical co-founder",
+      "licensed technical writer",
+      "licensed white-label software",
+      "load testing",
+      "local API gateway",
+      "local AWS consultant",
+      "local CI/CD pipeline",
+      "local CRM",
+      "local DevOps engineer",
+      "local GraphQL developer",
+      "local IT staffing agency",
+      "local QA testing",
+      "local REST API",
+      "local SOC 2 audit",
+      "local SSO provider",
+      "local SaaS platform",
+      "local UX designer",
+      "local app builder",
+      "local backend developer",
+      "local cloud hosting",
+      "local code audit",
+      "local code review",
+      "local cybersecurity audit",
+      "local data engineer",
+      "local data pipeline",
+      "local database admin",
+      "local frontend developer",
+      "local full-stack developer",
+      "local kubernetes consultant",
+      "local legacy system migration",
+      "local load testing",
+      "local microservices consultant",
+      "local mobile app developer",
+      "local no-code builder",
+      "local outsourced dev team",
+      "local penetration testing",
+      "local product manager",
+      "local scrum master",
+      "local site reliability engineer",
+      "local software architect",
+      "local software escrow",
+      "local technical co-founder",
+      "local technical writer",
+      "local white-label software",
+      "microservices consultant",
+      "mobile app developer",
+      "no-code builder",
+      "online API gateway",
+      "online AWS consultant",
+      "online CI/CD pipeline",
+      "online CRM",
+      "online DevOps engineer",
+      "online GraphQL developer",
+      "online IT staffing agency",
+      "online QA testing",
+      "online REST API",
+      "online SOC 2 audit",
+      "online SSO provider",
+      "online SaaS platform",
+      "online UX designer",
+      "online app builder",
+      "online backend developer",
+      "online cloud hosting",
+      "online code audit",
+      "online code review",
+      "online cybersecurity audit",
+      "online data engineer",
+      "online data pipeline",
+      "online database admin",
+      "online frontend developer",
+      "online full-stack developer",
+      "online kubernetes consultant",
+      "online legacy system migration",
+      "online load testing",
+      "online microservices consultant",
+      "online mobile app developer",
+      "online no-code builder",
+      "online outsourced dev team",
+      "online penetration testing",
+      "online product manager",
+      "online scrum master",
+      "online site reliability engineer",
+      "online software architect",
+      "online software escrow",
+      "online technical co-founder",
+      "online technical writer",
+      "online white-label software",
+      "outsourced dev team",
+      "penetration testing",
+      "premium API gateway",
+      "premium AWS consultant",
+      "premium CI/CD pipeline",
+      "premium CRM",
+      "premium DevOps engineer",
+      "premium GraphQL developer",
+      "premium IT staffing agency",
+      "premium QA testing",
+      "premium REST API",
+      "premium SOC 2 audit",
+      "premium SSO provider",
+      "premium SaaS platform",
+      "premium UX designer",
+      "premium app builder",
 
 ]
 
@@ -374,6 +374,16 @@ SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
 # SINGLE RapidAPI call via an OR'd query, instead of one call/keyword.
 # This is the ONLY cost-control change in this version. Default 10.
 GOOGLE_SERP_BATCH = int(os.getenv("GOOGLE_SERP_BATCH", "10"))
+
+# ── How many results to ask RapidAPI for, PER keyword in a batch, via
+# its "limit" query parameter (confirmed supported by this exact
+# provider — ScraperLink/google-search116 — "you can specify limit to
+# fetch more results per page"). A batch of 3 keywords now requests
+# limit = GOOGLE_SERP_BASE_RESULTS_PER_KEYWORD * 3, so per-keyword
+# result depth stays consistent regardless of batch size, instead of
+# every batch just getting Google's bare default (~10) no matter how
+# many keywords were OR'd together.
+GOOGLE_SERP_BASE_RESULTS_PER_KEYWORD = int(os.getenv("GOOGLE_SERP_BASE_RESULTS_PER_KEYWORD", "10"))
 
 # ── REDDIT "SMART FETCH" CONFIG — UNCHANGED v9.6 retry logic.
 REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
@@ -820,10 +830,16 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
     quoted_terms = " OR ".join(f'"{kw}"' for kw in keywords_batch)
     query = f'site:reddit.com ({quoted_terms})'
 
+    # Scale the requested result count with batch size, so a 3-keyword
+    # batch asks for ~3x the results a single keyword would, instead of
+    # every batch getting capped at the provider's bare default (~10)
+    # regardless of how many keywords were combined into the query.
+    requested_limit = GOOGLE_SERP_BASE_RESULTS_PER_KEYWORD * len(keywords_batch)
+
     try:
         url = "https://google-search116.p.rapidapi.com/"
 
-        querystring = {"query": query}
+        querystring = {"query": query, "limit": str(requested_limit)}
 
         headers = {
             "x-rapidapi-key": RAPIDAPI_KEY,  # .env
@@ -840,14 +856,43 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
             return []
 
         raw_items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
+
+        # ── DIAGNOSTIC (always at INFO) — shows the raw count RapidAPI
+        # actually returned for this combined/OR'd query, BEFORE any
+        # local filtering. Without this, "serp_results:0" in the pass
+        # log is ambiguous: it could mean RapidAPI itself returned 0
+        # hits for the batched query, OR it could mean RapidAPI returned
+        # results but every single one got filtered out locally (either
+        # not a reddit.com URL, or couldn't be attributed back to one
+        # of the batch's keywords). This line tells you which.
+        log.info(
+            f"[SERP-BATCH] RAW response for batch {keywords_batch!r} → "
+            f"{len(raw_items)} raw item(s) from RapidAPI (requested limit:{requested_limit}, "
+            f"before reddit-domain / keyword-attribution filtering) | query:{query!r}"
+        )
+        if len(raw_items) == 0:
+            log.warning(
+                f"[SERP-BATCH] RapidAPI returned ZERO raw items for this batch's combined "
+                f"query — this is NOT a local filtering issue, the SERP call itself found "
+                f"nothing. Possible causes: the OR'd query "
+                f"(site:reddit.com (\"kw1\" OR \"kw2\" OR ...)) may be too long / not "
+                f"supported the same way as a single-keyword query by this RapidAPI host, "
+                f"or the response shape changed (result_data keys tried: "
+                f"{RESULT_LIST_KEY_CANDIDATES}) — raw response top-level keys: "
+                f"{list(result_data.keys()) if isinstance(result_data, dict) else type(result_data).__name__}"
+            )
+
         results = []
         rank_misses = 0
+        non_reddit_count = 0
         skipped_unattributed = 0
+        unattributed_samples = []
         for pos, item in enumerate(raw_items, start=1):
             if not isinstance(item, dict):
                 continue
             item_url = item.get("url", "") or item.get("link", "")
             if "reddit.com" not in item_url:
+                non_reddit_count += 1
                 continue
             rank = _dig_value(item, RANK_FIELD_CANDIDATES)
             if rank is None:
@@ -858,6 +903,8 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
             matched_keyword = _find_best_matching_keyword(f"{title} {item_url}", keywords_batch)
             if matched_keyword is None:
                 skipped_unattributed += 1
+                if len(unattributed_samples) < 5:
+                    unattributed_samples.append({"title": title, "url": item_url})
                 continue
 
             results.append({
@@ -873,16 +920,24 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
                 f"result (tried {RANK_FIELD_CANDIDATES}); used result order as rank fallback."
             )
 
+        if non_reddit_count:
+            log.info(
+                f"[SERP-BATCH] batch {keywords_batch!r} — {non_reddit_count} raw item(s) were "
+                f"not reddit.com URLs — filtered out."
+            )
+
         if skipped_unattributed:
-            log.debug(
-                f"[SERP-BATCH] batch {keywords_batch!r} — {skipped_unattributed} result(s) "
-                f"could not be confidently attributed to any keyword in the batch — skipped."
+            log.warning(
+                f"[SERP-BATCH] batch {keywords_batch!r} — {skipped_unattributed} reddit.com "
+                f"result(s) COULD NOT be attributed to any keyword in this batch (title/url "
+                f"didn't contain the keyword or any fuzzy variant) — skipped, not saved. "
+                f"Sample: {unattributed_samples}"
             )
 
         log.info(
             f"[SERP-BATCH] batch of {len(keywords_batch)} keyword(s) → {len(results)} attributed "
-            f"Reddit result(s) (last {months_back} months: {cd_min} to {cd_max}) | "
-            f"1 RapidAPI call | query:{query!r}"
+            f"Reddit result(s) out of {len(raw_items)} raw item(s) "
+            f"(last {months_back} months: {cd_min} to {cd_max}) | 1 RapidAPI call"
         )
         return results
 
