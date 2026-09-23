@@ -99,6 +99,28 @@ WHAT THIS FILE IS:
       passes_fuzzy_filter() is left defined in this file (unused by the
       loop) rather than removed.
 
+  DUAL-MONGODB SPLIT (NEW, this version only):
+    - This build now connects to TWO separate MongoDB targets instead
+      of one:
+        * MONGODB_URI  (db)  — holds ONLY `flintel_signals`. This is
+          the sole collection that is READ from and WRITTEN to on this
+          connection (is_post_already_signaled() + save_signal() +
+          the /signals endpoint).
+        * MONGODB2_URI (db2) — holds `flintel_keywords` and
+          `flintel_google_posts`. Every place in this file that used to
+          read/write those two collections on `db` now reads/writes
+          them on `db2` instead (sync_keywords_to_db, get_due_keywords,
+          mark_keyword_fetched, save_google_post, get_due_google_posts,
+          mark_google_post_fetched, set_google_post_retry_cooldown, and
+          the /keywords + /google-posts endpoints + the counts shown on
+          "/").
+    - Nothing else about the logic, schema, indexes, retry/cooldown
+      behavior, fuzzy matching, SERP batching, or Reddit RSS fetching
+      changed — only WHICH MongoDB connection each collection lives on.
+    - If MONGODB2_URI is not set, it falls back to MONGODB_URI so the
+      service still runs against a single Mongo target (both `db` and
+      `db2` simply point at the same cluster/DB in that case).
+
 Run:
     pip install fastapi uvicorn pymongo python-dotenv httpx requests \
                 feedparser
@@ -145,6 +167,13 @@ log = logging.getLogger("flintel")
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
+
+# ── SECOND MONGODB CONNECTION (NEW) — holds flintel_keywords +
+# flintel_google_posts. flintel_signals stays on MONGODB_URI/MONGODB_DB
+# above. If MONGODB2_URI isn't set, falls back to MONGODB_URI so the
+# service still runs fine against a single Mongo target.
+MONGODB2_URI = os.getenv("MONGODB2_URI", MONGODB_URI)
+MONGODB2_DB  = os.getenv("MONGODB2_DB", MONGODB_DB)
 
 # ── RapidAPI — SOLE provider for Google SERP rank/discovery. UNCHANGED.
 RAPIDAPI_KEY          = os.getenv("RAPIDAPI_KEY", "")
@@ -436,9 +465,11 @@ def passes_fuzzy_filter(text: str, search_keyword: str, fuzzy_keywords: list) ->
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB — flintel_signals + flintel_keywords (fetch-once cache) +
-# flintel_google_posts. Batch/queue collections REMOVED entirely — there
-# is no batching or Claude step left to persist state for.
+# MONGODB — TWO connections now (NEW):
+#   db  (MONGODB_URI / MONGODB_DB)   -> flintel_signals ONLY
+#   db2 (MONGODB2_URI / MONGODB2_DB) -> flintel_keywords + flintel_google_posts
+# Batch/queue collections REMOVED entirely — there is no batching or
+# Claude step left to persist state for.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ensure_index(collection, keys, **kwargs):
@@ -469,54 +500,75 @@ def _ensure_index(collection, keys, **kwargs):
 
 
 def get_database():
+    """
+    NEW — connects to TWO MongoDB targets instead of one:
+      * `db`  (MONGODB_URI/MONGODB_DB)   — holds ONLY flintel_signals.
+      * `db2` (MONGODB2_URI/MONGODB2_DB) — holds flintel_keywords and
+        flintel_google_posts.
+    If MONGODB2_URI was not set, it defaults to MONGODB_URI (see the
+    CONFIGURATION section above), so a single-Mongo deployment still
+    works exactly as before — `db` and `db2` just point at the same
+    cluster/DB in that case.
+
+    Returns (db, db2). Indexes for each collection are created on
+    whichever connection now owns that collection.
+    """
     try:
         client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         client.server_info()
         db = client[MONGODB_DB]
 
-        # NOTE: names below match what this collection already has in
-        # production. Same keys/uniqueness as before — only the *name*
-        # passed to create_index() matters here. Any mismatch for a
-        # key pattern that already exists under a different name is
-        # now handled gracefully by _ensure_index() instead of crashing
-        # the process with IndexOptionsConflict (code 85).
+        # flintel_signals — lives on the PRIMARY connection (db). Same
+        # names/keys/uniqueness as before — only the *name* passed to
+        # create_index() matters here. Any mismatch for a key pattern
+        # that already exists under a different name is now handled
+        # gracefully by _ensure_index() instead of crashing the
+        # process with IndexOptionsConflict (code 85).
         _ensure_index(db.flintel_signals, [("message_id", ASCENDING)], unique=True, name="signals_message_id_unique")
         _ensure_index(db.flintel_signals, [("post_url", ASCENDING)], name="post_url_lookup")
         _ensure_index(db.flintel_signals, [("search_keyword", ASCENDING)], name="signals_search_keyword")
         _ensure_index(db.flintel_signals, [("platform", ASCENDING)], name="signals_platform")
         _ensure_index(db.flintel_signals, [("created_at", ASCENDING)], name="signals_created_at")
 
+        log.info("MongoDB (primary — flintel_signals) connected.")
+
+        # ── SECOND CONNECTION (NEW) — flintel_keywords + flintel_google_posts.
+        client2 = MongoClient(MONGODB2_URI, serverSelectionTimeoutMS=5000)
+        client2.server_info()
+        db2 = client2[MONGODB2_DB]
+
         # flintel_keywords — fetch-once-forever cache. UNCHANGED shape,
         # minus the search_volume fields (removed — no longer used).
-        _ensure_index(db.flintel_keywords, [("keyword", ASCENDING)], unique=True, name="keyword_unique")
-        _ensure_index(db.flintel_keywords, [("fetched", ASCENDING)], name="keyword_fetched_idx")
-        _ensure_index(db.flintel_keywords, [("next_retry_at", ASCENDING)], name="keyword_retry_cooldown_idx")
+        _ensure_index(db2.flintel_keywords, [("keyword", ASCENDING)], unique=True, name="keyword_unique")
+        _ensure_index(db2.flintel_keywords, [("fetched", ASCENDING)], name="keyword_fetched_idx")
+        _ensure_index(db2.flintel_keywords, [("next_retry_at", ASCENDING)], name="keyword_retry_cooldown_idx")
 
         # flintel_google_posts — UNCHANGED schema/indexes from v9.12.
         _ensure_index(
-            db.flintel_google_posts, [("post_url", ASCENDING)], unique=True, name="google_post_url_unique"
+            db2.flintel_google_posts, [("post_url", ASCENDING)], unique=True, name="google_post_url_unique"
         )
         _ensure_index(
-            db.flintel_google_posts, [("reddit_fetched", ASCENDING)], name="google_post_fetched_idx"
+            db2.flintel_google_posts, [("reddit_fetched", ASCENDING)], name="google_post_fetched_idx"
         )
         _ensure_index(
-            db.flintel_google_posts, [("next_retry_at", ASCENDING)], name="google_post_retry_cooldown_idx"
+            db2.flintel_google_posts, [("next_retry_at", ASCENDING)], name="google_post_retry_cooldown_idx"
         )
         _ensure_index(
-            db.flintel_google_posts, [("subreddit", ASCENDING)], name="google_post_subreddit_idx"
+            db2.flintel_google_posts, [("subreddit", ASCENDING)], name="google_post_subreddit_idx"
         )
         _ensure_index(
-            db.flintel_google_posts, [("search_keyword", ASCENDING)], name="google_post_search_keyword_idx"
+            db2.flintel_google_posts, [("search_keyword", ASCENDING)], name="google_post_search_keyword_idx"
         )
 
-        log.info("MongoDB connected.")
-        return db
+        log.info("MongoDB2 (secondary — flintel_keywords + flintel_google_posts) connected.")
+
+        return db, db2
     except Exception as exc:
         log.critical(f"MongoDB connection failed: {exc}")
         raise
 
 
-db = get_database()
+db, db2 = get_database()
 
 
 def log_operator_alert(title: str, detail: str, level: str = "ERROR"):
@@ -527,15 +579,16 @@ def log_operator_alert(title: str, detail: str, level: str = "ERROR"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEYWORD CACHE — flintel_keywords. Same fetch-once-forever behavior as
-# v9.12, minus every search_volume-related field/function (removed).
+# KEYWORD CACHE — flintel_keywords (now on db2). Same fetch-once-forever
+# behavior as v9.12, minus every search_volume-related field/function
+# (removed).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sync_keywords_to_db(keywords: list):
     now = datetime.now(timezone.utc)
     for kw in keywords:
         try:
-            db.flintel_keywords.update_one(
+            db2.flintel_keywords.update_one(
                 {"keyword": kw},
                 {"$setOnInsert": {
                     "keyword":         kw,
@@ -553,7 +606,7 @@ def sync_keywords_to_db(keywords: list):
 def get_due_keywords() -> list:
     try:
         now = datetime.now(timezone.utc)
-        cursor = db.flintel_keywords.find({
+        cursor = db2.flintel_keywords.find({
             "fetched": False,
             "$or": [
                 {"next_retry_at": None},
@@ -570,7 +623,7 @@ def get_due_keywords() -> list:
 def mark_keyword_fetched(keyword: str):
     now = datetime.now(timezone.utc)
     try:
-        db.flintel_keywords.update_one(
+        db2.flintel_keywords.update_one(
             {"keyword": keyword},
             {"$set": {"fetched": True, "last_fetched_at": now}},
         )
@@ -711,8 +764,9 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
 
     # Scale the requested result count with batch size, so a 3-keyword
     # batch asks for ~3x the results a single keyword would, instead of
-    # every batch getting capped at the provider's bare default (~10)
-    # regardless of how many keywords were combined into the query.
+    # every batch just getting capped at the provider's bare default
+    # (~10) regardless of how many keywords were combined into the
+    # query.
     requested_limit = GOOGLE_SERP_BASE_RESULTS_PER_KEYWORD * len(keywords_batch)
 
     try:
@@ -826,8 +880,8 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
 
 
 def is_post_already_signaled(post_url: str) -> bool:
-    """UNCHANGED — checks `flintel_signals` directly by post_url before
-    any Reddit fetch happens."""
+    """UNCHANGED — checks `flintel_signals` directly (on db, the primary
+    connection) by post_url before any Reddit fetch happens."""
     if not post_url:
         return False
     try:
@@ -839,7 +893,7 @@ def is_post_already_signaled(post_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# flintel_google_posts HELPERS — UNCHANGED from v9.12.
+# flintel_google_posts HELPERS — UNCHANGED from v9.12 (now on db2).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit: str, fuzzy_keywords: list) -> bool:
@@ -848,7 +902,7 @@ def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit:
     brand-new document."""
     now = datetime.now(timezone.utc)
     try:
-        result = db.flintel_google_posts.update_one(
+        result = db2.flintel_google_posts.update_one(
             {"post_url": post_url},
             {"$setOnInsert": {
                 "post_url":        post_url,
@@ -875,7 +929,7 @@ def get_due_google_posts() -> list:
     reddit_fetched=False AND not currently in a retry cooldown."""
     try:
         now = datetime.now(timezone.utc)
-        cursor = db.flintel_google_posts.find({
+        cursor = db2.flintel_google_posts.find({
             "reddit_fetched": False,
             "$or": [
                 {"next_retry_at": None},
@@ -893,7 +947,7 @@ def mark_google_post_fetched(post_url: str, fuzzy_matched):
     """Flips reddit_fetched=True PERMANENTLY for this post_url."""
     now = datetime.now(timezone.utc)
     try:
-        db.flintel_google_posts.update_one(
+        db2.flintel_google_posts.update_one(
             {"post_url": post_url},
             {"$set": {
                 "reddit_fetched": True,
@@ -911,7 +965,7 @@ def set_google_post_retry_cooldown(post_url: str, cooldown_seconds: int = REDDIT
     now = datetime.now(timezone.utc)
     next_retry = now + timedelta(seconds=cooldown_seconds)
     try:
-        db.flintel_google_posts.update_one(
+        db2.flintel_google_posts.update_one(
             {"post_url": post_url},
             {"$set": {"next_retry_at": next_retry}},
         )
@@ -1055,8 +1109,9 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL STORAGE — direct save into flintel_signals, no batching, no
-# scoring. This is what replaces the old queue -> Claude -> save flow.
+# SIGNAL STORAGE — direct save into flintel_signals (on db, the primary
+# connection), no batching, no scoring. This is what replaces the old
+# queue -> Claude -> save flow.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_signal(item: dict) -> bool:
@@ -1364,14 +1419,14 @@ def _serialise(signals: list) -> list:
 
 @app.get("/")
 def root():
-    total_keywords_tracked = db.flintel_keywords.count_documents({})
-    due_now_count = db.flintel_keywords.count_documents({"fetched": False})
+    total_keywords_tracked = db2.flintel_keywords.count_documents({})
+    due_now_count = db2.flintel_keywords.count_documents({"fetched": False})
 
-    total_google_posts = db.flintel_google_posts.count_documents({})
-    pending_reddit_fetch = db.flintel_google_posts.count_documents({"reddit_fetched": False})
-    fetched_reddit_posts = db.flintel_google_posts.count_documents({"reddit_fetched": True})
-    fuzzy_matched_posts  = db.flintel_google_posts.count_documents({"fuzzy_matched": True})
-    fuzzy_no_match_posts = db.flintel_google_posts.count_documents({"fuzzy_matched": False})
+    total_google_posts = db2.flintel_google_posts.count_documents({})
+    pending_reddit_fetch = db2.flintel_google_posts.count_documents({"reddit_fetched": False})
+    fetched_reddit_posts = db2.flintel_google_posts.count_documents({"reddit_fetched": True})
+    fuzzy_matched_posts  = db2.flintel_google_posts.count_documents({"fuzzy_matched": True})
+    fuzzy_no_match_posts = db2.flintel_google_posts.count_documents({"fuzzy_matched": False})
 
     return {
         "status":                  "running",
@@ -1405,6 +1460,8 @@ def root():
         "twitter_removed":         True,
         "batching_removed":        True,
         "signals_saved_directly":  True,
+        "dual_mongodb":            True,
+        "mongodb2_configured":     bool(MONGODB2_URI),
     }
 
 
@@ -1416,12 +1473,19 @@ def health():
     except Exception:
         mongo = "disconnected"
 
+    try:
+        db2.command("ping")
+        mongo2 = "connected"
+    except Exception:
+        mongo2 = "disconnected"
+
     return {
         "status":                  "ok",
         "mongodb":                 mongo,
+        "mongodb2":                mongo2,
         "reddit_working":          REDDIT_ENABLED and bool(RAPIDAPI_KEY),
         "reddit_indicator":        _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
-        "google_posts_pending_reddit_fetch": db.flintel_google_posts.count_documents({"reddit_fetched": False}),
+        "google_posts_pending_reddit_fetch": db2.flintel_google_posts.count_documents({"reddit_fetched": False}),
         "client_id":               CLIENT_ID,
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
@@ -1429,7 +1493,7 @@ def health():
 
 @app.get("/keywords", dependencies=[Depends(verify_api_key)])
 def get_keywords_status():
-    raw_docs = list(db.flintel_keywords.find({}, {"_id": 0}).sort("keyword", 1))
+    raw_docs = list(db2.flintel_keywords.find({}, {"_id": 0}).sort("keyword", 1))
     due_count = 0
     docs = []
     for d in raw_docs:
@@ -1452,17 +1516,17 @@ def get_google_posts_status(reddit_fetched: bool = None, fuzzy_matched: bool = N
     if fuzzy_matched is not None:
         q["fuzzy_matched"] = fuzzy_matched
 
-    docs = list(db.flintel_google_posts.find(q, {"_id": 0}).sort("discovered_at", -1).limit(limit))
+    docs = list(db2.flintel_google_posts.find(q, {"_id": 0}).sort("discovered_at", -1).limit(limit))
     for d in docs:
         for f in ["discovered_at", "fetched_at", "next_retry_at"]:
             if d.get(f):
                 d[f] = d[f].isoformat()
 
-    total = db.flintel_google_posts.count_documents({})
-    pending = db.flintel_google_posts.count_documents({"reddit_fetched": False})
-    fetched = db.flintel_google_posts.count_documents({"reddit_fetched": True})
-    matched = db.flintel_google_posts.count_documents({"fuzzy_matched": True})
-    no_match = db.flintel_google_posts.count_documents({"fuzzy_matched": False})
+    total = db2.flintel_google_posts.count_documents({})
+    pending = db2.flintel_google_posts.count_documents({"reddit_fetched": False})
+    fetched = db2.flintel_google_posts.count_documents({"reddit_fetched": True})
+    matched = db2.flintel_google_posts.count_documents({"fuzzy_matched": True})
+    no_match = db2.flintel_google_posts.count_documents({"fuzzy_matched": False})
 
     return {
         "total": total,
@@ -1511,19 +1575,22 @@ if __name__ == "__main__":
     log.info("   -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals,")
     log.info("   saved directly, tagged with search_keyword)")
     log.info("  Claude / search_volume / engagement / Twitter / queueing: REMOVED")
+    log.info("  DUAL MONGODB: flintel_signals on MONGODB_URI | flintel_keywords +")
+    log.info("  flintel_google_posts on MONGODB2_URI")
     log.info("=" * 70)
     log.info(f"  Client                : {CLIENT_ID}")
     log.info(f"  Reddit                : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
     log.info(f"  Reddit fetch method   : public per-post RSS only — credential-free, no OAuth/PRAW, no .json anywhere")
     log.info(f"  Reddit keywords       : {len(REDDIT_SEARCH_KEYWORDS)} (used ONLY to seed brand-new flintel_keywords docs)")
-    log.info(f"  Keyword cache         : flintel_keywords — fetch-once-forever")
+    log.info(f"  Keyword cache         : flintel_keywords (MONGODB2) — fetch-once-forever")
     log.info(f"  Google SERP           : search_google_for_keywords_batch() — {GOOGLE_SERP_BATCH} keyword(s) OR'd into ONE RapidAPI call (cost control)")
-    log.info(f"  flintel_google_posts  : stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched")
+    log.info(f"  flintel_google_posts  : (MONGODB2) stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched")
     log.info(f"  Reddit fetch interval : check every {REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | retry cooldown {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s on genuine fetch failure")
     log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time — used to filter fetched RSS content")
-    log.info(f"  Signal storage        : direct save into flintel_signals on fuzzy match — NO queue, NO batch, NO Claude")
+    log.info(f"  Signal storage        : (MONGODB primary) direct save into flintel_signals on fuzzy match — NO queue, NO batch, NO Claude")
     log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — Google SERP discovery only now, batched {GOOGLE_SERP_BATCH}/call)")
-    log.info(f"  MongoDB DB            : {MONGODB_DB}")
+    log.info(f"  MongoDB DB (primary)  : {MONGODB_DB}")
+    log.info(f"  MongoDB2 DB (secondary): {MONGODB2_DB}")
     log.info(f"  API auth              : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
     log.info("=" * 70)
 
