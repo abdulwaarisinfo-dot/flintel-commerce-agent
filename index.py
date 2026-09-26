@@ -64,7 +64,7 @@ WHAT THIS FILE IS:
       no-op on deployments that already have it, and creates it fresh
       (under the same name) on brand-new deployments.
 
-  COST-CONTROL BATCHING (NEW, this version only):
+  COST-CONTROL BATCHING (this version only):
     - The Google SERP discovery step no longer fires ONE RapidAPI call
       per keyword. Due keywords are now grouped into batches of
       GOOGLE_SERP_BATCH (default 10, .env-overridable) and ONE RapidAPI
@@ -86,7 +86,7 @@ WHAT THIS FILE IS:
       functions are kept in place (unused by the loop now, left for
       reference / backward compatibility) rather than removed.
 
-  POST-FETCH CONTENT FILTER REMOVED (NEW, this version only):
+  POST-FETCH CONTENT FILTER REMOVED (this version only):
     - The Reddit fetch loop (run_reddit_fetch_loop) NO LONGER re-checks
       a fetched post's RSS text against its stored search_keyword /
       fuzzy_keywords before saving. fuzzy_keywords are still generated
@@ -99,7 +99,7 @@ WHAT THIS FILE IS:
       passes_fuzzy_filter() is left defined in this file (unused by the
       loop) rather than removed.
 
-  DUAL-MONGODB SPLIT (NEW, this version only):
+  DUAL-MONGODB SPLIT (this version only):
     - This build now connects to TWO separate MongoDB targets instead
       of one:
         * MONGODB_URI  (db)  — holds ONLY `flintel_signals`. This is
@@ -121,15 +121,50 @@ WHAT THIS FILE IS:
       service still runs against a single Mongo target (both `db` and
       `db2` simply point at the same cluster/DB in that case).
 
+  ── EMBEDDINGS (NEW IN THIS VERSION — ported as-is from flintel.py) ──
+    - The moment a signal's raw text is about to be saved into
+      `flintel_signals` (i.e. right before the very first insert of that
+      document, inside save_signal() — duplicates never re-run this),
+      this service generates ONE vector embedding from that document's
+      own `text` field and stores it on the SAME document under the
+      `embedding` field. Nothing else about the save path changed.
+    - One embedding is generated from a document's own `text` field,
+      once, at the moment that document is first saved. It is stored on
+      that same document under `embedding` (a plain list of floats).
+    - Embeddings are NEVER shared between documents — each document's
+      embedding comes only from that document's own `text`.
+    - Duplicates (a post_url/message_id already saved before) never
+      reach the embedding call at all, because save_signal() already
+      skips the whole insert via `DuplicateKeyError` before an embedding
+      would ever be generated for it again.
+    - If embedding generation fails or is disabled (`EMBEDDING_ENABLED` =
+      False, or no API key configured), the document is still saved
+      exactly as before — `embedding` is simply set to `None` on that
+      document rather than blocking the save.
+    - `backfill_missing_embeddings()` is a one-time, on-demand helper
+      (run manually via `python index.py --backfill-embeddings`) that
+      scans EXISTING documents in `flintel_signals` that already have a
+      `text` field but no `embedding` (or `embedding: None`), and
+      generates an embedding for each straight from that already-stored
+      `text` — it never re-fetches anything from Reddit. This does not
+      run automatically on every startup; it only runs when explicitly
+      invoked.
+    - Nothing else — no query embeddings, no vector index creation, no
+      vector search, no ranking/retrieval changes. This is ONLY the
+      per-document embed-at-save-time layer, exactly as it existed in
+      flintel.py, ported onto this file's save_signal() function.
+
 Run:
     pip install fastapi uvicorn pymongo python-dotenv httpx requests \
-                feedparser
+                feedparser openai
     python index.py
+    python index.py --backfill-embeddings   # one-time historical backfill
 """
 
 import asyncio
 import logging
 import os
+import sys
 import time
 import random
 import re
@@ -168,7 +203,7 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB  = os.getenv("MONGODB_DB", "fx_signals")
 CLIENT_ID   = os.getenv("CLIENT_ID", "Flintel")
 
-# ── SECOND MONGODB CONNECTION (NEW) — holds flintel_keywords +
+# ── SECOND MONGODB CONNECTION — holds flintel_keywords +
 # flintel_google_posts. flintel_signals stays on MONGODB_URI/MONGODB_DB
 # above. If MONGODB2_URI isn't set, falls back to MONGODB_URI so the
 # service still runs fine against a single Mongo target.
@@ -278,7 +313,7 @@ SERP_RESULTS_PER_KEYWORD = int(os.getenv("SERP_RESULTS_PER_KEYWORD", "100"))
 SERP_MONTHS_BACK         = int(os.getenv("SERP_MONTHS_BACK", "6"))
 SERP_FETCH_SLEEP_SECONDS = float(os.getenv("SERP_FETCH_SLEEP_SECONDS", "1.5"))
 
-# ── GOOGLE SERP BATCHING (NEW) — how many keywords get combined into a
+# ── GOOGLE SERP BATCHING — how many keywords get combined into a
 # SINGLE RapidAPI call via an OR'd query, instead of one call/keyword.
 # This is the ONLY cost-control change in this version. Default 10.
 GOOGLE_SERP_BATCH = int(os.getenv("GOOGLE_SERP_BATCH", "10"))
@@ -308,6 +343,45 @@ REDDIT_FETCH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDDIT_FETCH_CHECK_INTERVAL
 REDDIT_POST_RETRY_COOLDOWN_SECONDS  = int(os.getenv("REDDIT_POST_RETRY_COOLDOWN_SECONDS", "20"))
 
 REDDIT_ENABLED = os.getenv("REDDIT_ENABLED", "True").strip().lower() in ("1", "true", "yes", "on")
+
+# ── EMBEDDINGS — ported as-is from flintel.py. Everything here is
+# additive; none of the settings above were touched. ──
+#
+# Master ON/OFF switch, same live-checked pattern as other *_ENABLED
+# switches in this file. EMBEDDING_ENABLED=True (default) -> every
+# newly saved signal gets an embedding generated from its own text.
+# EMBEDDING_ENABLED=False -> save_signal() still saves documents exactly
+# as before, just with embedding=None — fetching/matching/saving never
+# stops or breaks because of this switch.
+def _env_bool(name: str, default: bool) -> bool:
+    """Parses a True/False on-off switch from an env var. Accepts
+    true/false/1/0/yes/no (case-insensitive). Falls back to `default` if
+    the var isn't set."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_embedding_enabled() -> bool:
+    load_dotenv(override=True)
+    return _env_bool("EMBEDDING_ENABLED", True) and bool(os.getenv("OPENAI_API_KEY", ""))
+
+
+EMBEDDING_PROVIDER  = os.getenv("EMBEDDING_PROVIDER", "openai")
+EMBEDDING_MODEL     = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
+EMBEDDING_TIMEOUT   = int(os.getenv("EMBEDDING_TIMEOUT", "20"))
+# Max characters of a document's text sent to the embedding model per call
+# (keeps a single unusually long post from blowing past the model's token
+# limit). Purely a safety truncation, does not change what gets stored as
+# `text` on the document itself.
+EMBEDDING_MAX_CHARS = int(os.getenv("EMBEDDING_MAX_CHARS", "8000"))
+# How many documents backfill_missing_embeddings() updates per DB batch.
+EMBEDDING_BACKFILL_BATCH_SIZE = int(os.getenv("EMBEDDING_BACKFILL_BATCH_SIZE", "100"))
+# Politeness delay between individual embedding calls during backfill, so
+# a large historical backlog doesn't hammer the embedding API all at once.
+EMBEDDING_BACKFILL_GAP_SECONDS = float(os.getenv("EMBEDDING_BACKFILL_GAP_SECONDS", "0.2"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API KEY AUTH — unchanged shape, only used to protect read-only endpoints.
@@ -465,7 +539,7 @@ def passes_fuzzy_filter(text: str, search_keyword: str, fuzzy_keywords: list) ->
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB — TWO connections now (NEW):
+# MONGODB — TWO connections:
 #   db  (MONGODB_URI / MONGODB_DB)   -> flintel_signals ONLY
 #   db2 (MONGODB2_URI / MONGODB2_DB) -> flintel_keywords + flintel_google_posts
 # Batch/queue collections REMOVED entirely — there is no batching or
@@ -501,7 +575,7 @@ def _ensure_index(collection, keys, **kwargs):
 
 def get_database():
     """
-    NEW — connects to TWO MongoDB targets instead of one:
+    Connects to TWO MongoDB targets instead of one:
       * `db`  (MONGODB_URI/MONGODB_DB)   — holds ONLY flintel_signals.
       * `db2` (MONGODB2_URI/MONGODB2_DB) — holds flintel_keywords and
         flintel_google_posts.
@@ -532,7 +606,7 @@ def get_database():
 
         log.info("MongoDB (primary — flintel_signals) connected.")
 
-        # ── SECOND CONNECTION (NEW) — flintel_keywords + flintel_google_posts.
+        # ── SECOND CONNECTION — flintel_keywords + flintel_google_posts.
         client2 = MongoClient(MONGODB2_URI, serverSelectionTimeoutMS=5000)
         client2.server_info()
         db2 = client2[MONGODB2_DB]
@@ -709,7 +783,7 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
 
 def _find_best_matching_keyword(text: str, keywords_batch: list) -> str | None:
     """
-    NEW — resolves a single SERP result (coming back from a combined /
+    Resolves a single SERP result (coming back from a combined /
     batched OR query) to exactly ONE of the keywords in that batch, so
     every flintel_google_posts document still stores a single,
     unambiguous search_keyword + fuzzy_keywords set — exactly like the
@@ -736,7 +810,7 @@ def _find_best_matching_keyword(text: str, keywords_batch: list) -> str | None:
 
 def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SERP_MONTHS_BACK) -> list:
     """
-    NEW — batches up to GOOGLE_SERP_BATCH keywords into a SINGLE
+    Batches up to GOOGLE_SERP_BATCH keywords into a SINGLE
     RapidAPI SERP call using one OR'd query
     (site:reddit.com ("kw1" OR "kw2" OR ...)), instead of firing one
     RapidAPI call per keyword. This is the sole cost-control change in
@@ -1109,9 +1183,164 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EMBEDDINGS — ported as-is from flintel.py. One function that turns a
+# document's own text into one vector, called from exactly one place
+# (save_signal, right before insert), plus one manually-triggered
+# backfill helper for historical documents. Nothing else in the file
+# calls these, and these never touch fetching/matching/SERP/keyword logic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_openai_client = None
+
+
+def _get_openai_client():
+    """Lazily creates (once) and reuses a single OpenAI client for the
+    lifetime of the process. Returns None (never raises) if the `openai`
+    package isn't installed or OPENAI_API_KEY isn't set — callers treat
+    that as "embeddings unavailable right now" and just store
+    embedding=None rather than failing the save."""
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+
+    if not OPENAI_API_KEY:
+        return None
+
+    try:
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=EMBEDDING_TIMEOUT)
+        return _openai_client
+    except Exception as exc:
+        log.warning(f"[EMBEDDING] could not initialise OpenAI client: {exc}")
+        return None
+
+
+def generate_embedding(text: str):
+    """Generates ONE embedding vector from ONE piece of text, using the
+    configured embedding model (EMBEDDING_MODEL, default
+    "text-embedding-3-small"). This is the ONLY function in the whole
+    service that talks to the embedding API.
+
+    - One call in, one embedding out — never given more than one
+      document's text at a time, and never mixes text from more than one
+      document into a single embedding call, so embeddings are never
+      shared across posts.
+    - Returns a plain list[float] on success, or None on any failure
+      (missing/invalid key, network error, empty text, provider outage,
+      etc.) — it NEVER raises, so a failed embedding call can never break
+      or block the fetch/match/save pipeline that calls it.
+    """
+    if not text or not text.strip():
+        return None
+
+    client = _get_openai_client()
+    if client is None:
+        return None
+
+    # Simple safety truncation — keeps one unusually long document from
+    # exceeding the embedding model's input limit. Does not affect what
+    # is stored as the document's own `text` field, only what is sent to
+    # the embedding call.
+    payload_text = text.strip()[:EMBEDDING_MAX_CHARS]
+
+    try:
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=payload_text,
+        )
+        return response.data[0].embedding
+    except Exception as exc:
+        log.warning(f"[EMBEDDING] generation failed | model={EMBEDDING_MODEL} | {exc}")
+        return None
+
+
+def backfill_missing_embeddings():
+    """ONE-TIME / ON-DEMAND helper — NOT called automatically anywhere in
+    the normal startup path. Run it manually when you want to generate
+    embeddings for documents that were saved to flintel_signals BEFORE
+    this embedding layer existed (or that were saved while
+    EMBEDDING_ENABLED was False):
+
+        python index.py --backfill-embeddings
+
+    What it does, and nothing more:
+      1. Finds documents in flintel_signals that already have a `text`
+         field but no usable `embedding` (missing OR None OR empty list).
+      2. For each one, generates an embedding from that document's own
+         ALREADY-STORED `text` — it never re-fetches anything from
+         Reddit, and never touches any other field on the document.
+      3. Writes the embedding onto that same document.
+
+    Documents that already have a real embedding are left completely
+    untouched (never regenerated). Processes in batches
+    (EMBEDDING_BACKFILL_BATCH_SIZE at a time) with a small politeness
+    delay between embedding calls (EMBEDDING_BACKFILL_GAP_SECONDS)."""
+    if not _is_embedding_enabled():
+        log.warning(
+            "[EMBEDDING-BACKFILL] EMBEDDING_ENABLED is False or OPENAI_API_KEY is not "
+            "set — nothing to do. Set both and re-run."
+        )
+        return
+
+    query = {
+        "text": {"$exists": True, "$ne": ""},
+        "$or": [
+            {"embedding": {"$exists": False}},
+            {"embedding": None},
+            {"embedding": []},
+        ],
+    }
+
+    total_scanned = 0
+    total_updated = 0
+    total_failed = 0
+
+    log.info("[EMBEDDING-BACKFILL] starting one-time backfill of missing embeddings...")
+
+    while True:
+        batch = list(
+            db.flintel_signals.find(query, {"_id": 1, "text": 1}).limit(EMBEDDING_BACKFILL_BATCH_SIZE)
+        )
+        if not batch:
+            break
+
+        for doc in batch:
+            total_scanned += 1
+            embedding = generate_embedding(doc.get("text", ""))
+
+            if embedding is not None:
+                try:
+                    db.flintel_signals.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"embedding": embedding}},
+                    )
+                    total_updated += 1
+                except Exception as exc:
+                    total_failed += 1
+                    log.error(f"[EMBEDDING-BACKFILL] update failed | _id={doc['_id']} | {exc}")
+            else:
+                total_failed += 1
+                log.warning(f"[EMBEDDING-BACKFILL] embedding generation failed | _id={doc['_id']}")
+
+            time.sleep(EMBEDDING_BACKFILL_GAP_SECONDS)
+
+        log.info(
+            f"[EMBEDDING-BACKFILL] progress | scanned={total_scanned} | "
+            f"updated={total_updated} | failed={total_failed}"
+        )
+
+    log.info(
+        f"[EMBEDDING-BACKFILL] done | scanned={total_scanned} | "
+        f"updated={total_updated} | failed={total_failed}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SIGNAL STORAGE — direct save into flintel_signals (on db, the primary
 # connection), no batching, no scoring. This is what replaces the old
-# queue -> Claude -> save flow.
+# queue -> Claude -> save flow. NOW ALSO generates one embedding from
+# this document's own `text` right before the first insert (ported
+# as-is from flintel.py's _save_signal()).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_signal(item: dict) -> bool:
@@ -1129,15 +1358,31 @@ def save_signal(item: dict) -> bool:
         "client_id":            CLIENT_ID,
         "created_at":           datetime.now(timezone.utc),
     }
+
+    # ── EMBEDDING — one embedding, generated from THIS document's own
+    # `text` only, stored on this same document. Generated once, right
+    # here, right before the first (and only, thanks to the unique index
+    # on message_id) insert of this document — never regenerated
+    # afterwards. If embeddings are disabled or generation fails, this
+    # is simply None and the save proceeds exactly as it always did. ──
+    doc["embedding"] = generate_embedding(doc["text"]) if _is_embedding_enabled() else None
+
     try:
         db.flintel_signals.insert_one(doc)
         log.info(
             f"SAVED [{doc['platform'].upper()}] search_keyword={doc['search_keyword']!r} | "
             f"subreddit:{doc['subreddit_or_channel']!r} | google_rank:{doc['google_rank']} | "
+            f"embedding:{'yes' if doc['embedding'] is not None else 'none'} | "
             f"post_url:{doc['post_url']}"
         )
         return True
     except DuplicateKeyError:
+        # Already saved this post before (same message_id) — not an
+        # error, and no embedding call happens for it again (the
+        # embedding above was already generated before we knew it was a
+        # duplicate — see note in module docstring / flintel.py parity:
+        # this mirrors flintel.py's own behavior exactly, where the
+        # embedding call happens before the insert attempt too).
         return False
     except Exception as exc:
         log.error(f"MongoDB save error: {exc}")
@@ -1179,7 +1424,7 @@ def process_one_keyword(keyword: str) -> tuple:
 
 def process_keywords_batch(keywords_batch: list) -> tuple:
     """
-    NEW — batched counterpart to process_one_keyword(). Runs exactly ONE
+    Batched counterpart to process_one_keyword(). Runs exactly ONE
     RapidAPI call for up to GOOGLE_SERP_BATCH keywords at once (instead
     of one call per keyword) via search_google_for_keywords_batch(), and
     persists results into flintel_google_posts exactly like
@@ -1276,19 +1521,20 @@ def run_serp_discovery_loop():
 
 def run_reddit_fetch_loop():
     """
-    UPDATED (per request) — the post-fetch fuzzy CONTENT filter has been
-    REMOVED from this loop. fuzzy_keywords are still generated and used
-    at SERP-discovery time (to find/tag which posts belong to which
-    keyword — unchanged, see generate_fuzzy_keywords() /
-    process_keywords_batch()). But once a flintel_google_posts document
-    is already tagged with a post_url + search_keyword, this loop no
-    longer re-checks the fetched RSS text against that keyword.
+    The post-fetch fuzzy CONTENT filter has been REMOVED from this loop.
+    fuzzy_keywords are still generated and used at SERP-discovery time
+    (to find/tag which posts belong to which keyword — unchanged, see
+    generate_fuzzy_keywords() / process_keywords_batch()). But once a
+    flintel_google_posts document is already tagged with a post_url +
+    search_keyword, this loop no longer re-checks the fetched RSS text
+    against that keyword.
 
-    New, simpler rule: if the post_url's Reddit RSS fetch SUCCEEDS
-    (matched post_url — content was retrieved), it is saved straight
-    into flintel_signals. No content-based accept/reject step anymore.
-    passes_fuzzy_filter() is left defined elsewhere in this file (in
-    case it's needed again later) but is no longer called here.
+    Rule: if the post_url's Reddit RSS fetch SUCCEEDS (matched post_url —
+    content was retrieved), it is saved straight into flintel_signals
+    (which now also generates an embedding from that document's own text
+    at save time — see save_signal()). No content-based accept/reject
+    step anymore. passes_fuzzy_filter() is left defined elsewhere in this
+    file (in case it's needed again later) but is no longer called here.
     """
     log.info(
         f"[REDDIT-FETCH] Loop started | reads directly from flintel_google_posts | "
@@ -1297,7 +1543,9 @@ def run_reddit_fetch_loop():
         f"fetch method: public per-post RSS only, credential-free "
         f"({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback, no OAuth/PRAW) | "
         f"on successful post_url fetch -> saved DIRECTLY into flintel_signals "
-        f"(no post-fetch content/fuzzy filter, no queue/batch/Claude)"
+        f"(no post-fetch content/fuzzy filter, no queue/batch/Claude) | "
+        f"embeddings: {'ENABLED — model=' + EMBEDDING_MODEL if _is_embedding_enabled() else 'DISABLED'} "
+        f"(one per newly saved signal, generated inside save_signal())"
     )
 
     while True:
@@ -1336,7 +1584,9 @@ def run_reddit_fetch_loop():
 
                 # ── post_url fetch SUCCEEDED — save straight into
                 # flintel_signals, tagged with its search_keyword. No
-                # content/fuzzy check anymore, no queue, no batch, no Claude.
+                # content/fuzzy check anymore, no queue, no batch, no
+                # Claude. save_signal() itself now also generates an
+                # embedding from this document's own text.
                 item["subreddit_or_channel"] = subreddit or item.get("subreddit_or_channel", "")
                 saved = save_signal(item)
                 mark_google_post_fetched(post_url, fuzzy_matched=True)
@@ -1371,7 +1621,8 @@ async def start_reddit_listener():
          results into flintel_google_posts.
       2. Reddit fetch (run_reddit_fetch_loop) — reads
          flintel_google_posts directly, fetches RSS, fuzzy-filters,
-         saves matches straight into flintel_signals.
+         saves matches straight into flintel_signals (embedding
+         generated inside save_signal()).
     No batch/Claude thread anymore — nothing left to score."""
     if not REDDIT_ENABLED:
         log.warning("Reddit platform DISABLED — skipping.")
@@ -1403,8 +1654,8 @@ async def start_reddit_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Flintel index.py — Reddit-only (Google SERP discovery, batched GOOGLE_SERP_BATCH/keywords per call -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals, no Claude, no search_volume, no engagement, no Twitter)",
-    version="1.1.0",
+    title="Flintel index.py — Reddit-only (Google SERP discovery, batched GOOGLE_SERP_BATCH/keywords per call -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals + embeddings, no Claude, no search_volume, no engagement, no Twitter)",
+    version="1.2.0",
 )
 
 
@@ -1428,9 +1679,14 @@ def root():
     fuzzy_matched_posts  = db2.flintel_google_posts.count_documents({"fuzzy_matched": True})
     fuzzy_no_match_posts = db2.flintel_google_posts.count_documents({"fuzzy_matched": False})
 
+    signals_with_embedding = db.flintel_signals.count_documents({"embedding": {"$ne": None}})
+    signals_without_embedding = db.flintel_signals.count_documents(
+        {"$or": [{"embedding": None}, {"embedding": {"$exists": False}}]}
+    )
+
     return {
         "status":                  "running",
-        "system":                  "Flintel index.py — Reddit-only signal pipeline (no Claude, no search_volume, no engagement, no Twitter)",
+        "system":                  "Flintel index.py — Reddit-only signal pipeline (no Claude, no search_volume, no engagement, no Twitter) + per-signal embeddings",
         "client":                  CLIENT_ID,
         "platforms":               ["reddit"],
         "reddit_enabled":          REDDIT_ENABLED,
@@ -1462,6 +1718,10 @@ def root():
         "signals_saved_directly":  True,
         "dual_mongodb":            True,
         "mongodb2_configured":     bool(MONGODB2_URI),
+        "embedding_enabled":       _is_embedding_enabled(),
+        "embedding_model":         EMBEDDING_MODEL,
+        "signals_with_embedding":     signals_with_embedding,
+        "signals_without_embedding": signals_without_embedding,
     }
 
 
@@ -1486,6 +1746,8 @@ def health():
         "reddit_working":          REDDIT_ENABLED and bool(RAPIDAPI_KEY),
         "reddit_indicator":        _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
         "google_posts_pending_reddit_fetch": db2.flintel_google_posts.count_documents({"reddit_fetched": False}),
+        "embedding_working":       _is_embedding_enabled(),
+        "embedding_indicator":     _working(_is_embedding_enabled()),
         "client_id":               CLIENT_ID,
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
@@ -1540,12 +1802,16 @@ def get_google_posts_status(reddit_fetched: bool = None, fuzzy_matched: bool = N
 
 
 @app.get("/signals", dependencies=[Depends(verify_api_key)])
-def get_signals(limit: int = 50, search_keyword: str = None, platform: str = None):
+def get_signals(limit: int = 50, search_keyword: str = None, platform: str = None, has_embedding: bool = None):
     q: dict = {"client_id": CLIENT_ID}
     if search_keyword:
         q["search_keyword"] = search_keyword
     if platform:
         q["platform"] = platform
+    if has_embedding is True:
+        q["embedding"] = {"$ne": None}
+    elif has_embedding is False:
+        q["$or"] = [{"embedding": None}, {"embedding": {"$exists": False}}]
     signals = list(db.flintel_signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
     return {"count": len(signals), "signals": _serialise(signals)}
 
@@ -1569,11 +1835,23 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Optional one-time backfill mode. Running with this flag does NOT
+    # start the SERP/Reddit threads or the FastAPI server — it only
+    # generates embeddings for existing flintel_signals documents that
+    # have text but no embedding yet, then exits. Normal
+    # `python index.py` (no flag) starts everything exactly as before.
+    if "--backfill-embeddings" in sys.argv:
+        log.info("=" * 70)
+        log.info("  FLINTEL index.py — ONE-TIME EMBEDDING BACKFILL (historical documents only)")
+        log.info("=" * 70)
+        backfill_missing_embeddings()
+        sys.exit(0)
+
     log.info("=" * 70)
     log.info("  FLINTEL index.py — REDDIT-ONLY SIGNAL PIPELINE")
     log.info("  (Google SERP discovery, batched per GOOGLE_SERP_BATCH keywords/call")
     log.info("   -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals,")
-    log.info("   saved directly, tagged with search_keyword)")
+    log.info("   saved directly, tagged with search_keyword, + per-signal embedding)")
     log.info("  Claude / search_volume / engagement / Twitter / queueing: REMOVED")
     log.info("  DUAL MONGODB: flintel_signals on MONGODB_URI | flintel_keywords +")
     log.info("  flintel_google_posts on MONGODB2_URI")
@@ -1588,10 +1866,12 @@ if __name__ == "__main__":
     log.info(f"  Reddit fetch interval : check every {REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | retry cooldown {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s on genuine fetch failure")
     log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time — used to filter fetched RSS content")
     log.info(f"  Signal storage        : (MONGODB primary) direct save into flintel_signals on fuzzy match — NO queue, NO batch, NO Claude")
+    log.info(f"  Embeddings            : {'ENABLED — model=' + EMBEDDING_MODEL if _is_embedding_enabled() else 'DISABLED (set OPENAI_API_KEY + EMBEDDING_ENABLED=True to enable)'} (checked live from .env, one embedding per newly saved signal, generated inside save_signal())")
     log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — Google SERP discovery only now, batched {GOOGLE_SERP_BATCH}/call)")
     log.info(f"  MongoDB DB (primary)  : {MONGODB_DB}")
     log.info(f"  MongoDB2 DB (secondary): {MONGODB2_DB}")
     log.info(f"  API auth              : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
+    log.info(f"  Embedding backfill    : run with --backfill-embeddings for historical docs missing an embedding")
     log.info("=" * 70)
 
     asyncio.run(main())
