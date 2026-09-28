@@ -180,6 +180,7 @@ Run:
                 feedparser openai
     python index.py
     python index.py --backfill-embeddings   # one-time historical backfill
+    python index.py --reset-keywords        # FIX: one-time recovery of keywords burned by SERP failures
 """
 
 import asyncio
@@ -821,6 +822,46 @@ def mark_keyword_fetched(keyword: str):
         log.error(f"[KEYWORD-CACHE] mark_keyword_fetched error for {keyword!r}: {exc}")
 
 
+def reset_burned_keywords() -> int:
+    """FIX: ONE-TIME / ON-DEMAND recovery helper (run via
+    `python index.py --reset-keywords`). Finds keywords in
+    db2.flintel_keywords with fetched == True that have ZERO documents in
+    db2.flintel_google_posts with that search_keyword — i.e. keywords that
+    were marked fetched but produced nothing (typically burned by an earlier
+    SERP failure) — and sets fetched=False, next_retry_at=None on them so the
+    discovery loop searches them again. Returns how many were reset.
+
+    Note: a keyword that genuinely had zero Reddit results also matches this
+    rule; it will simply be searched once more and re-marked fetched."""
+    try:
+        fetched_docs = list(db2.flintel_keywords.find({"fetched": True}, {"keyword": 1}))
+        burned = []
+        for d in fetched_docs:
+            kw = d.get("keyword")
+            if not kw:
+                continue
+            if db2.flintel_google_posts.count_documents({"search_keyword": kw}, limit=1) == 0:
+                burned.append(kw)
+
+        reset_count = 0
+        for i in range(0, len(burned), 500):
+            chunk = burned[i:i + 500]
+            res = db2.flintel_keywords.update_many(
+                {"keyword": {"$in": chunk}, "fetched": True},
+                {"$set": {"fetched": False, "next_retry_at": None}},
+            )
+            reset_count += res.modified_count
+
+        log.info(
+            f"[KEYWORD-RESET] scanned {len(fetched_docs)} fetched keyword(s) | "
+            f"burned (0 google_posts) found:{len(burned)} | reset to fetched=False:{reset_count}"
+        )
+        return reset_count
+    except Exception as exc:
+        log.error(f"[KEYWORD-RESET] reset_burned_keywords error: {exc}")
+        return 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT — SOLE discovery mechanism: RapidAPI SERP search
 # (site:reddit.com). Same single RapidAPI call, same independent host,
@@ -937,14 +978,21 @@ def _find_best_matching_keyword(text: str, keywords_batch: list) -> str | None:
     for kw in keywords_batch:
         if kw and kw.lower() in t:
             return kw
+    # FIX: fuzzy fallback now only accepts variants containing a space (2+ words).
+    # Single-word variants like "business", "affordable", "video" are far too
+    # generic and were tagging results to the wrong keyword in a batch.
+    # (generate_fuzzy_keywords() itself is unchanged — stored fuzzy_keywords stay the same.)
     for kw in keywords_batch:
         for fkw in generate_fuzzy_keywords(kw):
-            if fkw and fkw in t:
+            if fkw and " " in fkw and fkw in t:
                 return kw
     return None
 
 
-def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SERP_MONTHS_BACK) -> list:
+# FIX: return contract — returns None on a REAL failure (missing key, non-200,
+# non-JSON, API error payload, exception) and [] ONLY when the call succeeded
+# (HTTP 200 + valid JSON) with genuinely zero results (or an empty batch).
+def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SERP_MONTHS_BACK) -> list | None:
     """
     Batches up to GOOGLE_SERP_BATCH keywords into a SINGLE
     RapidAPI SERP call using one OR'd query
@@ -965,7 +1013,7 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
     """
     if not RAPIDAPI_KEY:
         log.warning("[SERP-BATCH] RapidAPI key not set — skipping SERP search.")
-        return []
+        return None  # FIX: real failure -> None (was []), so keywords are NOT marked fetched
     if not keywords_batch:
         return []
 
@@ -997,13 +1045,40 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
 
         r = requests.get(url, headers=headers, params=querystring, timeout=DATAFORSEO_SERP_TIMEOUT_SECONDS)
 
+        # FIX: HTTP status check right after the request. Anything but 200
+        # (quota exceeded, bad subscription, provider outage, ...) is a
+        # real failure -> None, so the caller does NOT burn the keywords.
+        if r.status_code != 200:
+            log.error(
+                f"[SERP-BATCH] HTTP {r.status_code} for batch {keywords_batch!r} — treating as "
+                f"FAILURE (batch will be retried) | first 200 chars of body: {r.text[:200]!r}"
+            )
+            return None
+
         try:
             result_data = r.json()
         except ValueError:
             log.error(f"[SERP-BATCH] Non-JSON response for batch {keywords_batch!r} | status:{r.status_code}")
-            return []
+            return None  # FIX: real failure -> None (was [])
 
         raw_items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
+
+        # FIX: RapidAPI quota / subscription errors often come back as HTTP 200-ish JSON
+        # like {"message": "..."} or {"error": "..."} with no result list at all.
+        # That is a failure, NOT a genuine zero-result search. (A payload that
+        # DOES contain a result list — even an empty one — is a genuine success.)
+        if (
+            isinstance(result_data, dict)
+            and ("message" in result_data or "error" in result_data)
+            and not raw_items
+            and not any(isinstance(result_data.get(k), list) for k in RESULT_LIST_KEY_CANDIDATES)
+        ):
+            log.error(
+                f"[SERP-BATCH] API error payload (no result list) for batch {keywords_batch!r} — "
+                f"treating as FAILURE (batch will be retried) | "
+                f"message:{str(result_data.get('message'))[:200]!r} error:{str(result_data.get('error'))[:200]!r}"
+            )
+            return None
 
         # ── DIAGNOSTIC (always at INFO) — shows the raw count RapidAPI
         # actually returned for this combined/OR'd query, BEFORE any
@@ -1109,7 +1184,7 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
 
     except Exception as exc:
         log.error(f"[SERP-BATCH] RapidAPI search error for batch {keywords_batch!r}: {exc}")
-        return []
+        return None  # FIX: real failure -> None (was []), so keywords are NOT marked fetched
 
 
 def is_post_already_signaled(post_url: str) -> bool:
@@ -1530,7 +1605,10 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> tuple:
         if summary_plain and summary_plain.lower() != title.lower():
             text = f"{title}\n\n{summary_plain}"
 
-        author = (entry.get("author", "") or "unknown").lstrip("u/").lstrip("/u/").strip() or "unknown"
+        # FIX: .lstrip("u/") strips every leading 'u' or '/' CHARACTER ("/u/username" -> "sername").
+        # Remove only the literal "/u/" or "u/" prefix instead.
+        author = (entry.get("author", "") or "unknown").strip()
+        author = re.sub(r"^/?u/", "", author).strip() or "unknown"
         subreddit = _extract_reddit_subreddit_from_url(canonical_url)
 
         posted_at = None
@@ -1816,6 +1894,11 @@ def process_keywords_batch(keywords_batch: list) -> tuple:
     """
     results = search_google_for_keywords_batch(keywords_batch, months_back=SERP_MONTHS_BACK)
 
+    # FIX: None means the SERP call FAILED (not "zero results") — signal that to the
+    # caller with (None, 0) so it does not mark these keywords as fetched.
+    if results is None:
+        return None, 0
+
     new_posts_saved = 0
     # Cap kept proportional to batch size so the effective per-keyword
     # depth stays the same as before batching (SERP_RESULTS_PER_KEYWORD
@@ -1862,6 +1945,7 @@ def run_serp_discovery_loop():
                 continue
 
             total_results, total_new_posts = 0, 0
+            failed_batches = 0  # FIX: batches whose SERP call failed this pass (keywords left un-fetched)
 
             # ── Batch due keywords into groups of GOOGLE_SERP_BATCH —
             # ONE RapidAPI call per group instead of one per keyword.
@@ -1870,6 +1954,21 @@ def run_serp_discovery_loop():
                 batch_keywords = [doc["keyword"] for doc in batch_docs]
 
                 results_count, new_posts_saved = process_keywords_batch(batch_keywords)
+
+                # FIX: results_count is None => the SERP call FAILED (RapidAPI down / quota /
+                # non-JSON / missing key / exception). Do NOT mark these keywords fetched —
+                # they stay fetched=False and are retried on the next pass. The 30s sleep
+                # also prevents a tight retry loop while the provider is down.
+                if results_count is None:
+                    failed_batches += 1
+                    log.error(
+                        f"[SERP] batch {batch_keywords!r} FAILED — SERP call did not succeed. "
+                        f"Keywords NOT marked fetched; will be retried next pass. "
+                        f"Sleeping 30s before continuing."
+                    )
+                    time.sleep(30)
+                    continue
+
                 total_results += results_count
                 total_new_posts += new_posts_saved
 
@@ -1887,7 +1986,8 @@ def run_serp_discovery_loop():
             log.info(
                 f"[SERP] Pass complete | keywords_processed:{len(due)} | "
                 f"rapidapi_calls_used:{rapidapi_calls_used} (batch_size:{GOOGLE_SERP_BATCH}) | "
-                f"total_serp_results:{total_results} | new_google_posts_saved:{total_new_posts}"
+                f"total_serp_results:{total_results} | new_google_posts_saved:{total_new_posts} | "
+                f"failed_batches_will_retry:{failed_batches}"  # FIX
             )
 
         except Exception as exc:
@@ -2349,6 +2449,18 @@ if __name__ == "__main__":
     # generates embeddings for existing flintel_signals documents that
     # have text but no embedding yet, then exits. Normal
     # `python index.py` (no flag) starts everything exactly as before.
+    # FIX: optional one-time recovery mode — `python index.py --reset-keywords`.
+    # Un-burns keywords that were marked fetched=True but have zero
+    # flintel_google_posts (earlier SERP failures), logs the count, then exits.
+    # Does NOT start the SERP/Reddit threads or the FastAPI server.
+    if "--reset-keywords" in sys.argv:
+        log.info("=" * 70)
+        log.info("  FLINTEL index.py — ONE-TIME KEYWORD RESET (recover keywords burned by SERP failures)")
+        log.info("=" * 70)
+        n_reset = reset_burned_keywords()
+        log.info(f"[KEYWORD-RESET] done — {n_reset} keyword(s) reset to fetched=False.")
+        sys.exit(0)
+
     if "--backfill-embeddings" in sys.argv:
         log.info("=" * 70)
         log.info("  FLINTEL index.py — ONE-TIME EMBEDDING BACKFILL (historical documents only)")
