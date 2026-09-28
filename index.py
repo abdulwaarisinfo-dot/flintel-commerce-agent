@@ -121,7 +121,7 @@ WHAT THIS FILE IS:
       service still runs against a single Mongo target (both `db` and
       `db2` simply point at the same cluster/DB in that case).
 
-  ── EMBEDDINGS (NEW IN THIS VERSION — ported as-is from flintel.py) ──
+  ── EMBEDDINGS (ported as-is from flintel.py) ──
     - The moment a signal's raw text is about to be saved into
       `flintel_signals` (i.e. right before the very first insert of that
       document, inside save_signal() — duplicates never re-run this),
@@ -150,9 +150,30 @@ WHAT THIS FILE IS:
       run automatically on every startup; it only runs when explicitly
       invoked.
     - Nothing else — no query embeddings, no vector index creation, no
-      vector search, no ranking/retrieval changes. This is ONLY the
-      per-document embed-at-save-time layer, exactly as it existed in
-      flintel.py, ported onto this file's save_signal() function.
+      vector search, no ranking/retrieval changes.
+
+  ── REDDIT FETCH FIXES (THIS VERSION — every change is marked "# FIX:") ──
+    1. URL NORMALIZATION (root cause of "https://old.reddit.com.rss" and
+       "RSS feed had no entries"): _normalize_reddit_post_url() accepts
+       ONLY real post URLs (…/r/<sub>/comments/<id>[/<slug>]) and returns
+       the canonical "https://www.reddit.com/r/<sub>/comments/<id>/<slug>/"
+       with no query string / fragment. Used in both SERP search
+       functions (non-post URLs are skipped, ?tl=xx variants are deduped),
+       in save_google_post(), and in fetch_reddit_post_by_url(), which now
+       builds the RSS URL as canonical + ".rss" (".../slug/.rss").
+       cleanup_google_posts() runs at startup: deletes unfetched
+       non-post documents and rewrites/merges non-canonical URLs.
+    2. RATE-LIMIT HANDLING: _reddit_get_with_retry() returns
+       (response, reason) with reason in ok / 429 / blocked / not_found /
+       empty / network. A global limiter enforces REDDIT_MIN_GAP_SECONDS
+       (+ jitter) between ANY two Reddit requests. A circuit breaker
+       pauses the fetch loop for REDDIT_CIRCUIT_BREAK_SECONDS after 3
+       consecutive 429/403 responses. Per-post cooldown is exponential
+       (retry_count stored in flintel_google_posts), "empty" responses
+       get a longer floor, and old.reddit.com fallback is skipped after a
+       429/403 (same IP, same limit).
+    3. OPTIONAL PROXY: REDDIT_PROXY_URL is applied to every Reddit request.
+    4. DIAGNOSTICS: GET /reddit-test?url=... (API-key protected).
 
 Run:
     pip install fastapi uvicorn pymongo python-dotenv httpx requests \
@@ -171,6 +192,7 @@ import re
 import html
 import threading
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse  # FIX: used by _normalize_reddit_post_url()
 from dotenv import load_dotenv
 
 import requests
@@ -220,7 +242,7 @@ REDDIT_JSON_TIMEOUT_SECONDS     = int(os.getenv("REDDIT_JSON_TIMEOUT_SECONDS", "
 # ── SERP DISCOVERY CONFIG — UNCHANGED. This Python list's ONLY job is to
 # seed brand-new keyword documents into flintel_keywords (insert-only).
 REDDIT_SEARCH_KEYWORDS = [
-    
+
 "residential graphic designer",
       "residential growth marketer",
       "residential influencer marketing",
@@ -328,15 +350,45 @@ GOOGLE_SERP_BATCH = int(os.getenv("GOOGLE_SERP_BATCH", "10"))
 # many keywords were OR'd together.
 GOOGLE_SERP_BASE_RESULTS_PER_KEYWORD = int(os.getenv("GOOGLE_SERP_BASE_RESULTS_PER_KEYWORD", "10"))
 
-# ── REDDIT "SMART FETCH" CONFIG — UNCHANGED v9.6 retry logic.
+# ── REDDIT "SMART FETCH" CONFIG — v9.6 retry logic (now only used for
+# transient network/5xx errors — see FIX notes below).
 REDDIT_FETCH_MAX_RETRIES     = int(os.getenv("REDDIT_FETCH_MAX_RETRIES", "3"))
 REDDIT_FETCH_BACKOFF_BASE    = float(os.getenv("REDDIT_FETCH_BACKOFF_BASE", "2.0"))
 REDDIT_FETCH_JITTER_MIN      = float(os.getenv("REDDIT_FETCH_JITTER_MIN", "0.4"))
 REDDIT_FETCH_JITTER_MAX      = float(os.getenv("REDDIT_FETCH_JITTER_MAX", "1.6"))
+
+# FIX: realistic browser User-Agent by default (a custom "bot-style" UA is
+# one of the most common reasons Reddit answers 403/429 to RSS requests).
+# Override with REDDIT_USER_AGENT in .env if you prefer something else.
 REDDIT_USER_AGENT = os.getenv(
     "REDDIT_USER_AGENT",
-    "python:flintel-signal-bot:v1.0 (by /u/flintel_signals)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 )
+
+# FIX: global rate limiter — minimum seconds between ANY two Reddit
+# requests (shared by the fetch loop and /reddit-test), plus the random
+# jitter above (REDDIT_FETCH_JITTER_MIN..MAX) on top of it.
+REDDIT_MIN_GAP_SECONDS = float(os.getenv("REDDIT_MIN_GAP_SECONDS", "4"))
+
+# FIX: circuit breaker — after REDDIT_CIRCUIT_BREAK_THRESHOLD consecutive
+# 429/403 responses, the whole fetch loop pauses for this many seconds.
+REDDIT_CIRCUIT_BREAK_SECONDS   = int(os.getenv("REDDIT_CIRCUIT_BREAK_SECONDS", "300"))
+REDDIT_CIRCUIT_BREAK_THRESHOLD = int(os.getenv("REDDIT_CIRCUIT_BREAK_THRESHOLD", "3"))
+
+# FIX: exponential per-post cooldown: next_retry_at = now +
+# min(REDDIT_POST_RETRY_COOLDOWN_SECONDS * 2^retry_count, REDDIT_POST_MAX_COOLDOWN_SECONDS).
+# After REDDIT_POST_MAX_FAILED_ATTEMPTS failures the post stays
+# reddit_fetched=False but is pinned to the max (6h) cooldown.
+REDDIT_POST_MAX_COOLDOWN_SECONDS = int(os.getenv("REDDIT_POST_MAX_COOLDOWN_SECONDS", str(6 * 3600)))
+REDDIT_POST_MAX_FAILED_ATTEMPTS  = int(os.getenv("REDDIT_POST_MAX_FAILED_ATTEMPTS", "8"))
+# FIX: a 200 response with zero feed entries (or a 404) gets AT LEAST this
+# long a cooldown — it is not a transient network blip.
+REDDIT_EMPTY_COOLDOWN_SECONDS    = int(os.getenv("REDDIT_EMPTY_COOLDOWN_SECONDS", "600"))
+
+# FIX: optional proxy (e.g. http://user:pass@host:port). Applied to every
+# Reddit requests.get when set; behaves exactly as before when unset.
+REDDIT_PROXY_URL = os.getenv("REDDIT_PROXY_URL", "").strip()
 
 # ── flintel_google_posts CONFIG — UNCHANGED.
 REDDIT_FETCH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDDIT_FETCH_CHECK_INTERVAL_SECONDS", "30"))
@@ -405,6 +457,71 @@ async def verify_api_key(
 
 def _working(flag: bool) -> str:
     return "✅ Working" if flag else "❌ Not Working"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX: REDDIT POST URL NORMALIZATION — the root-cause fix.
+# Google SERP returns all sorts of reddit.com URLs (homepage, /search,
+# /policies, wiki pages, subreddit roots, business.reddit.com, user
+# profiles, and ?tl=fil / ?utm_* variants of the same post). The old code
+# accepted anything containing "reddit.com" and then blindly appended
+# ".rss", producing garbage such as "https://old.reddit.com.rss" or
+# "…/slug/?tl=da.rss". This function accepts ONLY real post URLs and
+# returns ONE canonical form per post.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# FIX: hosts allowed — reddit.com, www., old., np. only (NOT business.reddit.com,
+# NOT m., NOT redd.it, etc.).
+_REDDIT_ALLOWED_HOSTS = {"reddit.com", "www.reddit.com", "old.reddit.com", "np.reddit.com"}
+
+# FIX: /r/<sub>/comments/<id>[/<slug>][/anything-else-ignored]
+_REDDIT_POST_PATH_RE = re.compile(
+    r"^/r/([A-Za-z0-9_]+)/comments/([A-Za-z0-9]+)(?:/([^/]+))?(?:/.*)?$"
+)
+
+# FIX: loose "is this even a post URL?" regex used ONLY by the startup
+# cleanup query (same pattern the request specified).
+_REDDIT_POST_LOOSE_RE = re.compile(r"reddit\.com/r/[^/]+/comments/")
+
+# FIX: shape of an already-canonical URL — used by cleanup to find
+# documents that still need rewriting.
+_REDDIT_CANONICAL_RE = re.compile(
+    r"^https://www\.reddit\.com/r/[^/?#]+/comments/[^/?#]+/[^/?#]+/$"
+)
+
+
+def _normalize_reddit_post_url(url: str) -> str | None:
+    """FIX: Returns the canonical post URL
+        https://www.reddit.com/r/<sub>/comments/<id>/<slug>/
+    (no query string, no fragment, always www.reddit.com, always with a
+    trailing slash) for any http(s) URL of a Reddit POST on reddit.com /
+    www. / old. / np. — or None for everything else (homepage, /search,
+    /policies, wiki pages, subreddit roots, business.reddit.com, user
+    profiles, non-reddit hosts, garbage).
+
+    If the input has no slug (…/comments/<id>), the canonical form is
+    https://www.reddit.com/r/<sub>/comments/<id>/ — Reddit resolves that
+    fine, and it is still a stable, dedupable key."""
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return None
+
+    if parsed.scheme not in ("http", "https"):
+        return None
+    host = (parsed.hostname or "").lower()
+    if host not in _REDDIT_ALLOWED_HOSTS:
+        return None
+
+    m = _REDDIT_POST_PATH_RE.match(parsed.path or "")
+    if not m:
+        return None
+
+    sub, post_id, slug = m.groups()
+    base = f"https://www.reddit.com/r/{sub}/comments/{post_id}/"
+    return f"{base}{slug}/" if slug else base
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,10 +594,9 @@ RESULT_LIST_KEY_CANDIDATES = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUZZY KEYWORD GENERATION + MATCHING — UNCHANGED from v9.12. This is the
-# only relevance filter left in the whole file: a fetched Reddit post is
-# only saved into flintel_signals if it matches its own stored
-# search_keyword / fuzzy_keywords.
+# FUZZY KEYWORD GENERATION + MATCHING — UNCHANGED from v9.12. Fuzzy
+# variants are used at SERP-discovery time to resolve which keyword a
+# batched SERP result belongs to.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _FUZZY_STOPWORDS = {
@@ -707,15 +823,17 @@ def mark_keyword_fetched(keyword: str):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT — SOLE discovery mechanism: RapidAPI SERP search
-# (site:reddit.com). UNCHANGED from v9.12 — same single RapidAPI call,
-# same independent host, same try/except.
+# (site:reddit.com). Same single RapidAPI call, same independent host,
+# same try/except. FIX: result URLs are now validated + canonicalized +
+# deduped via _normalize_reddit_post_url() instead of a bare
+# `"reddit.com" in url` check.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK) -> list:
-    """UNCHANGED, one-keyword-per-call version. Kept in place for
-    reference / backward compatibility — the live discovery loop below
-    now calls the batched version (search_google_for_keywords_batch)
-    instead, to cut RapidAPI usage. This function itself is untouched."""
+    """One-keyword-per-call version. Kept in place for reference /
+    backward compatibility — the live discovery loop below now calls the
+    batched version (search_google_for_keywords_batch) instead.
+    FIX: now also uses _normalize_reddit_post_url() + canonical dedupe."""
     if not RAPIDAPI_KEY:
         log.warning("[SERP] RapidAPI key not set — skipping SERP search.")
         return []
@@ -748,18 +866,30 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
         raw_items = _dig_list(result_data, RESULT_LIST_KEY_CANDIDATES)
         results = []
         rank_misses = 0
+        non_post_count = 0   # FIX: non-post reddit / non-reddit URLs skipped
+        dupe_count = 0       # FIX: same post under a different ?tl=/utm variant
+        seen_canonical = set()  # FIX: dedupe by canonical URL
         for pos, item in enumerate(raw_items, start=1):
             if not isinstance(item, dict):
                 continue
             item_url = item.get("url", "") or item.get("link", "")
-            if "reddit.com" not in item_url:
+
+            # FIX: was `if "reddit.com" not in item_url: continue`
+            canonical_url = _normalize_reddit_post_url(item_url)
+            if canonical_url is None:
+                non_post_count += 1
                 continue
+            if canonical_url in seen_canonical:
+                dupe_count += 1
+                continue
+            seen_canonical.add(canonical_url)
+
             rank = _dig_value(item, RANK_FIELD_CANDIDATES)
             if rank is None:
                 rank = pos
                 rank_misses += 1
             results.append({
-                "url":   item_url,
+                "url":   canonical_url,  # FIX: canonical, never the raw SERP URL
                 "rank":  rank,
                 "title": item.get("title", ""),
             })
@@ -768,6 +898,12 @@ def search_google_for_keyword(keyword: str, months_back: int = SERP_MONTHS_BACK)
             log.warning(
                 f"[SERP] '{keyword}' — no explicit rank field found in any result "
                 f"(tried {RANK_FIELD_CANDIDATES}); used result order as rank fallback."
+            )
+
+        if non_post_count or dupe_count:
+            log.info(
+                f"[SERP] '{keyword}' — skipped {non_post_count} non-post URL(s), "
+                f"deduped {dupe_count} variant URL(s) of the same post."
             )
 
         log.info(
@@ -821,6 +957,11 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
     _find_best_matching_keyword) before flintel_google_posts ever sees
     it, so save_google_post(), fuzzy_keywords generation, the Reddit
     fetch loop, and signal storage all keep working exactly as before.
+
+    FIX: result URLs are validated/canonicalized with
+    _normalize_reddit_post_url() (non-post URLs are skipped and counted
+    as non-post) and deduped by canonical URL, so ?tl=fil / ?tl=da
+    variants of the same post become ONE result.
     """
     if not RAPIDAPI_KEY:
         log.warning("[SERP-BATCH] RapidAPI key not set — skipping SERP search.")
@@ -870,12 +1011,12 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
         # log is ambiguous: it could mean RapidAPI itself returned 0
         # hits for the batched query, OR it could mean RapidAPI returned
         # results but every single one got filtered out locally (either
-        # not a reddit.com URL, or couldn't be attributed back to one
+        # not a reddit post URL, or couldn't be attributed back to one
         # of the batch's keywords). This line tells you which.
         log.info(
             f"[SERP-BATCH] RAW response for batch {keywords_batch!r} → "
             f"{len(raw_items)} raw item(s) from RapidAPI (requested limit:{requested_limit}, "
-            f"before reddit-domain / keyword-attribution filtering) | query:{query!r}"
+            f"before reddit-post-URL / keyword-attribution filtering) | query:{query!r}"
         )
         if len(raw_items) == 0:
             log.warning(
@@ -891,31 +1032,42 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
 
         results = []
         rank_misses = 0
-        non_reddit_count = 0
+        non_reddit_count = 0   # FIX: now means "not a real reddit POST url" (was "not reddit.com")
+        dupe_count = 0         # FIX: canonical-URL duplicates (?tl=fil / ?tl=da / utm variants)
         skipped_unattributed = 0
         unattributed_samples = []
+        seen_canonical = set()  # FIX: dedupe by canonical URL
         for pos, item in enumerate(raw_items, start=1):
             if not isinstance(item, dict):
                 continue
             item_url = item.get("url", "") or item.get("link", "")
-            if "reddit.com" not in item_url:
+
+            # FIX: was `if "reddit.com" not in item_url: ...continue`
+            # Now: only real post URLs survive, in canonical form.
+            canonical_url = _normalize_reddit_post_url(item_url)
+            if canonical_url is None:
                 non_reddit_count += 1
                 continue
+            if canonical_url in seen_canonical:
+                dupe_count += 1
+                continue
+
             rank = _dig_value(item, RANK_FIELD_CANDIDATES)
             if rank is None:
                 rank = pos
                 rank_misses += 1
             title = item.get("title", "")
 
-            matched_keyword = _find_best_matching_keyword(f"{title} {item_url}", keywords_batch)
+            matched_keyword = _find_best_matching_keyword(f"{title} {canonical_url}", keywords_batch)
             if matched_keyword is None:
                 skipped_unattributed += 1
                 if len(unattributed_samples) < 5:
-                    unattributed_samples.append({"title": title, "url": item_url})
+                    unattributed_samples.append({"title": title, "url": canonical_url})
                 continue
 
+            seen_canonical.add(canonical_url)
             results.append({
-                "url":     item_url,
+                "url":     canonical_url,  # FIX: canonical, never the raw SERP URL
                 "rank":    rank,
                 "title":   title,
                 "keyword": matched_keyword,
@@ -930,7 +1082,14 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
         if non_reddit_count:
             log.info(
                 f"[SERP-BATCH] batch {keywords_batch!r} — {non_reddit_count} raw item(s) were "
-                f"not reddit.com URLs — filtered out."
+                f"not real reddit POST URLs (homepage/search/wiki/profile/subreddit root/other host) "
+                f"— filtered out."
+            )
+
+        if dupe_count:
+            log.info(
+                f"[SERP-BATCH] batch {keywords_batch!r} — {dupe_count} raw item(s) were duplicate "
+                f"variants (?tl=/utm/old./np.) of a post already in this batch — deduped."
             )
 
         if skipped_unattributed:
@@ -967,13 +1126,25 @@ def is_post_already_signaled(post_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# flintel_google_posts HELPERS — UNCHANGED from v9.12 (now on db2).
+# flintel_google_posts HELPERS — same schema/collection/indexes as v9.12
+# (on db2). FIX: save_google_post() canonicalizes, retry cooldown is now
+# exponential and stores retry_count, startup cleanup added.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit: str, fuzzy_keywords: list) -> bool:
     """Insert-only upsert — a post_url already tracked here is NEVER
     overwritten. Returns True only when this call genuinely inserted a
-    brand-new document."""
+    brand-new document.
+
+    FIX: post_url is canonicalized first (belt-and-braces — the SERP
+    functions already do this), and anything that isn't a real Reddit
+    post URL is refused instead of being stored."""
+    canonical_url = _normalize_reddit_post_url(post_url)  # FIX
+    if canonical_url is None:                             # FIX
+        log.debug(f"[GOOGLE-POSTS] refused non-post URL: {post_url!r}")
+        return False
+    post_url = canonical_url                              # FIX
+
     now = datetime.now(timezone.utc)
     try:
         result = db2.flintel_google_posts.update_one(
@@ -987,6 +1158,7 @@ def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit:
                 "reddit_fetched":  False,
                 "fuzzy_matched":   None,
                 "next_retry_at":   None,
+                "retry_count":     0,  # FIX: exponential-backoff counter
                 "discovered_at":   now,
                 "fetched_at":      None,
             }},
@@ -1033,68 +1205,247 @@ def mark_google_post_fetched(post_url: str, fuzzy_matched):
         log.error(f"[GOOGLE-POSTS] mark_google_post_fetched error for {post_url}: {exc}")
 
 
-def set_google_post_retry_cooldown(post_url: str, cooldown_seconds: int = REDDIT_POST_RETRY_COOLDOWN_SECONDS):
+def _compute_post_cooldown_seconds(reason: str, retry_count: int) -> int:
+    """FIX: exponential per-post cooldown.
+
+        cooldown = min(REDDIT_POST_RETRY_COOLDOWN_SECONDS * 2^retry_count,
+                       REDDIT_POST_MAX_COOLDOWN_SECONDS)          # 20s * 2^n, cap 6h
+
+    - `retry_count` is the number of failed attempts BEFORE this one.
+    - "empty" (200 with zero entries) and "not_found" get a longer floor
+      (REDDIT_EMPTY_COOLDOWN_SECONDS, default 10 min) because retrying
+      them in 20s is pointless — they are not transient network blips.
+    - Once this failure makes it REDDIT_POST_MAX_FAILED_ATTEMPTS (8)
+      failures, the post is pinned to the max (6h) cooldown. It stays
+      reddit_fetched=False (never permanently abandoned)."""
+    if retry_count + 1 >= REDDIT_POST_MAX_FAILED_ATTEMPTS:
+        return REDDIT_POST_MAX_COOLDOWN_SECONDS
+
+    cooldown = REDDIT_POST_RETRY_COOLDOWN_SECONDS * (2 ** min(retry_count, 20))
+    if reason in ("empty", "not_found"):
+        cooldown = max(cooldown, REDDIT_EMPTY_COOLDOWN_SECONDS)
+    return int(min(cooldown, REDDIT_POST_MAX_COOLDOWN_SECONDS))
+
+
+def set_google_post_retry_cooldown(post_url: str, reason: str = "network", retry_count: int = 0):
     """Called when a specific post_url's Reddit RSS fetch genuinely
-    failed. Keeps reddit_fetched=False but stamps next_retry_at."""
+    failed. Keeps reddit_fetched=False but stamps next_retry_at.
+
+    FIX: was a flat 20s. Now exponential (see _compute_post_cooldown_seconds)
+    and the new attempt count is persisted in `retry_count` on the same
+    flintel_google_posts document."""
     now = datetime.now(timezone.utc)
+    cooldown_seconds = _compute_post_cooldown_seconds(reason, retry_count)
+    new_retry_count = retry_count + 1
     next_retry = now + timedelta(seconds=cooldown_seconds)
     try:
         db2.flintel_google_posts.update_one(
             {"post_url": post_url},
-            {"$set": {"next_retry_at": next_retry}},
+            {"$set": {"next_retry_at": next_retry, "retry_count": new_retry_count}},
         )
         log.info(
-            f"[GOOGLE-POSTS] '{post_url}' cooldown set | next_retry_at:{next_retry.isoformat()} "
+            f"[GOOGLE-POSTS] '{post_url}' cooldown set | reason:{reason} | "
+            f"retry_count:{new_retry_count} | next_retry_at:{next_retry.isoformat()} "
             f"({cooldown_seconds}s from now) — will not be re-attempted before then"
         )
     except Exception as exc:
         log.error(f"[GOOGLE-POSTS] set_google_post_retry_cooldown error for {post_url}: {exc}")
 
 
+def cleanup_google_posts():
+    """FIX: startup cleanup for flintel_google_posts. Runs once, before the
+    worker threads start. No schema/index changes — only deletes junk and
+    rewrites post_url values to their canonical form.
+
+      1. DELETE documents with reddit_fetched == False whose post_url is
+         not a Reddit post (doesn't match reddit\\.com/r/[^/]+/comments/):
+         homepage, /search, /policies, wiki pages, subreddit roots, etc.
+      2. REWRITE / MERGE documents whose post_url is a real post but not
+         in canonical form (?tl=fil, ?utm_*, old./np./bare host, http://,
+         no trailing slash …):
+           - if no document with the canonical URL exists yet -> the
+             URL is rewritten in place;
+           - if one already exists -> the duplicate is deleted and one
+             is kept (preferring an already-fetched document, so a
+             finished post never gets re-fetched)."""
+    try:
+        # ── 1. delete unfetched non-post junk ────────────────────────────
+        del_result = db2.flintel_google_posts.delete_many({
+            "reddit_fetched": False,
+            "post_url": {"$not": _REDDIT_POST_LOOSE_RE},
+        })
+        junk_deleted = del_result.deleted_count
+
+        # ── 2. rewrite / merge non-canonical URLs ─────────────────────────
+        candidates = list(db2.flintel_google_posts.find(
+            {"post_url": {"$not": _REDDIT_CANONICAL_RE}},
+            {"_id": 1, "post_url": 1, "reddit_fetched": 1},
+        ))
+
+        rewritten, merged_dupes, skipped = 0, 0, 0
+        for doc in candidates:
+            old_url = doc.get("post_url", "")
+            canonical = _normalize_reddit_post_url(old_url)
+            if canonical is None:
+                skipped += 1   # not a post URL but already fetched — leave it alone
+                continue
+            if canonical == old_url:
+                continue
+
+            existing = db2.flintel_google_posts.find_one(
+                {"post_url": canonical}, {"_id": 1, "reddit_fetched": 1}
+            )
+            if existing is None:
+                db2.flintel_google_posts.update_one(
+                    {"_id": doc["_id"]}, {"$set": {"post_url": canonical}}
+                )
+                rewritten += 1
+            elif doc.get("reddit_fetched") and not existing.get("reddit_fetched"):
+                # the variant is already done, the canonical one isn't -> keep the finished one
+                db2.flintel_google_posts.delete_one({"_id": existing["_id"]})
+                db2.flintel_google_posts.update_one(
+                    {"_id": doc["_id"]}, {"$set": {"post_url": canonical}}
+                )
+                merged_dupes += 1
+            else:
+                db2.flintel_google_posts.delete_one({"_id": doc["_id"]})
+                merged_dupes += 1
+
+        log.info(
+            f"[CLEANUP] flintel_google_posts | deleted_unfetched_non_post:{junk_deleted} | "
+            f"urls_rewritten_to_canonical:{rewritten} | duplicate_variants_merged:{merged_dupes} | "
+            f"non_post_but_already_fetched_left_alone:{skipped}"
+        )
+    except Exception as exc:
+        log.error(f"[CLEANUP] cleanup_google_posts error: {exc}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT POST FETCH — public, credential-free per-post RSS feed ONLY.
-# UNCHANGED retry/backoff/parsing behavior from v9.12/v9.11. The ONLY
-# change: no more random-fallback upvotes/comments — those fields are
-# simply not generated or stored anymore.
+# No more random-fallback upvotes/comments — those fields are simply not
+# generated or stored anymore.
+#
+# FIX: rewritten request layer —
+#   * every request goes through ONE global rate limiter
+#   * optional proxy (REDDIT_PROXY_URL)
+#   * realistic browser headers
+#   * _reddit_get_with_retry() returns (response, reason) instead of just
+#     None, reason in: "ok" | "429" | "blocked" | "not_found" | "empty" | "network"
+#   * 429/403 are NOT retried in-place (retrying the same IP immediately
+#     only makes it worse) — the caller decides (cooldown + circuit breaker)
+#   * only transient "network" failures (timeouts, 5xx) are retried here
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _reddit_get_with_retry(url: str) -> requests.Response | None:
-    headers = {
+# FIX: global rate limiter state (shared by the fetch loop AND /reddit-test)
+_reddit_rate_lock = threading.Lock()
+_reddit_last_request_at = float("-inf")
+
+# FIX: log the first bytes of an "empty" response body ONCE per process so
+# you can tell whether it's a block page or a genuinely empty feed.
+_reddit_empty_body_logged = False
+
+
+def _reddit_rate_limit_wait():
+    """FIX: blocks until at least REDDIT_MIN_GAP_SECONDS (+ random jitter of
+    REDDIT_FETCH_JITTER_MIN..MAX) has elapsed since the previous Reddit
+    request from ANY thread. The sleep happens while holding the lock, so
+    concurrent callers queue up and are spaced out correctly."""
+    global _reddit_last_request_at
+    with _reddit_rate_lock:
+        gap = REDDIT_MIN_GAP_SECONDS + random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX)
+        wait = gap - (time.monotonic() - _reddit_last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _reddit_last_request_at = time.monotonic()
+
+
+def _reddit_proxies() -> dict | None:
+    """FIX: proxies dict for requests.get when REDDIT_PROXY_URL is set,
+    otherwise None (requests behaves exactly as before)."""
+    if REDDIT_PROXY_URL:
+        return {"http": REDDIT_PROXY_URL, "https": REDDIT_PROXY_URL}
+    return None
+
+
+def _reddit_headers() -> dict:
+    """FIX: browser-like headers with an RSS/Atom-friendly Accept."""
+    return {
         "User-Agent": REDDIT_USER_AGENT,
-        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+        "Accept": "application/atom+xml, application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
-    last_status = None
-    for attempt in range(1, REDDIT_FETCH_MAX_RETRIES + 1):
-        time.sleep(random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX))
-        try:
-            r = requests.get(url, headers=headers, timeout=REDDIT_JSON_TIMEOUT_SECONDS)
-            last_status = r.status_code
-            if r.status_code == 200:
-                return r
-            if r.status_code == 404:
-                log.debug(f"[REDDIT-FETCH] 404 (gone) for {url} — not retrying.")
-                return None
-            if r.status_code in (403, 429) or r.status_code >= 500:
-                wait = (REDDIT_FETCH_BACKOFF_BASE ** attempt) + random.uniform(0, 1.0)
-                log.warning(
-                    f"[REDDIT-FETCH] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
-                    f"got {r.status_code} for {url} — backing off {wait:.1f}s..."
-                )
-                time.sleep(wait)
-                continue
-            log.error(f"[REDDIT-FETCH] Unexpected status {r.status_code} for {url}")
-            return None
-        except requests.RequestException as exc:
-            log.warning(
-                f"[REDDIT-FETCH] Reddit fetch attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} "
-                f"network error for {url}: {exc}"
-            )
-            time.sleep((REDDIT_FETCH_BACKOFF_BASE ** attempt))
 
-    log.error(f"[REDDIT-FETCH] Reddit fetch exhausted {REDDIT_FETCH_MAX_RETRIES} attempts for {url} "
-              f"(last_status:{last_status})")
-    return None
+def _reddit_request_once(url: str) -> tuple:
+    """FIX: ONE rate-limited (optionally proxied) GET. Never retries.
+    Returns (response_or_None, reason, status_code_or_None, error_or_None).
+
+    reason:
+      "ok"        HTTP 200 with a non-empty body
+      "empty"     HTTP 200 with a completely empty body
+      "not_found" HTTP 404 / 410
+      "429"       HTTP 429 (rate limited)
+      "blocked"   HTTP 401 / 403 / 451 (IP or UA blocked)
+      "network"   timeout / connection error / 5xx / any unexpected status
+    """
+    _reddit_rate_limit_wait()
+    try:
+        r = requests.get(
+            url,
+            headers=_reddit_headers(),
+            timeout=REDDIT_JSON_TIMEOUT_SECONDS,
+            proxies=_reddit_proxies(),
+        )
+    except requests.RequestException as exc:
+        return None, "network", None, str(exc)
+
+    status = r.status_code
+    if status == 200:
+        return r, ("ok" if r.content and r.content.strip() else "empty"), status, None
+    if status in (404, 410):
+        return r, "not_found", status, None
+    if status == 429:
+        return r, "429", status, None
+    if status in (401, 403, 451):
+        return r, "blocked", status, None
+    # 5xx and anything unexpected -> treat as transient
+    return r, "network", status, None
+
+
+def _reddit_get_with_retry(url: str) -> tuple:
+    """FIX: returns (response_or_None, reason) — see _reddit_request_once()
+    for the reason values. Retries ONLY transient "network" failures (up to
+    REDDIT_FETCH_MAX_RETRIES, exponential backoff). 429 / blocked /
+    not_found / empty are returned immediately: retrying them in place just
+    burns requests against a limit that won't lift for minutes."""
+    last_reason = "network"
+    last_resp = None
+    for attempt in range(1, REDDIT_FETCH_MAX_RETRIES + 1):
+        r, reason, status, err = _reddit_request_once(url)
+        last_reason, last_resp = reason, r
+
+        if reason != "network":
+            if reason in ("429", "blocked"):
+                retry_after = r.headers.get("Retry-After") if r is not None else None
+                log.warning(
+                    f"[REDDIT-FETCH] {reason.upper()} (HTTP {status}) for {url}"
+                    f"{' | Retry-After:' + retry_after if retry_after else ''} — not retrying in place."
+                )
+            elif reason == "not_found":
+                log.debug(f"[REDDIT-FETCH] 404 (gone) for {url} — not retrying.")
+            return r, reason
+
+        # transient: network error / 5xx
+        if attempt < REDDIT_FETCH_MAX_RETRIES:
+            wait = (REDDIT_FETCH_BACKOFF_BASE ** attempt) + random.uniform(0, 1.0)
+            log.warning(
+                f"[REDDIT-FETCH] attempt {attempt}/{REDDIT_FETCH_MAX_RETRIES} transient failure "
+                f"(status:{status} err:{err}) for {url} — backing off {wait:.1f}s..."
+            )
+            time.sleep(wait)
+
+    log.error(f"[REDDIT-FETCH] exhausted {REDDIT_FETCH_MAX_RETRIES} attempts for {url} (last_reason:{last_reason})")
+    return last_resp, last_reason
 
 
 def _extract_reddit_submission_id(post_url: str) -> str | None:
@@ -1107,36 +1458,66 @@ def _extract_reddit_subreddit_from_url(post_url: str) -> str:
     return match.group(1) if match else ""
 
 
-def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | None:
-    """UNCHANGED retry/fallback behavior. No more upvotes/comments —
-    those fields are gone; only real, fetched content is returned."""
-    if not post_url:
-        return None
+def _fetch_and_parse_rss(rss_url: str) -> tuple:
+    """FIX: one _reddit_get_with_retry() + feedparser parse.
+    Returns (feed_or_None, reason). A 200 that parses to ZERO entries is
+    reported as "empty" (and the first 200 chars of the body are logged
+    once per process so you can see if it's a block/consent page)."""
+    global _reddit_empty_body_logged
 
-    primary_url = post_url.rstrip("/") + ".rss"
-    r = _reddit_get_with_retry(primary_url)
+    r, reason = _reddit_get_with_retry(rss_url)
+    if reason not in ("ok", "empty") or r is None:
+        return None, reason
 
-    if r is None and "old.reddit.com" not in post_url:
-        fallback_url = (
-            post_url.rstrip("/")
-            .replace("https://www.reddit.com", "https://old.reddit.com")
-            .replace("https://reddit.com", "https://old.reddit.com")
-            + ".rss"
-        )
+    feed = feedparser.parse(r.content)
+    if reason == "empty" or not feed.entries:
+        if not _reddit_empty_body_logged:
+            _reddit_empty_body_logged = True
+            preview = r.content[:200].decode("utf-8", errors="replace")
+            log.warning(
+                f"[REDDIT-FETCH] EMPTY feed (HTTP {r.status_code}, 0 entries) for {rss_url} | "
+                f"content-type:{r.headers.get('Content-Type')!r} | first 200 chars of body "
+                f"(logged once per process): {preview!r}"
+            )
+        return None, "empty"
+
+    return feed, "ok"
+
+
+def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> tuple:
+    """Fetches one post's public RSS feed.
+
+    FIX: now returns (item_or_None, reason) instead of just item_or_None,
+    so the fetch loop can react differently to 429 / blocked / empty /
+    not_found / network. reason is "ok" on success, or one of
+    "429" | "blocked" | "not_found" | "empty" | "network" | "invalid_url" | "parse_error".
+
+    FIX: the RSS URL is built from the CANONICAL post URL as
+    canonical + ".rss" (i.e. ".../slug/.rss") — never appended after a
+    query string. The old.reddit.com fallback is built the same way, and
+    is SKIPPED when the primary failed with 429/blocked (same IP, same
+    limit) — it is only tried on empty / not_found / network."""
+    canonical_url = _normalize_reddit_post_url(post_url)
+    if canonical_url is None:
+        log.error(f"[REDDIT-FETCH] not a Reddit post URL, refusing to fetch: {post_url!r}")
+        return None, "invalid_url"
+
+    primary_url = canonical_url + ".rss"
+    feed, reason = _fetch_and_parse_rss(primary_url)
+
+    if feed is None and reason in ("empty", "not_found", "network"):
+        fallback_url = canonical_url.replace("https://www.reddit.com", "https://old.reddit.com") + ".rss"
         if fallback_url != primary_url:
-            log.info(f"[REDDIT-FETCH] Retrying via old.reddit.com fallback: {fallback_url}")
-            r = _reddit_get_with_retry(fallback_url)
+            log.info(f"[REDDIT-FETCH] primary failed ({reason}) — retrying via old.reddit.com fallback: {fallback_url}")
+            feed, reason = _fetch_and_parse_rss(fallback_url)
+    elif feed is None:
+        log.info(f"[REDDIT-FETCH] primary failed with {reason} — skipping old.reddit.com fallback (same IP, same limit)")
 
-    if r is None:
-        log.error(f"[REDDIT-FETCH] fetch_reddit_post_by_url gave up for {post_url}")
-        return None
+    if feed is None:
+        log.error(f"[REDDIT-FETCH] fetch_reddit_post_by_url gave up for {post_url} (reason:{reason})")
+        return None, reason
 
     try:
-        feed = feedparser.parse(r.content)
-        if not feed.entries:
-            log.error(f"[REDDIT-FETCH] fetch_reddit_post_by_url: RSS feed had no entries for {post_url}")
-            return None
-
         entry = feed.entries[0]
 
         title = (entry.get("title", "") or "").strip()
@@ -1150,7 +1531,7 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
             text = f"{title}\n\n{summary_plain}"
 
         author = (entry.get("author", "") or "unknown").lstrip("u/").lstrip("/u/").strip() or "unknown"
-        subreddit = _extract_reddit_subreddit_from_url(post_url)
+        subreddit = _extract_reddit_subreddit_from_url(canonical_url)
 
         posted_at = None
         published = entry.get("published") or entry.get("updated")
@@ -1161,9 +1542,9 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
             except (TypeError, ValueError):
                 posted_at = published
 
-        submission_id = _extract_reddit_submission_id(post_url)
+        submission_id = _extract_reddit_submission_id(canonical_url)
         message_id = f"reddit_serp_{submission_id}" if submission_id else (
-            f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', post_url)[-40:]}"
+            f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', canonical_url)[-40:]}"
         )
 
         return {
@@ -1172,14 +1553,14 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> dict | N
             "text":                 text,
             "username":             author,
             "subreddit_or_channel": subreddit,
-            "post_url":             post_url,
+            "post_url":             post_url,   # keep the URL exactly as stored in flintel_google_posts
             "posted_at":            posted_at,
             "search_keyword":       keyword,
             "google_rank":          rank,
-        }
+        }, "ok"
     except Exception as exc:
         log.error(f"[REDDIT-FETCH] fetch_reddit_post_by_url parse error for {post_url}: {exc}")
-        return None
+        return None, "parse_error"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1340,7 +1721,7 @@ def backfill_missing_embeddings():
 # connection), no batching, no scoring. This is what replaces the old
 # queue -> Claude -> save flow. NOW ALSO generates one embedding from
 # this document's own `text` right before the first insert (ported
-# as-is from flintel.py's _save_signal()).
+# as-is from flintel.py's _save_signal()). UNCHANGED in this version.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_signal(item: dict) -> bool:
@@ -1394,7 +1775,8 @@ def save_signal(item: dict) -> bool:
 # SERP DISCOVERY — process_one_keyword() / process_keywords_batch() ONLY
 # run the Google SERP call(s) and persist results into
 # flintel_google_posts. Reddit is NEVER fetched here — SERP's job is
-# done the moment these functions return.
+# done the moment these functions return. UNCHANGED (URLs coming out of
+# the search functions are already canonical — see FIX notes above).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_one_keyword(keyword: str) -> tuple:
@@ -1515,8 +1897,18 @@ def run_serp_discovery_loop():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REDDIT FETCH LOOP — reads flintel_google_posts directly, fetches RSS,
-# fuzzy-filters, and on a match SAVES DIRECTLY into flintel_signals. No
+# and on a successful fetch SAVES DIRECTLY into flintel_signals. No
 # queue, no batching, no Claude call anywhere in this loop.
+#
+# FIX: reacts to the fetch reason —
+#   * circuit breaker: REDDIT_CIRCUIT_BREAK_THRESHOLD (3) consecutive
+#     429/403 responses -> the WHOLE loop pauses for
+#     REDDIT_CIRCUIT_BREAK_SECONDS (300s) instead of hammering Reddit
+#     through every remaining post
+#   * exponential per-post cooldown with retry_count
+#   * "empty"/"not_found" get a longer cooldown than network errors
+#   * the old extra SERP_FETCH_SLEEP_SECONDS sleep is gone — the global
+#     rate limiter in _reddit_rate_limit_wait() now spaces requests
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_reddit_fetch_loop():
@@ -1539,14 +1931,23 @@ def run_reddit_fetch_loop():
     log.info(
         f"[REDDIT-FETCH] Loop started | reads directly from flintel_google_posts | "
         f"check_interval:{REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | "
-        f"retry_cooldown:{REDDIT_POST_RETRY_COOLDOWN_SECONDS}s | "
+        f"per-post cooldown: exponential {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s*2^n "
+        f"(cap {REDDIT_POST_MAX_COOLDOWN_SECONDS}s, pinned after {REDDIT_POST_MAX_FAILED_ATTEMPTS} failures, "
+        f"empty/404 floor {REDDIT_EMPTY_COOLDOWN_SECONDS}s) | "
+        f"rate limit: min gap {REDDIT_MIN_GAP_SECONDS}s + jitter | "
+        f"circuit breaker: {REDDIT_CIRCUIT_BREAK_THRESHOLD} consecutive 429/403 -> pause {REDDIT_CIRCUIT_BREAK_SECONDS}s | "
+        f"proxy: {'ON' if REDDIT_PROXY_URL else 'off'} | "
         f"fetch method: public per-post RSS only, credential-free "
-        f"({REDDIT_FETCH_MAX_RETRIES}x backoff + old.reddit.com fallback, no OAuth/PRAW) | "
+        f"(canonical URL + '.rss', old.reddit.com fallback only on empty/404/network, no OAuth/PRAW) | "
         f"on successful post_url fetch -> saved DIRECTLY into flintel_signals "
         f"(no post-fetch content/fuzzy filter, no queue/batch/Claude) | "
         f"embeddings: {'ENABLED — model=' + EMBEDDING_MODEL if _is_embedding_enabled() else 'DISABLED'} "
         f"(one per newly saved signal, generated inside save_signal())"
     )
+
+    # FIX: circuit-breaker state. Lives outside the while-loop so a run of
+    # 429s that straddles two passes still counts as "consecutive".
+    consecutive_blocks = 0
 
     while True:
         try:
@@ -1557,13 +1958,15 @@ def run_reddit_fetch_loop():
 
             log.info(f"[REDDIT-FETCH] {len(due_posts)} post(s) due for Reddit RSS fetch this pass")
 
-            saved_count, dupe_count, fail_count = 0, 0, 0
+            saved_count, dupe_count, fail_count, invalid_count = 0, 0, 0, 0
+            breaker_tripped = False
 
             for doc in due_posts:
                 post_url       = doc["post_url"]
                 search_keyword = doc.get("search_keyword", "")
                 subreddit      = doc.get("subreddit", "")
                 google_rank    = doc.get("google_rank")
+                retry_count    = int(doc.get("retry_count") or 0)  # FIX
 
                 if is_post_already_signaled(post_url):
                     mark_google_post_fetched(post_url, fuzzy_matched=None)
@@ -1571,22 +1974,41 @@ def run_reddit_fetch_loop():
                     log.info(f"[REDDIT-FETCH] SKIP (already in flintel_signals) | {post_url}")
                     continue
 
-                item = fetch_reddit_post_by_url(post_url, search_keyword, google_rank)
+                item, reason = fetch_reddit_post_by_url(post_url, search_keyword, google_rank)  # FIX: (item, reason)
+
                 if not item:
-                    set_google_post_retry_cooldown(post_url)
+                    # FIX: a URL that isn't a Reddit post can never succeed — don't retry it forever.
+                    if reason == "invalid_url":
+                        mark_google_post_fetched(post_url, fuzzy_matched=None)
+                        invalid_count += 1
+                        continue
+
+                    # FIX: exponential cooldown + retry_count, reason-aware
+                    set_google_post_retry_cooldown(post_url, reason=reason, retry_count=retry_count)
                     fail_count += 1
                     log.warning(
-                        f"[REDDIT-FETCH] fetch FAILED (retries exhausted) | {post_url} | "
+                        f"[REDDIT-FETCH] fetch FAILED | reason:{reason} | {post_url} | "
                         f"left reddit_fetched=False — will retry after cooldown"
                     )
-                    time.sleep(SERP_FETCH_SLEEP_SECONDS)
-                    continue
+
+                    # FIX: circuit breaker bookkeeping
+                    if reason in ("429", "blocked"):
+                        consecutive_blocks += 1
+                    elif reason in ("empty", "not_found"):
+                        consecutive_blocks = 0   # Reddit answered normally — we're not being throttled
+                    # "network"/"parse_error": leave the counter untouched
+
+                    if consecutive_blocks >= REDDIT_CIRCUIT_BREAK_THRESHOLD:
+                        breaker_tripped = True
+                        break
+                    continue  # FIX: no extra sleep — the global rate limiter spaces requests
 
                 # ── post_url fetch SUCCEEDED — save straight into
                 # flintel_signals, tagged with its search_keyword. No
                 # content/fuzzy check anymore, no queue, no batch, no
                 # Claude. save_signal() itself now also generates an
                 # embedding from this document's own text.
+                consecutive_blocks = 0  # FIX: a good response resets the breaker
                 item["subreddit_or_channel"] = subreddit or item.get("subreddit_or_channel", "")
                 saved = save_signal(item)
                 mark_google_post_fetched(post_url, fuzzy_matched=True)
@@ -1598,12 +2020,25 @@ def run_reddit_fetch_loop():
                     f"keyword:{search_keyword!r} | subreddit:{subreddit!r} | google_rank:{google_rank} | "
                     f"marked reddit_fetched=True PERMANENTLY"
                 )
-                time.sleep(SERP_FETCH_SLEEP_SECONDS)
 
             log.info(
-                f"[REDDIT-FETCH] Pass complete | due:{len(due_posts)} | saved:{saved_count} | "
-                f"already_signaled:{dupe_count} | failed_will_retry:{fail_count}"
+                f"[REDDIT-FETCH] Pass {'ABORTED (circuit breaker)' if breaker_tripped else 'complete'} | "
+                f"due:{len(due_posts)} | saved:{saved_count} | already_signaled:{dupe_count} | "
+                f"invalid_url_skipped:{invalid_count} | failed_will_retry:{fail_count}"
             )
+
+            # FIX: circuit breaker — pause the whole loop instead of hammering Reddit
+            if breaker_tripped:
+                log.error(
+                    f"[REDDIT-FETCH] ⛔ CIRCUIT BREAKER TRIPPED — {consecutive_blocks} consecutive "
+                    f"429/403 responses. Reddit is rate-limiting/blocking this IP"
+                    f"{' (proxy in use: ' + 'yes)' if REDDIT_PROXY_URL else ' (no proxy configured — consider REDDIT_PROXY_URL)'}. "
+                    f"Pausing the ENTIRE Reddit fetch loop for {REDDIT_CIRCUIT_BREAK_SECONDS}s "
+                    f"instead of continuing through the remaining posts."
+                )
+                consecutive_blocks = 0
+                time.sleep(REDDIT_CIRCUIT_BREAK_SECONDS)
+                log.info("[REDDIT-FETCH] circuit breaker pause over — resuming.")
 
         except Exception as exc:
             log.error(f"[REDDIT-FETCH] loop error: {exc}")
@@ -1620,9 +2055,9 @@ async def start_reddit_listener():
          batched GOOGLE_SERP_BATCH keywords per RapidAPI call, saves
          results into flintel_google_posts.
       2. Reddit fetch (run_reddit_fetch_loop) — reads
-         flintel_google_posts directly, fetches RSS, fuzzy-filters,
-         saves matches straight into flintel_signals (embedding
-         generated inside save_signal()).
+         flintel_google_posts directly, fetches RSS, saves successful
+         fetches straight into flintel_signals (embedding generated
+         inside save_signal()).
     No batch/Claude thread anymore — nothing left to score."""
     if not REDDIT_ENABLED:
         log.warning("Reddit platform DISABLED — skipping.")
@@ -1650,12 +2085,12 @@ async def start_reddit_listener():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — read-only endpoints
+# FASTAPI — read-only endpoints (+ FIX: /reddit-test diagnostic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Flintel index.py — Reddit-only (Google SERP discovery, batched GOOGLE_SERP_BATCH/keywords per call -> flintel_google_posts -> Reddit RSS fetch -> flintel_signals + embeddings, no Claude, no search_volume, no engagement, no Twitter)",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -1691,7 +2126,7 @@ def root():
         "platforms":               ["reddit"],
         "reddit_enabled":          REDDIT_ENABLED,
         "reddit_status":           _working(REDDIT_ENABLED and bool(RAPIDAPI_KEY)),
-        "reddit_fetch_method":     "public per-post RSS (credential-free, smart-retry + old.reddit.com fallback) — no OAuth/PRAW, no .json endpoint anywhere",
+        "reddit_fetch_method":     "public per-post RSS (credential-free, canonical URL + '.rss', rate-limited, circuit-breaker, old.reddit.com fallback only on empty/404/network) — no OAuth/PRAW, no .json endpoint anywhere",
         "reddit_search_keywords":  len(REDDIT_SEARCH_KEYWORDS),
         "keyword_check_interval_seconds": KEYWORD_CHECK_INTERVAL_SECONDS,
         "keyword_cache":           "ENABLED — fetch-once-forever, restart-safe (flintel_keywords)",
@@ -1704,6 +2139,9 @@ def root():
         "google_posts_fuzzy_no_match":        fuzzy_no_match_posts,
         "reddit_fetch_check_interval_seconds": REDDIT_FETCH_CHECK_INTERVAL_SECONDS,
         "reddit_post_retry_cooldown_seconds":  REDDIT_POST_RETRY_COOLDOWN_SECONDS,
+        "reddit_min_gap_seconds":              REDDIT_MIN_GAP_SECONDS,        # FIX
+        "reddit_circuit_break_seconds":        REDDIT_CIRCUIT_BREAK_SECONDS,  # FIX
+        "reddit_proxy_configured":             bool(REDDIT_PROXY_URL),        # FIX
         "keywords_tracked":        total_keywords_tracked,
         "keywords_due_now":        due_now_count,
         "serp_months_back":        SERP_MONTHS_BACK,
@@ -1816,6 +2254,73 @@ def get_signals(limit: int = 50, search_keyword: str = None, platform: str = Non
     return {"count": len(signals), "signals": _serialise(signals)}
 
 
+@app.get("/reddit-test", dependencies=[Depends(verify_api_key)])
+def reddit_test(url: str, old: bool = False):
+    """FIX: diagnostic endpoint. Fetches ONE Reddit post's RSS feed using
+    the SAME request layer as the fetch loop (canonical URL + '.rss',
+    global rate limiter, browser headers, optional proxy) — but a single
+    attempt with no retries, and without touching the circuit breaker or
+    any collection — so you can tell from the deployed server whether
+    Reddit is blocking your IP.
+
+        GET /reddit-test?url=https://www.reddit.com/r/<sub>/comments/<id>/<slug>/
+        GET /reddit-test?url=...&old=true      # test the old.reddit.com host instead
+
+    Only Reddit POST URLs are accepted (anything else -> 400)."""
+    canonical = _normalize_reddit_post_url(url)
+    if canonical is None:
+        raise HTTPException(
+            status_code=400,
+            detail="url must be a Reddit post URL like https://www.reddit.com/r/<sub>/comments/<id>/<slug>/",
+        )
+
+    target = canonical
+    if old:
+        target = canonical.replace("https://www.reddit.com", "https://old.reddit.com")
+    rss_url = target + ".rss"
+
+    started = time.monotonic()
+    r, reason, status, err = _reddit_request_once(rss_url)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    entries = 0
+    body_preview = ""
+    content_type = None
+    final_url = None
+    retry_after = None
+    if r is not None:
+        content_type = r.headers.get("Content-Type")
+        retry_after = r.headers.get("Retry-After")
+        final_url = r.url
+        body_preview = r.content[:300].decode("utf-8", errors="replace")
+        try:
+            entries = len(feedparser.parse(r.content).entries)
+        except Exception:
+            entries = 0
+        if reason == "ok" and entries == 0:
+            reason = "empty"
+
+    return {
+        "input_url":               url,
+        "canonical_url":           canonical,
+        "final_url_requested":     rss_url,
+        "final_url_after_redirects": final_url,
+        "status_code":             status,
+        "reason":                  reason,
+        "feed_entries":            entries,
+        "body_first_300_chars":    body_preview,
+        "content_type":            content_type,
+        "retry_after":             retry_after,
+        "network_error":           err,
+        "proxy_used":              bool(REDDIT_PROXY_URL),
+        "user_agent":              REDDIT_USER_AGENT,
+        "elapsed_ms":              elapsed_ms,
+        "note":                    "Single attempt, rate-limited via the shared limiter (may wait up to "
+                                   f"~{REDDIT_MIN_GAP_SECONDS + REDDIT_FETCH_JITTER_MAX:.0f}s). "
+                                   "429 or 403 here => Reddit is blocking/throttling this server's IP.",
+    }
+
+
 def run_fastapi():
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
@@ -1828,6 +2333,10 @@ async def main():
     api_thread = threading.Thread(target=run_fastapi, daemon=True, name="FastAPI")
     api_thread.start()
     log.info("FastAPI running at http://0.0.0.0:8000")
+
+    # FIX: startup cleanup of flintel_google_posts (junk non-post URLs +
+    # ?tl=/utm duplicate variants) BEFORE the worker threads start.
+    cleanup_google_posts()
 
     await asyncio.gather(
         start_reddit_listener(),
@@ -1859,18 +2368,25 @@ if __name__ == "__main__":
     log.info(f"  Client                : {CLIENT_ID}")
     log.info(f"  Reddit                : {REDDIT_ENABLED} | {_working(REDDIT_ENABLED and bool(RAPIDAPI_KEY))}")
     log.info(f"  Reddit fetch method   : public per-post RSS only — credential-free, no OAuth/PRAW, no .json anywhere")
+    # FIX: new startup log lines
+    log.info(f"  Reddit URL handling   : canonical post URLs only (…/comments/<id>/<slug>/ + '.rss'); non-post URLs skipped, ?tl=/utm variants deduped")
+    log.info(f"  Reddit rate limit     : min gap {REDDIT_MIN_GAP_SECONDS}s + {REDDIT_FETCH_JITTER_MIN}-{REDDIT_FETCH_JITTER_MAX}s jitter, shared by every Reddit request")
+    log.info(f"  Circuit breaker       : {REDDIT_CIRCUIT_BREAK_THRESHOLD} consecutive 429/403 -> pause fetch loop {REDDIT_CIRCUIT_BREAK_SECONDS}s")
+    log.info(f"  Post retry cooldown   : exponential {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s*2^retry_count, cap {REDDIT_POST_MAX_COOLDOWN_SECONDS}s, pinned after {REDDIT_POST_MAX_FAILED_ATTEMPTS} failures; empty/404 floor {REDDIT_EMPTY_COOLDOWN_SECONDS}s")
+    log.info(f"  Reddit proxy          : {'ON (REDDIT_PROXY_URL set)' if REDDIT_PROXY_URL else 'off (set REDDIT_PROXY_URL to route Reddit requests through a proxy)'}")
     log.info(f"  Reddit keywords       : {len(REDDIT_SEARCH_KEYWORDS)} (used ONLY to seed brand-new flintel_keywords docs)")
     log.info(f"  Keyword cache         : flintel_keywords (MONGODB2) — fetch-once-forever")
     log.info(f"  Google SERP           : search_google_for_keywords_batch() — {GOOGLE_SERP_BATCH} keyword(s) OR'd into ONE RapidAPI call (cost control)")
-    log.info(f"  flintel_google_posts  : (MONGODB2) stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched")
-    log.info(f"  Reddit fetch interval : check every {REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s | retry cooldown {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s on genuine fetch failure")
-    log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time — used to filter fetched RSS content")
-    log.info(f"  Signal storage        : (MONGODB primary) direct save into flintel_signals on fuzzy match — NO queue, NO batch, NO Claude")
+    log.info(f"  flintel_google_posts  : (MONGODB2) stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched + retry_count")
+    log.info(f"  Reddit fetch interval : check every {REDDIT_FETCH_CHECK_INTERVAL_SECONDS}s")
+    log.info(f"  Fuzzy keywords        : Python auto-generated per SERP result at save time — used at SERP time to attribute batched results to a keyword")
+    log.info(f"  Signal storage        : (MONGODB primary) direct save into flintel_signals on successful fetch — NO queue, NO batch, NO Claude")
     log.info(f"  Embeddings            : {'ENABLED — model=' + EMBEDDING_MODEL if _is_embedding_enabled() else 'DISABLED (set OPENAI_API_KEY + EMBEDDING_ENABLED=True to enable)'} (checked live from .env, one embedding per newly saved signal, generated inside save_signal())")
     log.info(f"  RapidAPI config       : {bool(RAPIDAPI_KEY)} (SOLE provider — Google SERP discovery only now, batched {GOOGLE_SERP_BATCH}/call)")
     log.info(f"  MongoDB DB (primary)  : {MONGODB_DB}")
     log.info(f"  MongoDB2 DB (secondary): {MONGODB2_DB}")
     log.info(f"  API auth              : {'True | ' + _working(True) if API_KEY else 'False | ' + _working(False)}")
+    log.info(f"  Diagnostics           : GET /reddit-test?url=<reddit post url> (API-key protected)")
     log.info(f"  Embedding backfill    : run with --backfill-embeddings for historical docs missing an embedding")
     log.info("=" * 70)
 
