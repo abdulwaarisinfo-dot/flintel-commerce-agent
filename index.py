@@ -1949,6 +1949,8 @@ _MYSQL_INSERT_SQL = (
 _mysql_local = threading.local()          # one connection PER THREAD
 _mysql_table_ready = False
 _mysql_table_lock = threading.Lock()
+_mysql_insert_count = 0
+_mysql_insert_count_lock = threading.Lock()
 
 
 # ── Embedding <-> BLOB (float32, little-endian, flat bytes) ──────────────────
@@ -2211,9 +2213,32 @@ def _save_to_mysql(doc: dict) -> bool:
         row = _build_mysql_row(doc)
 
         def op(conn):
+            global _mysql_insert_count
             _ensure_mysql_table(conn)
             with conn.cursor() as cur:
                 cur.execute(_MYSQL_INSERT_SQL, row)
+                inserted = cur.rowcount == 1
+            if not inserted:
+                return False
+
+            emb_blob = row[_MYSQL_COLUMNS.index("embedding")]
+            log.info(
+                f"[MYSQL] INSERTED | db={MYSQL_DATABASE} table=flintel_signals | "
+                f"message_id={doc.get('message_id')} | google_rank={doc.get('google_rank')} | "
+                f"embedding_bytes={len(emb_blob) if emb_blob is not None else 0} | host={MYSQL_HOST}"
+            )
+
+            with _mysql_insert_count_lock:
+                _mysql_insert_count += 1
+                report_total = _mysql_insert_count % 25 == 0
+            if report_total:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT COUNT(*) FROM flintel_signals")
+                        total_rows = cur.fetchone()[0]
+                    log.info(f"[MYSQL] TOTAL rows in flintel_signals = {total_rows} (db={MYSQL_DATABASE})")
+                except Exception as exc:
+                    log.warning(f"[MYSQL] COUNT(*) failed (insert is unaffected) | {exc}")
             return True
 
         return bool(_with_mysql(op))
@@ -2613,12 +2638,22 @@ def run_reddit_fetch_loop():
                 consecutive_blocks = 0  # FIX: a good response resets the breaker
                 item["subreddit_or_channel"] = subreddit or item.get("subreddit_or_channel", "")
                 saved = save_signal(item)
-                mark_google_post_fetched(post_url, fuzzy_matched=True)
-                if saved:
-                    saved_count += 1
+                if saved or is_post_already_signaled(post_url):
+                    mark_google_post_fetched(post_url, fuzzy_matched=True)
+                    if saved:
+                        saved_count += 1
+                else:
+                    # save genuinely failed (sink down / schema error) - do NOT burn the post
+                    set_google_post_retry_cooldown(post_url, reason="save_failed", retry_count=retry_count)
+                    fail_count += 1
+                    log.warning(
+                        f"[REDDIT-FETCH] save FAILED (not a duplicate) | {post_url} | "
+                        f"left reddit_fetched=False - will retry after cooldown"
+                    )
+                    continue
 
                 log.info(
-                    f"[REDDIT-FETCH] {'SAVED' if saved else 'DUPLICATE (already existed)'} | {post_url} | "
+                    f"[REDDIT-FETCH] {'SAVED' if saved else 'SKIP (already existed)'} | {post_url} | "
                     f"keyword:{search_keyword!r} | subreddit:{subreddit!r} | google_rank:{google_rank} | "
                     f"marked reddit_fetched=True PERMANENTLY"
                 )
