@@ -257,6 +257,13 @@ try:  # numpy is optional; array.array fallback is used if missing
 except ImportError:  # pragma: no cover
     _np = None
 
+try:
+    from hackernews import run_hackernews_loop
+    from hackernews import config as hn_config
+except Exception:  # pragma: no cover
+    run_hackernews_loop = None
+    hn_config = None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ENV / LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2721,6 +2728,33 @@ async def start_reddit_listener():
             fetch_thread.start()
 
 
+async def start_hackernews_listener():
+    """Hacker News apne alag always-on thread par chalta hai (Algolia API, key nahi
+    chahiye). Keywords flintel_keywords (db2) se aate hain, save_signal() se save."""
+    if run_hackernews_loop is None:
+        log.warning("Hacker News module load nahi hua — skipping.")
+        return
+
+    def _sinks_ok():
+        return _is_mongodb_data_enabled() or _is_mysql_data_enabled()
+
+    def _spawn():
+        t = threading.Thread(
+            target=run_hackernews_loop, args=(save_signal, _sinks_ok),
+            daemon=True, name="HackerNews",
+        )
+        t.start()
+        return t
+
+    hn_thread = _spawn()
+    log.info("Hacker News thread running ✅")
+    while True:
+        await asyncio.sleep(60)
+        if not hn_thread.is_alive():
+            log.error("Hacker News thread died — restarting...")
+            hn_thread = _spawn()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FASTAPI — read-only endpoints (+ FIX: /reddit-test diagnostic)
 # (/signals and the counts on "/" still read the Mongo copy of
@@ -2984,6 +3018,7 @@ async def main():
 
     await asyncio.gather(
         start_reddit_listener(),
+        start_hackernews_listener(),
     )
 
 
@@ -3031,6 +3066,7 @@ if __name__ == "__main__":
     log.info(f"  Post retry cooldown   : exponential {REDDIT_POST_RETRY_COOLDOWN_SECONDS}s*2^retry_count, cap {REDDIT_POST_MAX_COOLDOWN_SECONDS}s, pinned after {REDDIT_POST_MAX_FAILED_ATTEMPTS} failures; empty/404 floor {REDDIT_EMPTY_COOLDOWN_SECONDS}s")
     log.info(f"  Reddit proxy          : {'ON (REDDIT_PROXY_URL set)' if REDDIT_PROXY_URL else 'off (set REDDIT_PROXY_URL to route Reddit requests through a proxy)'}")
     log.info(f"  Reddit keywords       : {len(REDDIT_SEARCH_KEYWORDS)} (used ONLY to seed brand-new flintel_keywords docs)")
+    log.info(f"  Hacker News           : {'ENABLED' if (hn_config and hn_config.is_hackernews_enabled()) else 'DISABLED'} (HACKERNEWS_ENABLED, live-checked, always-on thread, keywords from flintel_keywords, via Algolia API)")
     log.info(f"  Keyword cache         : flintel_keywords (MONGODB2) — fetch-once-forever")
     log.info(f"  Google SERP           : search_google_for_keywords_batch() — {GOOGLE_SERP_BATCH} keyword(s) OR'd into ONE RapidAPI call (cost control)")
     log.info(f"  flintel_google_posts  : (MONGODB2) stores post_url + google_rank + search_keyword + subreddit + auto fuzzy_keywords + reddit_fetched + retry_count")
