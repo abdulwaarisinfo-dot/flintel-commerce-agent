@@ -429,7 +429,7 @@ REDDIT_USER_AGENT = os.getenv(
 # FIX: global rate limiter — minimum seconds between ANY two Reddit
 # requests (shared by the fetch loop and /reddit-test), plus the random
 # jitter above (REDDIT_FETCH_JITTER_MIN..MAX) on top of it.
-REDDIT_MIN_GAP_SECONDS = float(os.getenv("REDDIT_MIN_GAP_SECONDS", "4"))
+REDDIT_MIN_GAP_SECONDS = float(os.getenv("REDDIT_MIN_GAP_SECONDS", "3"))
 
 # FIX: circuit breaker — after REDDIT_CIRCUIT_BREAK_THRESHOLD consecutive
 # 429/403 responses, the whole fetch loop pauses for this many seconds.
@@ -449,6 +449,33 @@ REDDIT_EMPTY_COOLDOWN_SECONDS    = int(os.getenv("REDDIT_EMPTY_COOLDOWN_SECONDS"
 # FIX: optional proxy (e.g. http://user:pass@host:port). Applied to every
 # Reddit requests.get when set; behaves exactly as before when unset.
 REDDIT_PROXY_URL = os.getenv("REDDIT_PROXY_URL", "").strip()
+
+# SPEED: pool of proxies (comma-separated). Each proxy = its own independent
+# rate-limit "slot" (own IP, own gap, own 429 block timer). N proxies => ~N x
+# throughput. Empty => a single direct slot (old behaviour).
+REDDIT_PROXY_URLS = [p.strip() for p in os.getenv("REDDIT_PROXY_URLS", "").split(",") if p.strip()]
+if REDDIT_PROXY_URL and REDDIT_PROXY_URL not in REDDIT_PROXY_URLS:
+    REDDIT_PROXY_URLS.append(REDDIT_PROXY_URL)
+if REDDIT_PROXY_URLS and not REDDIT_PROXY_URL:
+    REDDIT_PROXY_URL = REDDIT_PROXY_URLS[0]   # keeps the "proxy on/off" log + diagnostics booleans correct
+
+# SPEED: fetch worker threads (0 = one per slot) and posts loaded per pass
+# (was: ALL 27k+ docs loaded into RAM every pass).
+REDDIT_FETCH_WORKERS    = int(os.getenv("REDDIT_FETCH_WORKERS", "0"))
+REDDIT_FETCH_PASS_LIMIT = int(os.getenv("REDDIT_FETCH_PASS_LIMIT", "300"))
+# When a slot gets 429/403 only THAT slot rests this long (or Retry-After).
+REDDIT_SLOT_BLOCK_SECONDS = int(os.getenv("REDDIT_SLOT_BLOCK_SECONDS", "90"))
+# A 429 is the IP's fault, not the post's: short flat cooldown, retry_count NOT bumped.
+REDDIT_RATE_LIMIT_POST_COOLDOWN_SECONDS = int(os.getenv("REDDIT_RATE_LIMIT_POST_COOLDOWN_SECONDS", "45"))
+# If no slot is usable within this many seconds, report "throttled" instead of sleeping in a worker.
+REDDIT_MAX_SLOT_WAIT_SECONDS = float(os.getenv("REDDIT_MAX_SLOT_WAIT_SECONDS", "20"))
+
+# FREE FALLBACK (no proxy needed): when Reddit answers 429/blocked/throttled, save the
+# signal from data we ALREADY have (SERP title + snippet, or the words in the URL slug)
+# instead of leaving it unfetched. Real Reddit text is always tried first.
+# Capped per hour so the backlog isn't flooded with title-only signals.
+REDDIT_SERP_FALLBACK          = os.getenv("REDDIT_SERP_FALLBACK", "false").strip().lower() in ("1", "true", "yes", "on")
+REDDIT_FALLBACK_MAX_PER_HOUR  = int(os.getenv("REDDIT_FALLBACK_MAX_PER_HOUR", "25"))
 
 # ── flintel_google_posts CONFIG — UNCHANGED.
 REDDIT_FETCH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDDIT_FETCH_CHECK_INTERVAL_SECONDS", "30"))
@@ -1236,6 +1263,7 @@ def search_google_for_keywords_batch(keywords_batch: list, months_back: int = SE
                 "url":     canonical_url,  # FIX: canonical, never the raw SERP URL
                 "rank":    rank,
                 "title":   title,
+                "snippet": str(item.get("snippet") or item.get("description") or item.get("text") or item.get("body") or ""),
                 "keyword": matched_keyword,
             })
 
@@ -1316,7 +1344,8 @@ def is_post_already_signaled(post_url: str) -> bool:
 # exponential and stores retry_count, startup cleanup added.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit: str, fuzzy_keywords: list) -> bool:
+def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit: str, fuzzy_keywords: list,
+                     title: str = "", snippet: str = "") -> bool:
     """Insert-only upsert — a post_url already tracked here is NEVER
     overwritten. Returns True only when this call genuinely inserted a
     brand-new document.
@@ -1340,6 +1369,8 @@ def save_google_post(post_url: str, google_rank, search_keyword: str, subreddit:
                 "search_keyword":  search_keyword,
                 "subreddit":       subreddit,
                 "fuzzy_keywords":  fuzzy_keywords,
+                "serp_title":      title or "",
+                "serp_snippet":    snippet or "",
                 "reddit_fetched":  False,
                 "fuzzy_matched":   None,
                 "next_retry_at":   None,
@@ -1367,7 +1398,7 @@ def get_due_google_posts() -> list:
                 {"next_retry_at": {"$exists": False}},
                 {"next_retry_at": {"$lte": now}},
             ],
-        })
+        }).sort("google_rank", ASCENDING).limit(REDDIT_FETCH_PASS_LIMIT).allow_disk_use(True)
         return list(cursor)
     except Exception as exc:
         log.error(f"[GOOGLE-POSTS] get_due_google_posts error: {exc}")
@@ -1420,8 +1451,14 @@ def set_google_post_retry_cooldown(post_url: str, reason: str = "network", retry
     and the new attempt count is persisted in `retry_count` on the same
     flintel_google_posts document."""
     now = datetime.now(timezone.utc)
-    cooldown_seconds = _compute_post_cooldown_seconds(reason, retry_count)
-    new_retry_count = retry_count + 1
+    if reason in ("429", "blocked"):
+        # IP-level throttling, not a bad post: short flat cooldown, DON'T bump retry_count
+        # (before: 8 x 429 pinned perfectly good posts to a 6h cooldown).
+        cooldown_seconds = REDDIT_RATE_LIMIT_POST_COOLDOWN_SECONDS
+        new_retry_count = retry_count
+    else:
+        cooldown_seconds = _compute_post_cooldown_seconds(reason, retry_count)
+        new_retry_count = retry_count + 1
     next_retry = now + timedelta(seconds=cooldown_seconds)
     try:
         db2.flintel_google_posts.update_one(
@@ -1521,35 +1558,53 @@ def cleanup_google_posts():
 #   * only transient "network" failures (timeouts, 5xx) are retried here
 # ─────────────────────────────────────────────────────────────────────────────
 
-# FIX: global rate limiter state (shared by the fetch loop AND /reddit-test)
-_reddit_rate_lock = threading.Lock()
-_reddit_last_request_at = float("-inf")
+class _RedditSlot:
+    """One egress path (direct IP or one proxy) with its OWN rate limit + 429 block timer."""
+    def __init__(self, proxy):
+        self.proxy = proxy
+        self.last_at = float("-inf")     # monotonic time of last (reserved) request start
+        self.blocked_until = 0.0         # monotonic time until which this slot rests after a 429/403
+
+    def proxies(self):
+        return {"http": self.proxy, "https": self.proxy} if self.proxy else None
+
+    def ready_at(self):
+        return max(self.last_at + REDDIT_MIN_GAP_SECONDS, self.blocked_until)
+
+
+_reddit_slots = [_RedditSlot(p) for p in REDDIT_PROXY_URLS] or [_RedditSlot(None)]
+_reddit_slot_lock = threading.Lock()
 
 # FIX: log the first bytes of an "empty" response body ONCE per process so
 # you can tell whether it's a block page or a genuinely empty feed.
 _reddit_empty_body_logged = False
 
 
-def _reddit_rate_limit_wait():
-    """FIX: blocks until at least REDDIT_MIN_GAP_SECONDS (+ random jitter of
-    REDDIT_FETCH_JITTER_MIN..MAX) has elapsed since the previous Reddit
-    request from ANY thread. The sleep happens while holding the lock, so
-    concurrent callers queue up and are spaced out correctly."""
-    global _reddit_last_request_at
-    with _reddit_rate_lock:
-        gap = REDDIT_MIN_GAP_SECONDS + random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX)
-        wait = gap - (time.monotonic() - _reddit_last_request_at)
-        if wait > 0:
-            time.sleep(wait)
-        _reddit_last_request_at = time.monotonic()
+def _reddit_acquire_slot():
+    """Reserves the slot that becomes ready soonest and sleeps until its turn.
+    Returns the slot, or None if every slot is resting longer than
+    REDDIT_MAX_SLOT_WAIT_SECONDS (caller reports 'throttled' - no request is made)."""
+    with _reddit_slot_lock:
+        now = time.monotonic()
+        slot = min(_reddit_slots, key=lambda x: x.ready_at())
+        start = max(now, slot.ready_at())
+        wait = start - now
+        if wait > REDDIT_MAX_SLOT_WAIT_SECONDS:
+            return None
+        slot.last_at = start + random.uniform(REDDIT_FETCH_JITTER_MIN, REDDIT_FETCH_JITTER_MAX)
+    if wait > 0:
+        time.sleep(wait)
+    return slot
 
 
-def _reddit_proxies() -> dict | None:
-    """FIX: proxies dict for requests.get when REDDIT_PROXY_URL is set,
-    otherwise None (requests behaves exactly as before)."""
-    if REDDIT_PROXY_URL:
-        return {"http": REDDIT_PROXY_URL, "https": REDDIT_PROXY_URL}
-    return None
+def _reddit_seconds_until_ready() -> float:
+    with _reddit_slot_lock:
+        return max(0.0, min(x.ready_at() for x in _reddit_slots) - time.monotonic())
+
+
+def _reddit_slots_available() -> int:
+    now = time.monotonic()
+    return sum(1 for x in _reddit_slots if x.blocked_until <= now)
 
 
 def _reddit_headers() -> dict:
@@ -1562,24 +1617,19 @@ def _reddit_headers() -> dict:
 
 
 def _reddit_request_once(url: str) -> tuple:
-    """FIX: ONE rate-limited (optionally proxied) GET. Never retries.
+    """ONE rate-limited GET through the best available slot. Never retries.
     Returns (response_or_None, reason, status_code_or_None, error_or_None).
-
-    reason:
-      "ok"        HTTP 200 with a non-empty body
-      "empty"     HTTP 200 with a completely empty body
-      "not_found" HTTP 404 / 410
-      "429"       HTTP 429 (rate limited)
-      "blocked"   HTTP 401 / 403 / 451 (IP or UA blocked)
-      "network"   timeout / connection error / 5xx / any unexpected status
-    """
-    _reddit_rate_limit_wait()
+    reason: ok | empty | not_found | 429 | blocked | network | throttled
+    ('throttled' = every slot is resting after a 429; NO request was sent)."""
+    slot = _reddit_acquire_slot()
+    if slot is None:
+        return None, "throttled", None, "all slots cooling down"
     try:
         r = requests.get(
             url,
             headers=_reddit_headers(),
             timeout=REDDIT_JSON_TIMEOUT_SECONDS,
-            proxies=_reddit_proxies(),
+            proxies=slot.proxies(),
         )
     except requests.RequestException as exc:
         return None, "network", None, str(exc)
@@ -1589,11 +1639,16 @@ def _reddit_request_once(url: str) -> tuple:
         return r, ("ok" if r.content and r.content.strip() else "empty"), status, None
     if status in (404, 410):
         return r, "not_found", status, None
-    if status == 429:
-        return r, "429", status, None
-    if status in (401, 403, 451):
-        return r, "blocked", status, None
-    # 5xx and anything unexpected -> treat as transient
+    if status in (429, 401, 403, 451):
+        # rest ONLY this slot (honour Retry-After, capped at 10 min)
+        try:
+            ra = float(r.headers.get("Retry-After", "") or 0)
+        except ValueError:
+            ra = 0.0
+        rest = min(max(ra, REDDIT_SLOT_BLOCK_SECONDS), 600)
+        with _reddit_slot_lock:
+            slot.blocked_until = max(slot.blocked_until, time.monotonic() + rest)
+        return r, ("429" if status == 429 else "blocked"), status, None
     return r, "network", status, None
 
 
@@ -1605,11 +1660,19 @@ def _reddit_get_with_retry(url: str) -> tuple:
     burns requests against a limit that won't lift for minutes."""
     last_reason = "network"
     last_resp = None
-    for attempt in range(1, REDDIT_FETCH_MAX_RETRIES + 1):
+    block_hops = 0
+    attempt = 0
+    while attempt < REDDIT_FETCH_MAX_RETRIES:
+        attempt += 1
         r, reason, status, err = _reddit_request_once(url)
         last_reason, last_resp = reason, r
 
         if reason != "network":
+            # SPEED: another proxy slot is free -> retry the SAME post right now on it
+            if reason in ("429", "blocked") and _reddit_slots_available() > 0 and block_hops < len(_reddit_slots):
+                block_hops += 1
+                attempt -= 1
+                continue
             if reason in ("429", "blocked"):
                 retry_after = r.headers.get("Retry-After") if r is not None else None
                 log.warning(
@@ -2438,6 +2501,8 @@ def process_keywords_batch(keywords_batch: list) -> tuple:
             search_keyword=matched_keyword,
             subreddit=subreddit,
             fuzzy_keywords=fuzzy_keywords,
+            title=result.get("title", ""),
+            snippet=result.get("snippet", ""),
         )
         if was_new:
             new_posts_saved += 1
@@ -2539,6 +2604,42 @@ def run_serp_discovery_loop():
 # permanently, and never saved anywhere.
 # ─────────────────────────────────────────────────────────────────────────────
 
+_fallback_times = []   # monotonic timestamps of fallback saves (hourly cap)
+
+
+def _fallback_allowed() -> bool:
+    now = time.monotonic()
+    while _fallback_times and now - _fallback_times[0] > 3600:
+        _fallback_times.pop(0)
+    return REDDIT_SERP_FALLBACK and len(_fallback_times) < REDDIT_FALLBACK_MAX_PER_HOUR
+
+
+def _build_serp_fallback_item(doc: dict):
+    """Signal built WITHOUT touching Reddit: stored SERP title+snippet, else the
+    words in the URL slug (works for the whole existing backlog). None if nothing usable."""
+    post_url = doc["post_url"]
+    title   = (doc.get("serp_title") or "").strip()
+    snippet = (doc.get("serp_snippet") or "").strip()
+    if not title:
+        m = re.search(r"/comments/[a-zA-Z0-9]+/([^/?#]+)", post_url)
+        title = m.group(1).replace("_", " ").replace("-", " ").strip() if m else ""
+    if len(title) < 8:
+        return None
+    text = title if (not snippet or snippet.lower() == title.lower()) else f"{title}\n\n{snippet}"
+    sid = _extract_reddit_submission_id(post_url)
+    return {
+        "message_id":           f"reddit_serp_{sid}" if sid else f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', post_url)[-40:]}",
+        "platform":             "reddit",
+        "text":                 text,
+        "username":             "unknown",
+        "subreddit_or_channel": doc.get("subreddit", ""),
+        "post_url":             post_url,
+        "posted_at":            None,
+        "search_keyword":       doc.get("search_keyword", ""),
+        "google_rank":          doc.get("google_rank"),
+    }
+
+
 def run_reddit_fetch_loop():
     """
     The post-fetch fuzzy CONTENT filter has been REMOVED from this loop.
@@ -2573,13 +2674,17 @@ def run_reddit_fetch_loop():
         f"(one per newly saved signal, generated inside save_signal())"
     )
 
-    # FIX: circuit-breaker state. Lives outside the while-loop so a run of
-    # 429s that straddles two passes still counts as "consecutive".
-    consecutive_blocks = 0
+    from concurrent.futures import ThreadPoolExecutor
+    workers = max(1, REDDIT_FETCH_WORKERS or len(_reddit_slots))
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="Reddit-Fetch-W")
+    log.info(
+        f"[REDDIT-FETCH] SPEED MODE | slots(proxies):{len(_reddit_slots)} | workers:{workers} | "
+        f"pass_limit:{REDDIT_FETCH_PASS_LIMIT} | per-slot gap:{REDDIT_MIN_GAP_SECONDS}s | "
+        f"slot block on 429:{REDDIT_SLOT_BLOCK_SECONDS}s | 429 post cooldown:{REDDIT_RATE_LIMIT_POST_COOLDOWN_SECONDS}s (retry_count not bumped)"
+    )
 
     while True:
         try:
-            # MYSQL SINK guard: both save targets off -> don't burn tracked posts.
             if not _is_mongodb_data_enabled() and not _is_mysql_data_enabled():
                 _warn_no_sinks(force=True)
                 time.sleep(REDDIT_FETCH_CHECK_INTERVAL_SECONDS)
@@ -2590,99 +2695,99 @@ def run_reddit_fetch_loop():
                 time.sleep(REDDIT_FETCH_CHECK_INTERVAL_SECONDS)
                 continue
 
-            log.info(f"[REDDIT-FETCH] {len(due_posts)} post(s) due for Reddit RSS fetch this pass")
-
+            log.info(f"[REDDIT-FETCH] {len(due_posts)} post(s) loaded for this pass (best google_rank first)")
             saved_count, dupe_count, fail_count, invalid_count = 0, 0, 0, 0
-            breaker_tripped = False
+            throttled = False
 
-            for doc in due_posts:
-                post_url       = doc["post_url"]
-                search_keyword = doc.get("search_keyword", "")
-                subreddit      = doc.get("subreddit", "")
-                google_rank    = doc.get("google_rank")
-                retry_count    = int(doc.get("retry_count") or 0)  # FIX
-
-                if is_post_already_signaled(post_url):
-                    mark_google_post_fetched(post_url, fuzzy_matched=None)
-                    dupe_count += 1
-                    log.info(f"[REDDIT-FETCH] SKIP (already in flintel_signals) | {post_url}")
+            for i in range(0, len(due_posts), workers):
+                chunk = due_posts[i:i + workers]
+                to_fetch = []
+                for doc in chunk:
+                    post_url = doc["post_url"]
+                    if is_post_already_signaled(post_url):
+                        mark_google_post_fetched(post_url, fuzzy_matched=None)
+                        dupe_count += 1
+                    else:
+                        to_fetch.append(doc)
+                if not to_fetch:
                     continue
 
-                item, reason = fetch_reddit_post_by_url(post_url, search_keyword, google_rank)  # FIX: (item, reason)
+                # network part runs in parallel (one request per slot at a time)
+                futures = [
+                    (doc, executor.submit(fetch_reddit_post_by_url, doc["post_url"],
+                                          doc.get("search_keyword", ""), doc.get("google_rank")))
+                    for doc in to_fetch
+                ]
+                # DB / MySQL / embedding saves stay on THIS thread (shared connection)
+                for doc, fut in futures:
+                    post_url       = doc["post_url"]
+                    search_keyword = doc.get("search_keyword", "")
+                    subreddit      = doc.get("subreddit", "")
+                    google_rank    = doc.get("google_rank")
+                    retry_count    = int(doc.get("retry_count") or 0)
+                    try:
+                        item, reason = fut.result()
+                    except Exception as exc:
+                        log.error(f"[REDDIT-FETCH] worker error for {post_url}: {exc}")
+                        item, reason = None, "network"
 
-                if not item:
-                    # FIX: a URL that isn't a Reddit post can never succeed — don't retry it forever.
-                    if reason == "invalid_url":
-                        mark_google_post_fetched(post_url, fuzzy_matched=None)
-                        invalid_count += 1
+                    if not item:
+                        if reason == "invalid_url":
+                            mark_google_post_fetched(post_url, fuzzy_matched=None)
+                            invalid_count += 1
+                        elif reason in ("429", "blocked", "throttled") and _fallback_allowed() \
+                                and (fb_item := _build_serp_fallback_item(doc)) is not None:
+                            # FREE FALLBACK: Reddit is throttling this IP -> save from SERP data
+                            if reason == "throttled":
+                                throttled = True
+                            if save_signal(fb_item) or is_post_already_signaled(post_url):
+                                mark_google_post_fetched(post_url, fuzzy_matched=True)
+                                _fallback_times.append(time.monotonic())
+                                saved_count += 1
+                                log.info(f"[REDDIT-FETCH] SAVED via SERP fallback ({reason}) | {post_url} | "
+                                         f"fallback_used_last_hour:{len(_fallback_times)}/{REDDIT_FALLBACK_MAX_PER_HOUR}")
+                            else:
+                                set_google_post_retry_cooldown(post_url, reason=reason, retry_count=retry_count)
+                                fail_count += 1
+                        elif reason == "throttled":
+                            throttled = True          # no request was made - leave the post untouched
+                        else:
+                            set_google_post_retry_cooldown(post_url, reason=reason, retry_count=retry_count)
+                            fail_count += 1
+                            log.warning(f"[REDDIT-FETCH] fetch FAILED | reason:{reason} | {post_url}")
                         continue
 
-                    # FIX: exponential cooldown + retry_count, reason-aware
-                    set_google_post_retry_cooldown(post_url, reason=reason, retry_count=retry_count)
-                    fail_count += 1
-                    log.warning(
-                        f"[REDDIT-FETCH] fetch FAILED | reason:{reason} | {post_url} | "
-                        f"left reddit_fetched=False — will retry after cooldown"
-                    )
+                    item["subreddit_or_channel"] = subreddit or item.get("subreddit_or_channel", "")
+                    saved = save_signal(item)
+                    if saved or is_post_already_signaled(post_url):
+                        mark_google_post_fetched(post_url, fuzzy_matched=True)
+                        if saved:
+                            saved_count += 1
+                        log.info(
+                            f"[REDDIT-FETCH] {'SAVED' if saved else 'SKIP (already existed)'} | {post_url} | "
+                            f"keyword:{search_keyword!r} | subreddit:{subreddit!r} | google_rank:{google_rank}"
+                        )
+                    else:
+                        set_google_post_retry_cooldown(post_url, reason="save_failed", retry_count=retry_count)
+                        fail_count += 1
+                        log.warning(f"[REDDIT-FETCH] save FAILED (not a duplicate) | {post_url}")
 
-                    # FIX: circuit breaker bookkeeping
-                    if reason in ("429", "blocked"):
-                        consecutive_blocks += 1
-                    elif reason in ("empty", "not_found"):
-                        consecutive_blocks = 0   # Reddit answered normally — we're not being throttled
-                    # "network"/"parse_error": leave the counter untouched
-
-                    if consecutive_blocks >= REDDIT_CIRCUIT_BREAK_THRESHOLD:
-                        breaker_tripped = True
-                        break
-                    continue  # FIX: no extra sleep — the global rate limiter spaces requests
-
-                # ── post_url fetch SUCCEEDED — save straight into
-                # flintel_signals, tagged with its search_keyword. No
-                # content/fuzzy check anymore, no queue, no batch, no
-                # Claude. save_signal() itself now also generates an
-                # embedding from this document's own text.
-                consecutive_blocks = 0  # FIX: a good response resets the breaker
-                item["subreddit_or_channel"] = subreddit or item.get("subreddit_or_channel", "")
-                saved = save_signal(item)
-                if saved or is_post_already_signaled(post_url):
-                    mark_google_post_fetched(post_url, fuzzy_matched=True)
-                    if saved:
-                        saved_count += 1
-                else:
-                    # save genuinely failed (sink down / schema error) - do NOT burn the post
-                    set_google_post_retry_cooldown(post_url, reason="save_failed", retry_count=retry_count)
-                    fail_count += 1
-                    log.warning(
-                        f"[REDDIT-FETCH] save FAILED (not a duplicate) | {post_url} | "
-                        f"left reddit_fetched=False - will retry after cooldown"
-                    )
-                    continue
-
-                log.info(
-                    f"[REDDIT-FETCH] {'SAVED' if saved else 'SKIP (already existed)'} | {post_url} | "
-                    f"keyword:{search_keyword!r} | subreddit:{subreddit!r} | google_rank:{google_rank} | "
-                    f"marked reddit_fetched=True PERMANENTLY"
-                )
+                if throttled:
+                    break
 
             log.info(
-                f"[REDDIT-FETCH] Pass {'ABORTED (circuit breaker)' if breaker_tripped else 'complete'} | "
-                f"due:{len(due_posts)} | saved:{saved_count} | already_signaled:{dupe_count} | "
-                f"invalid_url_skipped:{invalid_count} | failed_will_retry:{fail_count}"
+                f"[REDDIT-FETCH] Pass {'PAUSED (all slots cooling)' if throttled else 'complete'} | "
+                f"loaded:{len(due_posts)} | saved:{saved_count} | already_signaled:{dupe_count} | "
+                f"invalid:{invalid_count} | failed_will_retry:{fail_count} | slots_ready:{_reddit_slots_available()}/{len(_reddit_slots)}"
             )
 
-            # FIX: circuit breaker — pause the whole loop instead of hammering Reddit
-            if breaker_tripped:
-                log.error(
-                    f"[REDDIT-FETCH] ⛔ CIRCUIT BREAKER TRIPPED — {consecutive_blocks} consecutive "
-                    f"429/403 responses. Reddit is rate-limiting/blocking this IP"
-                    f"{' (proxy in use: ' + 'yes)' if REDDIT_PROXY_URL else ' (no proxy configured — consider REDDIT_PROXY_URL)'}. "
-                    f"Pausing the ENTIRE Reddit fetch loop for {REDDIT_CIRCUIT_BREAK_SECONDS}s "
-                    f"instead of continuing through the remaining posts."
+            if throttled:
+                wait = min(max(_reddit_seconds_until_ready(), 5.0), float(REDDIT_CIRCUIT_BREAK_SECONDS))
+                log.warning(
+                    f"[REDDIT-FETCH] every slot is rate-limited - resting {wait:.0f}s "
+                    f"({'add more proxies via REDDIT_PROXY_URLS' if len(_reddit_slots) == 1 else 'proxies cooling'})"
                 )
-                consecutive_blocks = 0
-                time.sleep(REDDIT_CIRCUIT_BREAK_SECONDS)
-                log.info("[REDDIT-FETCH] circuit breaker pause over — resuming.")
+                time.sleep(wait)
 
         except Exception as exc:
             log.error(f"[REDDIT-FETCH] loop error: {exc}")
