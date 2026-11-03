@@ -264,6 +264,11 @@ except Exception:  # pragma: no cover
     run_hackernews_loop = None
     hn_config = None
 
+try:
+    import gpt_reddit_ingest
+except Exception:  # pragma: no cover
+    gpt_reddit_ingest = None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ENV / LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2403,6 +2408,8 @@ def save_signal(item: dict) -> bool:
     # ── 3. one embedding, shared. Reuse Mongo's if it already has one. ──
     if mongo_embedding is not None:
         embedding = mongo_embedding
+    elif isinstance(item.get("embedding"), list) and item["embedding"]:
+        embedding = item["embedding"]   # pre-computed by the GPT-Reddit flow; avoids a 2nd call
     elif _is_embedding_enabled():
         embedding = generate_embedding(doc["text"])
     else:
@@ -2861,6 +2868,92 @@ async def start_hackernews_listener():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GPT-REDDIT — 24h Google-discovered posts -> OpenAI Responses API web_search
+# (fetches the actual content of the EXISTING post_url) -> save_signal()
+# (MySQL flintel_signals + embedding) -> reddit_fetched=True. Logic lives in
+# gpt_reddit_ingest.py; this is only the wiring. OFF by default
+# (GPT_REDDIT_ENABLED=false); purely additive, existing loops are untouched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+GPT_REDDIT_MODEL                  = os.getenv("GPT_REDDIT_MODEL", "gpt-4.1-mini")
+GPT_REDDIT_TIMEOUT_SECONDS        = int(os.getenv("GPT_REDDIT_TIMEOUT_SECONDS", "90"))
+GPT_REDDIT_CYCLE_INTERVAL_SECONDS = int(os.getenv("GPT_REDDIT_CYCLE_INTERVAL_SECONDS", "900"))
+GPT_REDDIT_PASS_LIMIT             = int(os.getenv("GPT_REDDIT_PASS_LIMIT", "50"))
+GPT_REDDIT_RETRY_COOLDOWN_SECONDS = int(os.getenv("GPT_REDDIT_RETRY_COOLDOWN_SECONDS", "1800"))
+
+_gpt_reddit_client = None
+
+
+def _is_gpt_reddit_enabled() -> bool:
+    load_dotenv(override=True)
+    return _env_bool("GPT_REDDIT_ENABLED", False)
+
+
+def _get_gpt_reddit_client():
+    """Own OpenAI client (web search needs a longer timeout than the 20s
+    embedding client, which is left untouched). None if unavailable."""
+    global _gpt_reddit_client
+    if _gpt_reddit_client is not None:
+        return _gpt_reddit_client
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        from openai import OpenAI
+        _gpt_reddit_client = OpenAI(api_key=OPENAI_API_KEY, timeout=GPT_REDDIT_TIMEOUT_SECONDS)
+        return _gpt_reddit_client
+    except Exception as exc:
+        log.warning(f"[GPT-REDDIT] could not initialise OpenAI client: {exc}")
+        return None
+
+
+def _gpt_reddit_deps():
+    return gpt_reddit_ingest.Deps(
+        get_posts_collection=lambda: db2.flintel_google_posts,
+        get_client=_get_gpt_reddit_client,
+        model=GPT_REDDIT_MODEL,
+        generate_embedding=generate_embedding,
+        embedding_to_blob=_embedding_to_blob,
+        embedding_enabled=_is_embedding_enabled,
+        save_signal=save_signal,
+        is_post_already_signaled=is_post_already_signaled,
+        mysql_post_exists=_mysql_post_exists,
+        mysql_enabled=_is_mysql_data_enabled,
+        extract_submission_id=_extract_reddit_submission_id,
+        pass_limit=GPT_REDDIT_PASS_LIMIT,
+        retry_cooldown_seconds=GPT_REDDIT_RETRY_COOLDOWN_SECONDS,
+    )
+
+
+def run_gpt_reddit_loop():
+    log.info(f"[GPT-REDDIT] Loop started | interval:{GPT_REDDIT_CYCLE_INTERVAL_SECONDS}s | "
+             f"model:{GPT_REDDIT_MODEL} | pass_limit:{GPT_REDDIT_PASS_LIMIT}")
+    while True:
+        try:
+            if _is_gpt_reddit_enabled():
+                gpt_reddit_ingest.run_cycle(_gpt_reddit_deps())
+        except Exception as exc:
+            log.error(f"[GPT-REDDIT] loop error: {exc}")
+        time.sleep(GPT_REDDIT_CYCLE_INTERVAL_SECONDS)
+
+
+async def start_gpt_reddit_listener():
+    """Own thread, own auto-restart. Does nothing unless GPT_REDDIT_ENABLED
+    is true at startup (flag is also re-checked every cycle)."""
+    if gpt_reddit_ingest is None or not _is_gpt_reddit_enabled():
+        log.info("[GPT-REDDIT] disabled (set GPT_REDDIT_ENABLED=true to enable) — not started.")
+        return
+    t = threading.Thread(target=run_gpt_reddit_loop, daemon=True, name="GPT-Reddit")
+    t.start()
+    log.info("GPT-Reddit thread running ✅")
+    while True:
+        await asyncio.sleep(60)
+        if not t.is_alive():
+            log.error("GPT-Reddit thread died — restarting...")
+            t = threading.Thread(target=run_gpt_reddit_loop, daemon=True, name="GPT-Reddit")
+            t.start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FASTAPI — read-only endpoints (+ FIX: /reddit-test diagnostic)
 # (/signals and the counts on "/" still read the Mongo copy of
 # flintel_signals — they are unchanged.)
@@ -3124,6 +3217,7 @@ async def main():
     await asyncio.gather(
         start_reddit_listener(),
         start_hackernews_listener(),
+        start_gpt_reddit_listener(),
     )
 
 
