@@ -467,13 +467,27 @@ if REDDIT_PROXY_URLS and not REDDIT_PROXY_URL:
 # SPEED: fetch worker threads (0 = one per slot) and posts loaded per pass
 # (was: ALL 27k+ docs loaded into RAM every pass).
 REDDIT_FETCH_WORKERS    = int(os.getenv("REDDIT_FETCH_WORKERS", "0"))
-REDDIT_FETCH_PASS_LIMIT = int(os.getenv("REDDIT_FETCH_PASS_LIMIT", "300"))
+REDDIT_FETCH_PASS_LIMIT = int(os.getenv("REDDIT_FETCH_PASS_LIMIT", "500"))
 # When a slot gets 429/403 only THAT slot rests this long (or Retry-After).
 REDDIT_SLOT_BLOCK_SECONDS = int(os.getenv("REDDIT_SLOT_BLOCK_SECONDS", "90"))
 # A 429 is the IP's fault, not the post's: short flat cooldown, retry_count NOT bumped.
 REDDIT_RATE_LIMIT_POST_COOLDOWN_SECONDS = int(os.getenv("REDDIT_RATE_LIMIT_POST_COOLDOWN_SECONDS", "45"))
 # If no slot is usable within this many seconds, report "throttled" instead of sleeping in a worker.
 REDDIT_MAX_SLOT_WAIT_SECONDS = float(os.getenv("REDDIT_MAX_SLOT_WAIT_SECONDS", "20"))
+
+# ARCHIVE-FIRST FETCH (no proxy, no Reddit IP involved): posts are looked up in
+# BATCHES (up to 500 ids per HTTP call) from the free Arctic Shift Reddit archive.
+# One request replaces up to REDDIT_ARCHIVE_BATCH per-post Reddit RSS calls, so a
+# blocked/rate-limited IP no longer stops ingestion. Posts the archive does not have
+# (very fresh ones) fall through to the normal Reddit RSS path below.
+REDDIT_ARCHIVE_ENABLED = os.getenv("REDDIT_ARCHIVE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+REDDIT_ARCHIVE_URL     = os.getenv("REDDIT_ARCHIVE_URL", "https://arctic-shift.photon-reddit.com/api/posts/ids").strip()
+REDDIT_ARCHIVE_BATCH   = max(1, min(500, int(os.getenv("REDDIT_ARCHIVE_BATCH", "100"))))
+REDDIT_ARCHIVE_TIMEOUT_SECONDS = float(os.getenv("REDDIT_ARCHIVE_TIMEOUT_SECONDS", "30"))
+# a post the archive did not have is not asked again for this long (it is still tried on Reddit RSS)
+REDDIT_ARCHIVE_MISS_RETRY_SECONDS = int(os.getenv("REDDIT_ARCHIVE_MISS_RETRY_SECONDS", "3600"))
+# when every Reddit slot is cooling, rest at most this long before the next pass (archive keeps running)
+REDDIT_THROTTLE_REST_CAP_SECONDS = float(os.getenv("REDDIT_THROTTLE_REST_CAP_SECONDS", "30"))
 
 # FREE FALLBACK (no proxy needed): when Reddit answers 429/blocked/throttled, save the
 # signal from data we ALREADY have (SERP title + snippet, or the words in the URL slug)
@@ -1820,6 +1834,102 @@ def fetch_reddit_post_by_url(post_url: str, keyword: str, rank: int) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHIVE-FIRST BATCH FETCH — see REDDIT_ARCHIVE_* config. Returns items in the
+# EXACT same shape as fetch_reddit_post_by_url(), so save_signal() and everything
+# after it (Mongo / MySQL / embeddings) is untouched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_archive_miss_until = {}   # submission_id -> monotonic time before which we don't ask the archive again
+
+
+def _archive_post_to_item(post: dict, doc: dict):
+    """Archive post JSON -> signal item (same fields as the RSS path). None if unusable."""
+    title = (post.get("title") or "").strip()
+    body = (post.get("selftext") or "").strip()
+    if body.lower() in ("[removed]", "[deleted]"):
+        body = ""
+    if not title:
+        return None
+    text = title if (not body or body.lower() == title.lower()) else f"{title}\n\n{body}"
+
+    author = (post.get("author") or "unknown").strip()
+    if author.lower() in ("[deleted]", ""):
+        author = "unknown"
+
+    posted_at = None
+    created = post.get("created_utc")
+    try:
+        if created is not None:
+            posted_at = datetime.fromtimestamp(float(created), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        posted_at = None
+
+    post_url = doc["post_url"]
+    canonical = _normalize_reddit_post_url(post_url) or post_url
+    sid = _extract_reddit_submission_id(canonical)
+    return {
+        "message_id":           f"reddit_serp_{sid}" if sid else f"reddit_serp_{re.sub(r'[^a-zA-Z0-9]', '_', canonical)[-40:]}",
+        "platform":             "reddit",
+        "text":                 text,
+        "username":             author,
+        "subreddit_or_channel": doc.get("subreddit") or post.get("subreddit") or _extract_reddit_subreddit_from_url(canonical),
+        "post_url":             post_url,   # exactly as stored in flintel_google_posts
+        "posted_at":            posted_at,
+        "search_keyword":       doc.get("search_keyword", ""),
+        "google_rank":          doc.get("google_rank"),
+    }
+
+
+def fetch_reddit_posts_via_archive(docs: list) -> dict:
+    """ONE HTTP call for up to REDDIT_ARCHIVE_BATCH posts. Returns {post_url: item} for the
+    posts the archive has. Never raises; on any error returns {} (caller falls back to Reddit RSS)."""
+    if not REDDIT_ARCHIVE_ENABLED or not docs:
+        return {}
+    now = time.monotonic()
+    by_id = {}
+    for d in docs:
+        canonical = _normalize_reddit_post_url(d["post_url"])
+        sid = _extract_reddit_submission_id(canonical) if canonical else None
+        if sid and _archive_miss_until.get(sid, 0) <= now:
+            by_id[sid] = d
+    if not by_id:
+        return {}
+    try:
+        r = requests.get(
+            REDDIT_ARCHIVE_URL,
+            params={"ids": ",".join(by_id.keys()), "fields": "id,title,selftext,author,subreddit,created_utc"},
+            headers={"User-Agent": REDDIT_USER_AGENT},
+            timeout=REDDIT_ARCHIVE_TIMEOUT_SECONDS,
+        )
+        if r.status_code != 200:
+            log.warning(f"[REDDIT-ARCHIVE] HTTP {r.status_code} for batch of {len(by_id)} — falling back to Reddit RSS")
+            return {}
+        rows = (r.json() or {}).get("data") or []
+    except Exception as exc:
+        log.warning(f"[REDDIT-ARCHIVE] batch request failed ({exc}) — falling back to Reddit RSS")
+        return {}
+
+    found = {}
+    for post in rows:
+        sid = str(post.get("id") or "").strip()
+        doc = by_id.pop(sid, None)
+        if doc is None:
+            continue
+        item = _archive_post_to_item(post, doc)
+        if item:
+            found[doc["post_url"]] = item
+        else:
+            by_id[sid] = doc          # unusable row (no title) -> treat as a miss
+    miss_until = time.monotonic() + REDDIT_ARCHIVE_MISS_RETRY_SECONDS
+    for sid in by_id:                 # whatever is left was not in the archive
+        _archive_miss_until[sid] = miss_until
+    if len(_archive_miss_until) > 50000:
+        _archive_miss_until.clear()
+    log.info(f"[REDDIT-ARCHIVE] batch:{len(rows) + len(by_id)} asked | found:{len(found)} | missing:{len(by_id)}")
+    return found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # EMBEDDINGS — ported as-is from flintel.py. One function that turns a
 # document's own text into one vector, called from exactly one place
 # (save_signal, right before insert), plus one manually-triggered
@@ -2706,6 +2816,32 @@ def run_reddit_fetch_loop():
             saved_count, dupe_count, fail_count, invalid_count = 0, 0, 0, 0
             throttled = False
 
+            # ARCHIVE-FIRST: batch lookup (no Reddit IP). Hits are saved through the SAME
+            # save_signal()/mark_google_post_fetched() path; misses continue to Reddit RSS below.
+            if REDDIT_ARCHIVE_ENABLED:
+                remaining = []
+                for b in range(0, len(due_posts), REDDIT_ARCHIVE_BATCH):
+                    batch = [d for d in due_posts[b:b + REDDIT_ARCHIVE_BATCH]
+                             if not is_post_already_signaled(d["post_url"])]
+                    already = [d for d in due_posts[b:b + REDDIT_ARCHIVE_BATCH] if d not in batch]
+                    for d in already:
+                        mark_google_post_fetched(d["post_url"], fuzzy_matched=None)
+                        dupe_count += 1
+                    hits = fetch_reddit_posts_via_archive(batch)
+                    for d in batch:
+                        item = hits.get(d["post_url"])
+                        if item is None:
+                            remaining.append(d)
+                            continue
+                        if save_signal(item) or is_post_already_signaled(d["post_url"]):
+                            mark_google_post_fetched(d["post_url"], fuzzy_matched=True)
+                            saved_count += 1
+                        else:
+                            set_google_post_retry_cooldown(d["post_url"], reason="save_failed",
+                                                           retry_count=int(d.get("retry_count") or 0))
+                            fail_count += 1
+                due_posts = remaining
+
             for i in range(0, len(due_posts), workers):
                 chunk = due_posts[i:i + workers]
                 to_fetch = []
@@ -2789,7 +2925,8 @@ def run_reddit_fetch_loop():
             )
 
             if throttled:
-                wait = min(max(_reddit_seconds_until_ready(), 5.0), float(REDDIT_CIRCUIT_BREAK_SECONDS))
+                wait = min(max(_reddit_seconds_until_ready(), 5.0), float(REDDIT_CIRCUIT_BREAK_SECONDS),
+                           REDDIT_THROTTLE_REST_CAP_SECONDS if REDDIT_ARCHIVE_ENABLED else float(REDDIT_CIRCUIT_BREAK_SECONDS))
                 log.warning(
                     f"[REDDIT-FETCH] every slot is rate-limited - resting {wait:.0f}s "
                     f"({'add more proxies via REDDIT_PROXY_URLS' if len(_reddit_slots) == 1 else 'proxies cooling'})"
